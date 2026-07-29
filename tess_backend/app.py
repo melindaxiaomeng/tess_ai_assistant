@@ -38,7 +38,7 @@ REMEDIATION_EXECUTOR = MockRemediationExecutor()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # 生产请收紧为 Teensing 前端域名
-    allow_methods=["POST"],
+    allow_methods=["*"],  # 含 GET(健康检查)/POST(诊断)/DELETE(GAID删除) 等
     allow_headers=["*"],
 )
 
