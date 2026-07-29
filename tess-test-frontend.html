@@ -232,6 +232,41 @@ function renderResult(containerId, data) {
   html += `<pre class="out">${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
   c.innerHTML = html;
 }
+function renderJointResult(containerId, data) {
+  const c = document.getElementById(containerId);
+  const dx = data && data.diagnosis;
+  const corr = data && data.correlation;
+  let html = '';
+  // —— LLM 联合叙事（diagnosis 嵌套层）——
+  if (dx && dx.status) {
+    html += `<div class="meta-row">联合状态：<span class="badge ${dx.status}">${dx.status}</span>　置信度：<b>${(dx.confidence ?? '—')}</b></div>`;
+    if (dx.summary) html += `<div class="meta-row"><b>联合摘要：</b>${escapeHtml(dx.summary)}</div>`;
+    if (dx.joint_primary_factor) html += `<div class="meta-row"><b>共性根因因子：</b>${escapeHtml(String(dx.joint_primary_factor))}</div>`;
+    if (dx.contributing_event_ids) {
+      const ids = Array.isArray(dx.contributing_event_ids) ? dx.contributing_event_ids.map(escapeHtml).join(', ') : escapeHtml(String(dx.contributing_event_ids));
+      html += `<div class="meta-row"><b>贡献事件：</b>${ids}</div>`;
+    }
+    if (dx.root_cause_analysis) {
+      const rca = dx.root_cause_analysis;
+      if (rca.primary_factor) html += `<div class="meta-row"><b>主因子：</b>${escapeHtml(rca.primary_factor)}</div>`;
+      if (Array.isArray(rca.causal_chain)) html += `<div class="meta-row"><b>因果链：</b>${rca.causal_chain.map(escapeHtml).join(' → ')}</div>`;
+    }
+  }
+  // —— 后端确定性聚合（correlation，非 LLM 计算）——
+  if (corr) {
+    html += `<div class="section-title">后端确定性聚合（非 LLM 计算）</div>`;
+    if (corr.event_count !== undefined) html += `<div class="meta-row"><b>事件数：</b>${escapeHtml(String(corr.event_count))}</div>`;
+    if (corr.candidate_dimensions) html += `<div class="meta-row"><b>候选共性维度：</b>${escapeHtml(JSON.stringify(corr.candidate_dimensions))}</div>`;
+    if (corr.aggregated_loss_per_hour_usd !== undefined) html += `<div class="meta-row"><b>聚合损耗 / 小时：</b>$${escapeHtml(String(corr.aggregated_loss_per_hour_usd))}</div>`;
+    if (corr.max_severity) html += `<div class="meta-row"><b>最高严重度：</b>${escapeHtml(corr.max_severity)}</div>`;
+    if (corr.event_ids) {
+      const ids = Array.isArray(corr.event_ids) ? corr.event_ids.map(escapeHtml).join(', ') : escapeHtml(String(corr.event_ids));
+      html += `<div class="meta-row"><b>事件清单：</b>${ids}</div>`;
+    }
+  }
+  html += `<pre class="out">${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
+  c.innerHTML = html;
+}
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -318,7 +353,7 @@ async function sendJoint() {
   log('POST /tess/joint-diagnose …');
   try {
     const d = await postJSON('/tess/joint-diagnose', payload);
-    renderResult('jointResult', d);
+    renderJointResult('jointResult', d);
     log('联合诊断返回 status=' + (d.diagnosis && d.diagnosis.status), 'ok');
   } catch (e) { renderResult('jointResult', {error: e.message}); log('联合诊断失败：' + e.message, 'err'); }
 }
