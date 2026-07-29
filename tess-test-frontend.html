@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Tess 诊断 · 功能测试前端</title>
+<style>
+  :root {
+    --bg: #f5f7fa; --panel: #ffffff; --border: #e3e8ef; --text: #1f2937;
+    --muted: #6b7280; --primary: #2563eb; --primary-d: #1d4ed8;
+    --green: #16a34a; --yellow: #d97706; --gray: #6b7280; --red: #dc2626;
+    --code-bg: #0f172a; --code-fg: #e2e8f0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5;
+  }
+  header {
+    background: linear-gradient(135deg, #1e3a8a, #2563eb);
+    color: #fff; padding: 16px 24px;
+  }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  header p { margin: 4px 0 0; font-size: 12px; opacity: .85; }
+  .container { max-width: 1180px; margin: 0 auto; padding: 20px; }
+  .bar {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; margin-bottom: 16px;
+  }
+  .bar label { font-size: 13px; color: var(--muted); }
+  .bar input[type=text] {
+    flex: 1; min-width: 260px; padding: 8px 10px; border: 1px solid var(--border);
+    border-radius: 7px; font-size: 13px; font-family: ui-monospace, monospace;
+  }
+  button {
+    background: var(--primary); color: #fff; border: none; border-radius: 7px;
+    padding: 8px 14px; font-size: 13px; cursor: pointer; transition: .15s;
+  }
+  button:hover { background: var(--primary-d); }
+  button.ghost { background: #fff; color: var(--primary); border: 1px solid var(--primary); }
+  button.ghost:hover { background: #eff6ff; }
+  .health-dot { width: 10px; height: 10px; border-radius: 50%; background: #cbd5e1; display: inline-block; }
+  .health-dot.ok { background: var(--green); }
+  .health-dot.bad { background: var(--red); }
+  .tabs { display: flex; gap: 6px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .tab {
+    padding: 9px 16px; cursor: pointer; font-size: 14px; color: var(--muted);
+    border-bottom: 2px solid transparent; user-select: none;
+  }
+  .tab.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
+  .pane { display: none; }
+  .pane.active { display: block; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px;
+  }
+  .card h3 { margin: 0 0 10px; font-size: 14px; }
+  textarea {
+    width: 100%; min-height: 360px; resize: vertical; border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12.5px; line-height: 1.5; background: #fbfdff; color: var(--text);
+  }
+  pre.out {
+    margin: 0; background: var(--code-bg); color: var(--code-fg); padding: 12px;
+    border-radius: 8px; font-size: 12.5px; overflow: auto; max-height: 420px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all;
+  }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .badge.DIAGNOSED { background: #dcfce7; color: var(--green); }
+  .badge.DIAGNOSED_SUSPECT { background: #fef3c7; color: var(--yellow); }
+  .badge.INCONCLUSIVE { background: #e5e7eb; color: var(--gray); }
+  .meta-row { font-size: 13px; margin: 8px 0; color: var(--muted); }
+  .meta-row b { color: var(--text); }
+  .hint { font-size: 12px; color: var(--muted); margin: 6px 0 10px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+  input.sm {
+    padding: 7px 9px; border: 1px solid var(--border); border-radius: 7px; font-size: 13px;
+    font-family: ui-monospace, monospace;
+  }
+  .log {
+    margin-top: 14px; background: #0f172a; color: #cbd5e1; border-radius: 8px; padding: 10px 12px;
+    font-size: 12px; font-family: ui-monospace, monospace; max-height: 180px; overflow: auto; white-space: pre-wrap;
+  }
+  .log .err { color: #fca5a5; } .log .ok { color: #86efac; }
+  .pill { font-size: 11px; padding: 2px 7px; border-radius: 999px; background: #eef2ff; color: #4338ca; }
+  .section-title { font-size: 13px; font-weight: 600; color: var(--muted); margin: 14px 0 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Tess 归因诊断 · 功能测试前端</h1>
+  <p>对接 /tess/diagnose · /tess/joint-diagnose · 方案 C GAID 隐私接口（零依赖单文件）</p>
+</header>
+
+<div class="container">
+  <!-- 后端配置条 -->
+  <div class="bar">
+    <label>后端地址</label>
+    <input type="text" id="baseUrl" value="http://localhost:8080" placeholder="http://<服务器IP>:8080" />
+    <button class="ghost" onclick="healthCheck()">健康检查</button>
+    <span class="health-dot" id="healthDot"></span>
+    <span id="healthText" class="meta-row" style="margin:0">未检测</span>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <div class="tab active" data-pane="p1">① 单次诊断</div>
+    <div class="tab" data-pane="p2">② 联合诊断</div>
+    <div class="tab" data-pane="p3">③ 隐私 / GAID 演练</div>
+  </div>
+
+  <!-- Pane 1: 单次诊断 -->
+  <div class="pane active" id="p1">
+    <div class="hint">左侧编辑诊断输入（算法层需注入 <code>severity</code> 与 <code>calculated_loss</code>）。已内置一条强对齐样例，可一键发送验证。右侧展示 Gatekeeper 归一化后的安全结果。</div>
+    <div class="grid2">
+      <div class="card">
+        <h3>诊断输入 (JSON)</h3>
+        <textarea id="diagInput"></textarea>
+        <div class="row" style="margin-top:10px">
+          <button onclick="sendDiagnose()">▶ 发送诊断</button>
+          <button class="ghost" onclick="formatJSON('diagInput')">格式化</button>
+          <button class="ghost" onclick="loadSample('diagInput')">载入样例</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>返回结果</h3>
+        <div id="diagResult">
+          <pre class="out">// 结果将显示在这里</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pane 2: 联合诊断 -->
+  <div class="pane" id="p2">
+    <div class="hint">联合归因：把多个疑似同源异常事件打包，后端先确定性聚合（共性维度 / 聚合损耗 / 最高严重度），再让 LLM 产出联合叙事。填入 <code>{ "events": [ ...单事件... ] }</code>。</div>
+    <div class="grid2">
+      <div class="card">
+        <h3>联合输入 (JSON)</h3>
+        <textarea id="jointInput"></textarea>
+        <div class="row" style="margin-top:10px">
+          <button onclick="sendJoint()">▶ 发送联合诊断</button>
+          <button class="ghost" onclick="formatJSON('jointInput')">格式化</button>
+          <button class="ghost" onclick="loadJointSample()">载入样例</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>返回结果</h3>
+        <div id="jointResult"><pre class="out">// 结果将显示在这里</pre></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pane 3: 隐私演练 -->
+  <div class="pane" id="p3">
+    <div class="hint">方案 C 演示：原始 GAID 进入后端后立即被 HMAC-SHA256 哈希，<b>真实 GAID 永不发给 LLM</b>；后端内部持有加密映射，可按哈希还原吐给用户。下方走完整闭环。</div>
+    <div class="card">
+      <div class="section-title">步骤 1 · 输入原始 GAID 与 salt</div>
+      <div class="row">
+        <span>原始 GAID</span>
+        <input class="sm" id="rawGaid" value="GAID-9F2A-7C11-E3B8" style="width:200px" />
+        <span>salt（须与后端 TESS_GAID_SALT 一致）</span>
+        <input class="sm" id="salt" value="tess-dev-gaid-salt" style="width:200px" />
+        <button onclick="runPrivacyFlow()">▶ 走完整隐私闭环</button>
+      </div>
+      <div class="meta-row" id="privacyStep1"></div>
+
+      <div class="section-title">步骤 2 · 诊断（payload 含原始 GAID）</div>
+      <div class="meta-row" id="privacyStep2">点击上方按钮执行。后端会把 GAID 哈希后发给 LLM，返回结果中<b>不应再出现原始 GAID</b>。</div>
+
+      <div class="section-title">步骤 3 · 按哈希还原（被遗忘权 / 还原）</div>
+      <div class="row">
+        <span>哈希值（步骤1本地计算）</span>
+        <input class="sm" id="hashedGaid" style="width:480px" readonly placeholder="点击" />
+        <button class="ghost" onclick="resolveGaid()">resolve</button>
+        <button class="ghost" onclick="deleteGaid()">delete</button>
+      </div>
+      <div class="meta-row" id="privacyStep3"></div>
+    </div>
+  </div>
+
+  <!-- 操作日志 -->
+  <div class="log" id="log"></div>
+</div>
+
+<script>
+// ---------- 工具 ----------
+function log(msg, type) {
+  const el = document.getElementById('log');
+  const t = new Date().toLocaleTimeString();
+  const line = document.createElement('div');
+  if (type) line.className = type;
+  line.textContent = `[${t}] ${msg}`;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+function base() { return document.getElementById('baseUrl').value.replace(/\/+$/, ''); }
+
+async function postJSON(path, body, method='POST') {
+  const url = base() + path;
+  const opt = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const res = await fetch(url, opt);
+  let data = null;
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) {
+    const detail = (data && (data.detail || data.error)) || res.statusText;
+    throw new Error(`HTTP ${res.status}: ${detail}`);
+  }
+  return data;
+}
+function renderResult(containerId, data) {
+  const c = document.getElementById(containerId);
+  const status = data && data.status;
+  let html = '';
+  if (status) {
+    html += `<div class="meta-row">状态：<span class="badge ${status}">${status}</span>　置信度：<b>${(data.confidence ?? '—')}</b></div>`;
+    if (data.summary) html += `<div class="meta-row"><b>摘要：</b>${escapeHtml(data.summary)}</div>`;
+    if (data.primary_contributor_id) html += `<div class="meta-row"><b>主因贡献者：</b>${escapeHtml(String(data.primary_contributor_id))}</div>`;
+    if (data.root_cause_analysis) {
+      const rca = data.root_cause_analysis;
+      if (rca.primary_factor) html += `<div class="meta-row"><b>主因子：</b>${escapeHtml(rca.primary_factor)}</div>`;
+      if (Array.isArray(rca.causal_chain)) html += `<div class="meta-row"><b>因果链：</b>${rca.causal_chain.map(escapeHtml).join(' → ')}</div>`;
+    }
+  }
+  html += `<pre class="out">${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
+  c.innerHTML = html;
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ---------- 样例 ----------
+const SAMPLE = {
+  anomaly_metadata: {
+    event_id: "ERR-20260728-0912",
+    trigger_time: "2026-07-28 14:00:00",
+    target_metric: "Overall Margin",
+    current_value: "3.8%",
+    benchmark_value: "14.2%",
+    severity: "HIGH",
+    calculated_loss: {
+      loss_per_hour_usd: 350.00,
+      calculation_basis: "基于过去 30 分钟 Cost 速率与缺失 Revenue 的差值计算"
+    },
+    user_gaid: "GAID-9F2A-7C11-E3B8"
+  },
+  top_contributors: [
+    { dimension_type: "Publisher", dimension_value: "Pub_Media_802", impact_share: "82%", metric_change: "Margin 从 15.1% 降至 -2.4%" }
+  ],
+  associated_signals: [
+    { source: "Config_Change_Log", status: "INFO", detail: "13:25 运营将 Pub_Media_802 的 Postback 映射从 'default_v2' 切换为 'new_exp_v1'（CHG-4821, alice）。" },
+    { source: "AppsFlyer_Pull_API", status: "ERROR", detail: "13:25-14:00 期间该 Publisher Postback 接口持续 HTTP 504 占比 92%，与毛利断崖时间点吻合。" }
+  ]
+};
+const JOINT_SAMPLE = {
+  events: [
+    JSON.parse(JSON.stringify(SAMPLE)),
+    (() => { const e = JSON.parse(JSON.stringify(SAMPLE)); e.anomaly_metadata.event_id = "ERR-20260728-0913"; e.anomaly_metadata.current_value = "4.1%"; return e; })()
+  ]
+};
+
+function loadSample(id) { document.getElementById(id).value = JSON.stringify(SAMPLE, null, 2); }
+function loadJointSample() { document.getElementById('jointInput').value = JSON.stringify(JOINT_SAMPLE, null, 2); }
+function formatJSON(id) {
+  try { document.getElementById(id).value = JSON.stringify(JSON.parse(document.getElementById(id).value), null, 2); }
+  catch (e) { log('JSON 格式错误：' + e.message, 'err'); }
+}
+
+// ---------- Tab ----------
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.pane').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  document.getElementById(t.dataset.pane).classList.add('active');
+});
+
+// ---------- 健康检查 ----------
+async function healthCheck() {
+  const dot = document.getElementById('healthDot'), txt = document.getElementById('healthText');
+  dot.className = 'health-dot'; txt.textContent = '检测中…';
+  try {
+    const d = await postJSON('/healthz', undefined, 'GET');
+    dot.className = 'health-dot ok';
+    txt.textContent = `OK · v${d.version} · LLM已配置:${d.llm_configured}`;
+    log('健康检查通过：' + JSON.stringify(d), 'ok');
+  } catch (e) {
+    dot.className = 'health-dot bad';
+    txt.textContent = '连接失败';
+    log('健康检查失败：' + e.message, 'err');
+  }
+}
+
+// ---------- 诊断 ----------
+async function sendDiagnose() {
+  let payload;
+  try { payload = JSON.parse(document.getElementById('diagInput').value); }
+  catch (e) { return log('输入 JSON 解析失败：' + e.message, 'err'); }
+  log('POST /tess/diagnose …');
+  try {
+    const d = await postJSON('/tess/diagnose', payload);
+    renderResult('diagResult', d);
+    log('诊断返回 status=' + d.status, 'ok');
+  } catch (e) { renderResult('diagResult', {error: e.message}); log('诊断失败：' + e.message, 'err'); }
+}
+
+// ---------- 联合诊断 ----------
+async function sendJoint() {
+  let payload;
+  try { payload = JSON.parse(document.getElementById('jointInput').value); }
+  catch (e) { return log('输入 JSON 解析失败：' + e.message, 'err'); }
+  log('POST /tess/joint-diagnose …');
+  try {
+    const d = await postJSON('/tess/joint-diagnose', payload);
+    renderResult('jointResult', d);
+    log('联合诊断返回 status=' + (d.diagnosis && d.diagnosis.status), 'ok');
+  } catch (e) { renderResult('jointResult', {error: e.message}); log('联合诊断失败：' + e.message, 'err'); }
+}
+
+// ---------- 隐私演练 ----------
+async function hmacSha256(message, key) {
+  const enc = new TextEncoder();
+  const cryptoKey = await crypto.subtle.importKey('raw', enc.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(message));
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+async function runPrivacyFlow() {
+  const raw = document.getElementById('rawGaid').value.trim();
+  const salt = document.getElementById('salt').value.trim();
+  if (!raw) return log('请输入原始 GAID', 'err');
+  const hashed = await hmacSha256(raw, salt);
+  document.getElementById('hashedGaid').value = hashed;
+  document.getElementById('privacyStep1').innerHTML =
+    `原始 GAID = <b>${escapeHtml(raw)}</b>　本地计算哈希 = <span class="pill">${hashed.slice(0,16)}…</span>`;
+  log('隐私·本地 HMAC-SHA256 = ' + hashed, 'ok');
+
+  // 构造含原始 GAID 的诊断 payload 并发送
+  const payload = JSON.parse(JSON.stringify(SAMPLE));
+  payload.anomaly_metadata.user_gaid = raw;
+  document.getElementById('privacyStep2').innerHTML =
+    '已构造 payload（含 <b>原始</b> user_gaid），发送中…';
+  log('隐私·POST /tess/diagnose（含原始GAID）…');
+  try {
+    const d = await postJSON('/tess/diagnose', payload);
+    const rawStillThere = JSON.stringify(d).includes(raw);
+    renderResult('diagResult', d);
+    document.getElementById('privacyStep2').innerHTML =
+      `✅ 返回结果中<b>${rawStillThere ? '⚠️仍包含原始GAID' : '已无原始 GAID（哈希生效）'}</b>　status=${d.status}`;
+    log('隐私·返回状态=' + d.status + ' 原始GAID残留=' + rawStillThere, rawStillThere ? 'err' : 'ok');
+  } catch (e) {
+    document.getElementById('privacyStep2').innerHTML = '❌ 诊断失败：' + escapeHtml(e.message);
+    log('隐私·诊断失败：' + e.message, 'err');
+  }
+}
+async function resolveGaid() {
+  const h = document.getElementById('hashedGaid').value.trim();
+  if (!h) return log('请先执行隐私闭环得到哈希', 'err');
+  try {
+    const d = await postJSON('/tess/gaid/resolve', { hashed: h });
+    document.getElementById('privacyStep3').innerHTML =
+      `resolve 成功：哈希 → 原始 <b>${escapeHtml(d.original)}</b>`;
+    log('GAID resolve：' + d.original, 'ok');
+  } catch (e) {
+    document.getElementById('privacyStep3').innerHTML = 'resolve 失败：' + escapeHtml(e.message);
+    log('GAID resolve 失败：' + e.message, 'err');
+  }
+}
+async function deleteGaid() {
+  const h = document.getElementById('hashedGaid').value.trim();
+  if (!h) return log('请先执行隐私闭环得到哈希', 'err');
+  try {
+    const d = await postJSON('/tess/gaid/' + encodeURIComponent(h), undefined, 'DELETE');
+    document.getElementById('privacyStep3').innerHTML =
+      `delete 成功：deleted=${d.deleted}（被遗忘权已生效，再次 resolve 将 404）`;
+    log('GAID delete：deleted=' + d.deleted, 'ok');
+  } catch (e) {
+    document.getElementById('privacyStep3').innerHTML = 'delete 失败：' + escapeHtml(e.message);
+    log('GAID delete 失败：' + e.message, 'err');
+  }
+}
+
+// ---------- 初始化 ----------
+loadSample('diagInput');
+log('页面已加载。请确认后端地址后点「健康检查」。');
+</script>
+</body>
+</html>

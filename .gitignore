@@ -1,0 +1,28 @@
+# 密钥 / 环境
+.env
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.envs/
+*.egg-info/
+
+# 测试缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 学习后的阈值策略（由反馈自愈生成，非源码）
+tess_backend/thresholds.json
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+
+# 本机工具 / 导出产物（非源码，勿入库）
+.workbuddy/
+*.zip

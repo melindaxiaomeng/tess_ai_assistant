@@ -1,0 +1,8 @@
+# Tess 诊断服务 —— 独立部署运行时依赖
+# 仅含生产必需；测试依赖（pytest）见 DEPLOY.md，不进镜像。
+fastapi>=0.110
+uvicorn[standard]>=0.27
+httpx>=0.27
+jsonschema>=4.21
+# 可选：GAID 金库优先用 Fernet 做静态加密；未装则自动回退 stdlib HMAC 流密码
+cryptography>=42.0

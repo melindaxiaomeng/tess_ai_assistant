@@ -1,0 +1,16 @@
+# 构建镜像时排除（不进镜像）
+.venv/
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+.workbuddy/
+tests/
+*.jsonl
+.env
+.env.example
+*.md
+smoke_test.py
+sample_diagnosed.py
+*.zip
+Tess_*.md
