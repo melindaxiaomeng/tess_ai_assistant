@@ -18,6 +18,10 @@ htmlcov/
 # 学习后的阈值策略（由反馈自愈生成，非源码）
 tess_backend/thresholds.json
 
+# P6 问答审计库（运行时生成的 SQLite，非源码）
+tess_audit.db
+*.db
+
 # 编辑器 / 系统
 .DS_Store
 .idea/
