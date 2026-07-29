@@ -18,6 +18,11 @@ services:
       # JSONL 持久化路径（落在挂载卷内，容器重建不丢数据）
       TESS_FEEDBACK_PATH: "/data/feedback.jsonl"
       TESS_REMEDIATION_PATH: "/data/remediation.jsonl"
+      # P7 定时预警调度（默认关闭；置 true 后每小时自动拉异常→诊断→存预警库）
+      TESS_SCHEDULE_ENABLED: "${TESS_SCHEDULE_ENABLED:-false}"
+      TESS_SCHEDULE_INTERVAL: "${TESS_SCHEDULE_INTERVAL:-3600}"
+      TESS_SCHEDULE_LIMIT: "${TESS_SCHEDULE_LIMIT:-20}"
+      TESS_SYSTEM_TOKEN: "${TESS_SYSTEM_TOKEN:-}"
     volumes:
       - tess-data:/data
     restart: unless-stopped

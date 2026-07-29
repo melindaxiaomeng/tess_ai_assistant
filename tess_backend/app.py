@@ -8,6 +8,7 @@
 - uvicorn tess_backend.app:app --port 8080
 """
 
+import asyncio
 import hmac
 import os
 
@@ -29,6 +30,7 @@ from .remediation import (
 from .data_connector import get_data_connector, normalize_to_context, TeensingDataConnector
 from .gaid_vault import VAULT, RedactFilter
 from .audit_log import QueryLogStore
+from .alerts_store import AlertStore
 
 app = FastAPI(title="Tess Diagnose API", version="2.3.0")
 
@@ -41,6 +43,8 @@ REMEDIATION_EXECUTOR = MockRemediationExecutor()
 
 # P6 问答审计：本地 SQLite，记录每个运营的「问题 + Tess 回答」。
 AUDIT = QueryLogStore()
+# P7 定时预警存储：每小时诊断结果落库，供 Teensing 轮询拉取。
+ALERTS = AlertStore()
 
 app.add_middleware(
     CORSMiddleware,
@@ -103,6 +107,45 @@ def _get_data_connector():
     if _DATA_CONNECTOR is None:
         _DATA_CONNECTOR = get_data_connector()
     return _DATA_CONNECTOR
+
+
+def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None) -> list:
+    """P7 定时预警：用共享服务 token 拉异常 → 诊断 → 存预警库。
+
+    默认使用环境变量配置的 connector 与 LLM；测试可注入 connector/llm。
+    token：优先 TESS_SYSTEM_TOKEN，回退 TESS_DATA_API_KEY（共享服务 token，不按人过滤）。
+    返回本轮诊断结果列表（同 /tess/diagnose-from-source 的 results 形状）。
+    """
+    connector = connector or _get_data_connector()
+    llm = llm or _get_llm_client()
+    token = os.getenv("TESS_SYSTEM_TOKEN") or None
+    raw_events = connector.fetch_recent_anomalies(limit, token=token)
+    policy = load_policy()
+    results = []
+    for raw in raw_events:
+        ctx = normalize_to_context(raw)
+        VAULT.ingest(ctx)
+        event_id = (ctx.get("anomaly_metadata") or {}).get("event_id", "UNKNOWN")
+        try:
+            diag = run_diagnosis(ctx, llm, policy=policy)
+        except HTTPException:
+            raise
+        except Exception as e:  # 单条异常不拖垮整批
+            diag = {
+                "status": "INCONCLUSIVE",
+                "confidence": 0.0,
+                "summary": f"Tess 诊断链路异常，已自动切入人工排查：{type(e).__name__}",
+                "root_cause_analysis": {
+                    "primary_factor": f"系统异常：{type(e).__name__}",
+                    "causal_chain": ["编排链路异常", "转人工处理"],
+                },
+            }
+        STORE.observe_diagnosis(
+            event_id, diag.get("status", "UNKNOWN"), diag.get("confidence", 0.0)
+        )
+        results.append({"event_id": event_id, "diagnosis": diag, "meta": {"source_limit": limit}})
+    ALERTS.save_batch(results)
+    return results
 
 
 def _operator_id(request: Request) -> str:
@@ -228,6 +271,31 @@ def query_log(operator_id: str = None, limit: int = 100) -> dict:
     """
     rows = AUDIT.recent(operator_id=operator_id, limit=limit)
     return {"count": len(rows), "logs": rows}
+
+
+@app.get("/tess/alerts")
+def get_alerts(limit: int = 50) -> dict:
+    """P7 定时预警拉取接口：Teensing / SaaS 后端可轮询此接口获取每小时诊断结果。
+
+    返回最近 limit 条预警（含 run_time / event_id / status / confidence / diagnosis）。
+    受全局 X-API-Key 守卫（若生产已开启）。共享 token 模式：全局可读，不按人过滤。
+    """
+    rows = ALERTS.recent(limit=limit)
+    return {"count": len(rows), "alerts": rows}
+
+
+@app.post("/tess/cron/run")
+def cron_run(payload: dict = None) -> dict:
+    """P7 手动触发一次定时诊断（便于立即验证，不必等下一个整点）。
+
+    body: { "limit": 20 }
+    结果同时写入预警库（GET /tess/alerts 可拉取）。
+    """
+    payload = payload or {}
+    limit = int(payload.get("limit", os.getenv("TESS_SCHEDULE_LIMIT", "20")))
+    results = run_scheduled_diagnosis(limit)
+    return {"count": len(results), "results": results}
+
 
 @app.post("/tess/gaid/resolve")
 def gaid_resolve(payload: dict = None) -> dict:
@@ -494,6 +562,34 @@ def healthz() -> dict:
         "version": app.version,
         "llm_configured": bool(os.getenv("TESS_LLM_API_KEY")),
     }
+
+
+# ---------------------------------------------------------------------------
+# P7 定时预警调度器（进程内 asyncio 循环，间隔可配）
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger("tess_backend.app")
+
+
+async def _scheduler_loop() -> None:
+    """每小时（间隔可配）跑一轮 run_scheduled_diagnosis；单轮失败不影响下一轮。"""
+    interval = int(os.getenv("TESS_SCHEDULE_INTERVAL", "3600"))
+    limit = int(os.getenv("TESS_SCHEDULE_LIMIT", "20"))
+    while True:
+        try:
+            await asyncio.to_thread(run_scheduled_diagnosis, limit)
+        except Exception as e:  # 单轮异常（如 LLM 未配置、数据 API 不通）仅记录
+            logger.exception("P7 定时诊断本轮失败: %s", e)
+        await asyncio.sleep(interval)
+
+
+@app.on_event("startup")
+async def _startup_scheduler() -> None:
+    if os.getenv("TESS_SCHEDULE_ENABLED", "false").lower() in ("1", "true", "yes", "on"):
+        logger.info(
+            "P7 定时预警调度已启用，间隔 %ss", os.getenv("TESS_SCHEDULE_INTERVAL", "3600")
+        )
+        asyncio.create_task(_scheduler_loop())
 
 
 if __name__ == "__main__":
