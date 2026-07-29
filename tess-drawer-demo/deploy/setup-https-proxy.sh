@@ -49,7 +49,6 @@ server {
     add_header Access-Control-Allow-Origin  "*" always;
     add_header Access-Control-Allow-Methods "*" always;
     add_header Access-Control-Allow-Headers "*" always;
-    add_header Access-Control-Allow-Credentials "true" always;
 
     location / {
         # 预检请求直接返回 204（带上 CORS 头）
