@@ -99,6 +99,8 @@
   <div class="bar">
     <label>后端地址</label>
     <input type="text" id="baseUrl" value="http://localhost:8080" placeholder="http://<服务器IP>:8080" />
+    <label style="margin-left:12px">API Key</label>
+    <input type="text" id="apiKey" placeholder="可选（留空=不鉴权）" style="width:200px" />
     <button class="ghost" onclick="healthCheck()">健康检查</button>
     <span class="health-dot" id="healthDot"></span>
     <span id="healthText" class="meta-row" style="margin:0">未检测</span>
@@ -201,6 +203,8 @@ function base() { return document.getElementById('baseUrl').value.replace(/\/+$/
 async function postJSON(path, body, method='POST') {
   const url = base() + path;
   const opt = { method, headers: { 'Content-Type': 'application/json' } };
+  const ak = (document.getElementById('apiKey').value || '').trim();
+  if (ak) opt.headers['X-API-Key'] = ak;
   if (body !== undefined) opt.body = JSON.stringify(body);
   const res = await fetch(url, opt);
   let data = null;

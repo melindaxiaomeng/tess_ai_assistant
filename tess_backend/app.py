@@ -8,10 +8,12 @@
 - uvicorn tess_backend.app:app --port 8080
 """
 
+import hmac
 import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .orchestrator import run_diagnosis
 from .tess_agent import HttpLLMClient, LLMClient
@@ -41,6 +43,28 @@ app.add_middleware(
     allow_methods=["*"],  # 含 GET(健康检查)/POST(诊断)/DELETE(GAID删除) 等
     allow_headers=["*"],
 )
+
+# 可选 API Key 鉴权（纵深防御）：仅当环境变量 TESS_API_KEY 被设置时才强制校验。
+# - 开发期不设置 -> 行为与之前完全一致（无鉴权，测试前端照常可用）。
+# - 生产期设置后 -> 所有 /tess/* 接口要求请求头 X-API-Key 匹配，否则返回 401；
+#   /healthz 存活探针与 CORS 预检(OPTIONS) 一律放行，不影响监控与跨域。
+_TESS_API_KEY = os.getenv("TESS_API_KEY", "")
+
+
+@app.middleware("http")
+async def api_key_guard(request: Request, call_next):
+    if request.method == "OPTIONS":  # CORS 预检请求不带鉴权头，必须放行
+        return await call_next(request)
+    if request.url.path == "/healthz":  # 存活探针不鉴权
+        return await call_next(request)
+    if _TESS_API_KEY:
+        provided = request.headers.get("X-API-Key", "")
+        if not provided or not hmac.compare_digest(provided, _TESS_API_KEY):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "缺少或错误的 X-API-Key"},
+            )
+    return await call_next(request)
 
 # 方案 C：Tess 本地日志若含原始 GAID，自动抹掉（日志脱敏，不落明文）
 import logging
