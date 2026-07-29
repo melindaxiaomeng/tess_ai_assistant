@@ -284,3 +284,40 @@ docker compose down             # 停止并移除容器（数据卷 tess-data �
 docker compose up -d --build    # 改代码后重新构建
 ```
 
+---
+
+## 11. P5 数据接入（拉取真实异常）+ P6 审计（按人留痕）
+
+### 11.1 数据接入层
+- 默认 `TESS_DATA_CONNECTOR=mock`：调用 `POST /tess/diagnose-from-source` 即拉内置样例并真诊断，零配置可用。
+- 生产接真实数据：设 `TESS_DATA_CONNECTOR=teensing` + `TESS_DATA_API_BASE_URL=https://<saas-host>/api/v1`，再调同一端点。
+- 连接器轮询两个 Teensing 端点并归并：
+  - `GET /overview/ranking/anomaly-warning`（异常预警，标出异常实体）
+  - `GET /overview/ranking/fluctuation`（涨跌榜，含 `revenue/clicks/cvr/profit/margin/change`）
+  - 经 `normalize_to_context()` 归一化为 PRD §4.1 Context 后送诊断编排。
+
+### 11.2 鉴权透传（按访问者权限回数据）
+- 生产模式**不**在 Tess 落库任何 SaaS 凭据。前端调用 Tess 时，在请求头带上：
+  - `X-Teensing-Token: <当前运营已登录 SaaS 的 access_token>`
+  - Tess 原样作为 `Authorization: Bearer` 转发给 Teensing；Teensing 按该运营的 RBAC / 数据权限返回数据。**无需额外账号体系，天然不越权。**
+- `POST /tess/diagnose-from-source` 在 teensing 模式下**强制要求** `X-Teensing-Token`，缺则返回 `400`。
+- 另有兜底环境变量 `TESS_DATA_API_KEY`（服务端固定凭据），仅在无前端透传的特殊场景使用。
+
+### 11.3 问答审计（记录每个人问了什么、答了什么）
+- 每次 `POST /tess/diagnose` 与 `POST /tess/diagnose-from-source` 都会写入本地 SQLite 审计库（路径由 `TESS_AUDIT_DB` 指定，默认 `tess_audit.db`）。
+- 前端在请求头带 `X-Operator-Id: <运营标识>`，审计即按该运营归因（缺省记 `anonymous`）。
+- 查询：`GET /tess/query-log?operator_id=<可选>&limit=100`，返回最近问答记录（受全局 `X-API-Key` 守卫约束，若已开启）。
+
+### 11.4 调用示例（curl）
+```bash
+# 按当前运营权限拉取并诊断
+curl -X POST http://localhost:8080/tess/diagnose-from-source \
+  -H "Content-Type: application/json" \
+  -H "X-Operator-Id: alice" \
+  -H "X-Teensing-Token: <alice 的 SaaS access_token>" \
+  -d '{"limit": 5}'
+
+# 查看某运营的问答审计
+curl "http://localhost:8080/tess/query-log?operator_id=alice" \
+  -H "X-API-Key: <若生产已开启>" 
+

@@ -26,8 +26,9 @@ from .remediation import (
     RemediationStore,
     MockRemediationExecutor,
 )
-from .data_connector import get_data_connector, normalize_to_context
+from .data_connector import get_data_connector, normalize_to_context, TeensingDataConnector
 from .gaid_vault import VAULT, RedactFilter
+from .audit_log import QueryLogStore
 
 app = FastAPI(title="Tess Diagnose API", version="2.3.0")
 
@@ -37,6 +38,9 @@ STORE = FeedbackStore(persist_path=os.getenv("TESS_FEEDBACK_PATH") or None)
 REMEDIATION_STORE = RemediationStore(persist_path=os.getenv("TESS_REMEDIATION_PATH") or None)
 # 执行器默认 Mock；生产替换为 Teensing 平台真实 API 适配器。
 REMEDIATION_EXECUTOR = MockRemediationExecutor()
+
+# P6 问答审计：本地 SQLite，记录每个运营的「问题 + Tess 回答」。
+AUDIT = QueryLogStore()
 
 app.add_middleware(
     CORSMiddleware,
@@ -101,12 +105,24 @@ def _get_data_connector():
     return _DATA_CONNECTOR
 
 
+def _operator_id(request: Request) -> str:
+    """从请求头取运营身份（X-Operator-Id）；缺省记 anonymous。"""
+    return request.headers.get("X-Operator-Id", "anonymous") or "anonymous"
+
+
+def _teensing_token(request: Request) -> str:
+    """从请求头取运营 SaaS access_token（X-Teensing-Token），用于按权限拉数据；缺省空串。"""
+    return request.headers.get("X-Teensing-Token", "") or ""
+
+
 @app.post("/tess/diagnose")
-def diagnose(payload: dict) -> dict:
+def diagnose(payload: dict, request: Request) -> dict:
     """接收异常上下文 Input，返回 Gatekeeper 归一化后的归因结果。
 
-    每次诊断都会登记进反馈_ledger（observe_diagnosis），用于算覆盖率 / 降级率。
+    每次诊断都会登记进反馈_ledger（observe_diagnosis），用于算覆盖率 / 降级率；
+    同时写入 P6 问答审计（operator_id 来自 X-Operator-Id 请求头）。
     """
+    operator = _operator_id(request)
     llm = _get_llm_client()
     event_id = (payload or {}).get("anomaly_metadata", {}).get("event_id", "UNKNOWN")
     # 方案 C：Tess 自身持有 `哈希↔原始` GAID 加密映射（内部 join 用）
@@ -128,25 +144,46 @@ def diagnose(payload: dict) -> dict:
             },
         }
     STORE.observe_diagnosis(event_id, result["status"], result["confidence"])
+    # P6 审计：记录「谁问了什么 → Tess 答了什么」
+    AUDIT.log_query(
+        operator_id=operator,
+        endpoint="/tess/diagnose",
+        question=payload,
+        answer=result,
+        status=result.get("status"),
+        confidence=result.get("confidence"),
+        meta={"event_id": event_id},
+    )
     return result
 
 
 @app.post("/tess/diagnose-from-source")
-def diagnose_from_source(payload: dict = None) -> dict:
+def diagnose_from_source(payload: dict = None, request: Request = None) -> dict:
     """P5 数据接入：从 Teensing 真实异常数据源拉取最近 N 个异常，逐个诊断。
 
     body: { "limit": 5 }  （默认 5，最多 50）
+    鉴权：生产模式需在前端请求头带运营 SaaS access_token（X-Teensing-Token），
+          由 Tess 原样透传给 Teensing；Teensing 按该运营 RBAC/数据权限返回数据。
+          运营身份（X-Operator-Id）用于 P6 问答审计归因。
     拉取到的原始事件经 normalize_to_context 转成 PRD §4.1 Context 后送编排层；
     处置执行器不受影响（仍走 Mock / 服务端配置）。
     诊断失败时单条降级为 INCONCLUSIVE，不影响其余事件。
     """
+    operator = _operator_id(request) if request else "anonymous"
+    token = _teensing_token(request) if request else ""
     payload = payload or {}
     limit = max(1, min(int(payload.get("limit", 5)), 50))
     try:
         connector = _get_data_connector()
     except Exception as e:  # 接入层未配置（如 teensing 缺 base_url）
         raise HTTPException(status_code=503, detail=f"数据接入层初始化失败：{e}")
-    raw_events = connector.fetch_recent_anomalies(limit)
+    # 生产（teensing）模式必须带运营 token，否则无法按权限拉数据
+    if isinstance(connector, TeensingDataConnector) and not token:
+        raise HTTPException(
+            status_code=400,
+            detail="生产数据接入需在前端请求头携带 X-Teensing-Token（运营 SaaS access_token）",
+        )
+    raw_events = connector.fetch_recent_anomalies(limit, token=token or None)
     llm = _get_llm_client()
     results = []
     for raw in raw_events:
@@ -170,7 +207,27 @@ def diagnose_from_source(payload: dict = None) -> dict:
             }
         STORE.observe_diagnosis(event_id, diag.get("status", "UNKNOWN"), diag.get("confidence", 0.0))
         results.append({"event_id": event_id, "diagnosis": diag})
+        # P6 审计：逐条记录「该运营问的某个异常 → Tess 回答」
+        AUDIT.log_query(
+            operator_id=operator,
+            endpoint="/tess/diagnose-from-source",
+            question=ctx,
+            answer=diag,
+            status=diag.get("status"),
+            confidence=diag.get("confidence"),
+            meta={"event_id": event_id, "source_limit": limit},
+        )
     return {"count": len(results), "results": results}
+
+
+@app.get("/tess/query-log")
+def query_log(operator_id: str = None, limit: int = 100) -> dict:
+    """P6 问答审计：返回最近的问答记录（可选按运营过滤）。
+
+    受全局 X-API-Key 守卫（若生产已开启）。operator_id 对应调用方传入的 X-Operator-Id。
+    """
+    rows = AUDIT.recent(operator_id=operator_id, limit=limit)
+    return {"count": len(rows), "logs": rows}
 
 @app.post("/tess/gaid/resolve")
 def gaid_resolve(payload: dict = None) -> dict:

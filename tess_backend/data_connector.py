@@ -3,9 +3,13 @@
 
 设计要点：
 - DataConnector 为抽象接口（Protocol），便于测试时换 Mock、生产时换 Teensing。
-- TeensingDataConnector 读环境变量，调用真实异常数据 API（HTTP 轮询）。
-- normalize_to_context() 把上游原始 anomaly 映射成 Tess 消费的 PRD §4.1 Context；
-  真实字段映射见函数内 TODO(接入)，由接入方按 Teensing 实际返回结构填写。
+- TeensingDataConnector 读环境变量（TESS_DATA_API_BASE_URL 等），调用真实异常数据 API。
+- **鉴权透传（P6）**：token 不在 Tess 落库，而是「每次调用由调用方经请求头
+  X-Teensing-Token 传入」，connector 原样作为 Bearer 转发给 Teensing；
+  Teensing 按该运营的 RBAC/数据权限返回数据 —— 实现「按访问者权限回数据」。
+- normalize_to_context() 兼容两种上游形状：
+  (a) 直接就是 PRD §4.1 Context（Mock 样例走这里）；
+  (b) Teensing fluctuation/anomaly 形状（含 name/change/revenue/profit/margin）。
 - 默认用标准库 urllib（与 tess_agent.HttpLLMClient 一致），零额外依赖。
 """
 
@@ -52,13 +56,17 @@ _SAMPLE_RAW = {
 
 
 class DataConnector(Protocol):
-    """数据接入抽象：拉取真实异常事件，归一化为 Tess Context。"""
+    """数据接入抽象：拉取真实异常事件，归一化为 Tess Context。
 
-    def fetch_recent_anomalies(self, limit: int = 20) -> list[dict]:
+    token: 调用方传入的「运营 SaaS access_token」，用于按访问者权限拉数据；
+           具体实现若不依赖鉴权（如 Mock）可忽略该参数。
+    """
+
+    def fetch_recent_anomalies(self, limit: int = 20, token: Optional[str] = None) -> list[dict]:
         """拉取最近 limit 个原始异常事件（Teensing 原始结构）。"""
         ...
 
-    def fetch_anomaly_event(self, event_id: str) -> Optional[dict]:
+    def fetch_anomaly_event(self, event_id: str, token: Optional[str] = None) -> Optional[dict]:
         """按 event_id 拉取单个原始异常事件；不存在返回 None。"""
         ...
 
@@ -69,10 +77,10 @@ class MockDataConnector:
     def __init__(self, samples: Optional[list[dict]] = None):
         self.samples: list[dict] = samples if samples is not None else [_SAMPLE_RAW]
 
-    def fetch_recent_anomalies(self, limit: int = 20) -> list[dict]:
+    def fetch_recent_anomalies(self, limit: int = 20, token: Optional[str] = None) -> list[dict]:
         return self.samples[:limit]
 
-    def fetch_anomaly_event(self, event_id: str) -> Optional[dict]:
+    def fetch_anomaly_event(self, event_id: str, token: Optional[str] = None) -> Optional[dict]:
         for s in self.samples:
             if s.get("event_id") == event_id:
                 return s
@@ -82,9 +90,12 @@ class MockDataConnector:
 class TeensingDataConnector:
     """生产用：轮询 Teensing 真实异常数据 API。
 
-    必需环境变量：TESS_DATA_API_BASE_URL（异常数据 API 根地址）
-    可选：TESS_DATA_API_KEY（Bearer Token，留空则不带鉴权）
-          TESS_DATA_API_TIMEOUT（请求超时秒，默认 10）
+    必需环境变量：TESS_DATA_API_BASE_URL（异常数据 API 根地址，需含 /api/v1 前缀，
+                  例：https://saas.teensing.com/api/v1）
+    可选：TESS_DATA_API_TIMEOUT（请求超时秒，默认 10）
+
+    鉴权：token 由每次调用透传（来自请求头 X-Teensing-Token），作为 Bearer 发给
+          Teensing；环境变量 TESS_DATA_API_KEY 仅作兜底（多数场景不使用）。
     """
 
     def __init__(
@@ -103,17 +114,30 @@ class TeensingDataConnector:
 
     # ----- 传输层 -----
 
-    def _headers(self) -> dict:
+    def _headers(self, token: Optional[str] = None) -> dict:
         headers = {"Accept": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        # 优先用调用方透传的运营 token；缺省再用环境变量兜底 token
+        auth = token or self.api_key
+        if auth:
+            headers["Authorization"] = f"Bearer {auth}"
         return headers
 
-    def _http_get(self, path: str, params: Optional[dict] = None) -> dict:
+    @staticmethod
+    def _unwrap(resp: dict) -> dict:
+        """Teensing 统一返回 {code,message,data,meta}；拦截器解包 data，这里同样处理。"""
+        if isinstance(resp, dict) and "data" in resp and "code" in resp:
+            return resp.get("data") if isinstance(resp.get("data"), dict) else resp
+        return resp
+
+    def _http_get(
+        self, path: str, params: Optional[dict] = None, token: Optional[str] = None
+    ) -> dict:
         url = self.base_url + path
         if params:
             url += "?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers=self._headers(), method="GET")
+        req = urllib.request.Request(
+            url, headers=self._headers(token), method="GET"
+        )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read().decode("utf-8")
@@ -129,23 +153,67 @@ class TeensingDataConnector:
 
     # ----- DataConnector 接口实现 -----
 
-    def fetch_recent_anomalies(self, limit: int = 20) -> list[dict]:
-        # TODO(接入): 确认 Teensing 异常列表端点路径与分页参数名（如 page/limit/pageSize）。
-        # 下方默认调用 GET /anomalies?limit=N；若返回结构为 {items:[...]} 则取 items。
-        resp = self._http_get("/anomalies", {"limit": limit})
-        if isinstance(resp, list):
-            return resp
-        if isinstance(resp, dict):
-            for key in ("items", "data", "anomalies", "results"):
-                if isinstance(resp.get(key), list):
-                    return resp[key]
-        logger.warning("Teensing 异常列表返回结构未识别，已按空列表处理：%r", resp)
-        return []
+    def fetch_recent_anomalies(
+        self, limit: int = 20, token: Optional[str] = None
+    ) -> list[dict]:
+        """拉取最近异常实体（涨跌榜 + 异常预警归并）。
 
-    def fetch_anomaly_event(self, event_id: str) -> Optional[dict]:
-        # TODO(接入): 确认单事件端点路径（如 /anomalies/{id} 或 /events/{id}）。
-        resp = self._http_get(f"/anomalies/{event_id}")
-        return resp if isinstance(resp, dict) else None
+        主数据源：GET /overview/ranking/fluctuation（含 revenue/clicks/cvr/profit/margin/change）
+        辅助标记：GET /overview/ranking/anomaly-warning（标出被预警的实体）
+        二者按实体名(name)归并，构造可供 normalize_to_context 使用的原始事件。
+        """
+        warn = self._unwrap(
+            self._http_get("/overview/ranking/anomaly-warning", token=token)
+        )
+        fluc = self._unwrap(
+            self._http_get("/overview/ranking/fluctuation", token=token)
+        )
+        # 量化指标按实体名归并（fluctuation 含数值）
+        fluc_map: dict = {}
+        if isinstance(fluc, dict):
+            for grp in ("rising", "falling"):
+                for it in fluc.get(grp) or []:
+                    if isinstance(it, dict) and it.get("name"):
+                        fluc_map[it["name"]] = it
+        raws: list[dict] = []
+        if isinstance(warn, dict):
+            for grp in ("rising", "falling"):
+                for it in warn.get(grp) or []:
+                    if not isinstance(it, dict):
+                        continue
+                    name = it.get("name") or it.get("entity") or it.get("entity_name")
+                    merged = dict(it)
+                    if name and name in fluc_map:
+                        # fluctuation 的量化字段补齐到预警项上
+                        for k, v in fluc_map[name].items():
+                            merged.setdefault(k, v)
+                    merged["_direction"] = grp
+                    raws.append(merged)
+        # 若 anomaly-warning 为空，则直接用 fluctuation 列表
+        if not raws and isinstance(fluc, dict):
+            for grp in ("rising", "falling"):
+                for it in fluc.get(grp) or []:
+                    if isinstance(it, dict):
+                        merged = dict(it)
+                        merged["_direction"] = grp
+                        raws.append(merged)
+        return raws[:limit]
+
+    def fetch_anomaly_event(
+        self, event_id: str, token: Optional[str] = None
+    ) -> Optional[dict]:
+        """按实体名（event_id）在 fluctuation 中查找单条（best-effort）。"""
+        fluc = self._unwrap(
+            self._http_get("/overview/ranking/fluctuation", token=token)
+        )
+        if isinstance(fluc, dict):
+            for grp in ("rising", "falling"):
+                for it in fluc.get(grp) or []:
+                    if isinstance(it, dict) and it.get("name") == event_id:
+                        merged = dict(it)
+                        merged["_direction"] = grp
+                        return merged
+        return None
 
 
 # ----- 归一化：Teensing 原始事件 -> PRD §4.1 Context -----
@@ -154,25 +222,98 @@ class TeensingDataConnector:
 def normalize_to_context(raw: dict) -> dict:
     """把 Teensing 原始 anomaly 映射为 PRD §4.1 Context（各 connector 共用）。
 
-    TODO(接入): 按 Teensing 实际返回字段调整下方映射。
-    当前默认假设 raw 已接近 Context 形状；若 Teensing 字段名不同，
-    在此处做字段对齐即可，无需改动下游编排/诊断逻辑。
+    兼容两种上游形状：
+    (a) 直接就是 Context（含 anomaly_metadata / top_contributors / associated_signals）
+        —— Mock 样例、上游已规范化数据走这里。
+    (b) Teensing fluctuation/anomaly 形状（含 name / change / revenue / profit / margin）
+        —— 真实接入走这里；字段映射见下方 TODO(接入)，可按实际返回结构微调。
+
+    下游编排/诊断逻辑无需改动，归一化在此完成。
     """
-    # 兼容「原始事件直接就是 Context」与「嵌套在 meta 里」两种情况
-    meta_src = raw.get("anomaly_metadata", raw)
-    meta = {
-        "event_id": raw.get("event_id") or meta_src.get("event_id"),
-        "trigger_time": meta_src.get("trigger_time"),
-        "target_metric": meta_src.get("target_metric"),
-        "current_value": meta_src.get("current_value"),
-        "benchmark_value": meta_src.get("benchmark_value"),
-        "severity": meta_src.get("severity"),
-        "calculated_loss": meta_src.get("calculated_loss"),
+    # (a) 已是 Context 形状：原样抽取
+    if "anomaly_metadata" in raw or "top_contributors" in raw or "associated_signals" in raw:
+        meta_src = raw.get("anomaly_metadata", raw)
+        meta = {
+            "event_id": raw.get("event_id") or meta_src.get("event_id"),
+            "trigger_time": meta_src.get("trigger_time"),
+            "target_metric": meta_src.get("target_metric"),
+            "current_value": meta_src.get("current_value"),
+            "benchmark_value": meta_src.get("benchmark_value"),
+            "severity": meta_src.get("severity"),
+            "calculated_loss": meta_src.get("calculated_loss"),
+        }
+        return {
+            "anomaly_metadata": meta,
+            "top_contributors": raw.get("top_contributors", []),
+            "associated_signals": raw.get("associated_signals", []),
+        }
+
+    # (b) Teensing fluctuation/anomaly 形状
+    name = (
+        raw.get("name")
+        or raw.get("entity")
+        or raw.get("entity_name")
+        or "UNKNOWN"
+    )
+    direction = raw.get("_direction", "falling")
+    change = raw.get("change")  # 主指标日环比变化（数值，可为 % 或绝对值）
+    profit = raw.get("profit")
+    revenue = raw.get("revenue")
+    margin = raw.get("margin")
+
+    # TODO(接入): 按 Teensing 实际字段语义校准。以下为保守默认：
+    #   target_metric 取 profit（最具业务意义的亏损指标），缺则 revenue
+    #   current_value 取当前 profit/revenue；benchmark 以 change 反推基线
+    target_metric = "Profit" if profit is not None else ("Revenue" if revenue is not None else "Metric")
+    current_value = profit if profit is not None else revenue
+
+    benchmark_value = None
+    if isinstance(change, (int, float)) and isinstance(current_value, (int, float)):
+        benchmark_value = current_value - change
+
+    # severity 由变化幅度推导（可经 TESS 阈值配置进一步细化）
+    severity = "LOW"
+    if isinstance(change, (int, float)):
+        if change <= -10:
+            severity = "HIGH"
+        elif change < 0:
+            severity = "MEDIUM"
+        elif change >= 10:
+            severity = "HIGH"
+        elif change > 0:
+            severity = "MEDIUM"
+
+    loss = {
+        "delta": change,
+        "direction": direction,
+        "metric": target_metric,
+        "current_value": current_value,
+        "benchmark_value": benchmark_value,
+        "margin": margin,
     }
+    meta = {
+        "event_id": name,
+        "trigger_time": raw.get("trigger_time"),
+        "target_metric": target_metric,
+        "current_value": current_value,
+        "benchmark_value": benchmark_value,
+        "severity": severity,
+        "calculated_loss": loss,
+    }
+    top_contributors = [
+        {
+            "dimension_type": "Entity",
+            "dimension_value": name,
+            "impact_share": "100%",
+            "metric_change": (
+                f"{target_metric} {change:+g}" if isinstance(change, (int, float)) else None
+            ),
+        }
+    ]
     return {
         "anomaly_metadata": meta,
-        "top_contributors": raw.get("top_contributors", []),
-        "associated_signals": raw.get("associated_signals", []),
+        "top_contributors": top_contributors,
+        "associated_signals": [],
     }
 
 
