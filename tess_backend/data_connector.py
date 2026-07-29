@@ -21,6 +21,7 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from typing import Optional, Protocol
 
 logger = logging.getLogger("tess_backend.data_connector")
@@ -54,19 +55,51 @@ _SAMPLE_RAW = {
     ],
 }
 
-# 开发/测试用样例：实时 KPI 小时级曲线（最后一点 revenue/clicks/profit 骤降，可触发异常）
-_SAMPLE_REALTIME_KPI = {
-    "success": True,
-    "data": {
-        "series": [
-            {"time": "2026-07-29 09:00", "revenue": 1200, "clicks": 8000, "profit": 300},
-            {"time": "2026-07-29 10:00", "revenue": 1180, "clicks": 7900, "profit": 290},
-            {"time": "2026-07-29 11:00", "revenue": 1210, "clicks": 8100, "profit": 305},
-            {"time": "2026-07-29 12:00", "revenue": 1190, "clicks": 8050, "profit": 298},
-            {"time": "2026-07-29 13:00", "revenue": 200, "clicks": 1500, "profit": 40},
-        ]
-    },
-}
+# 开发/测试用样例：realtime-kpi 真实结构（data.items[] 逐小时 today/yesterday 同比）。
+# hour 12 模拟一次 Revenue 同比暴跌 50%，便于单测默认阈值命中、高阈值(0.99)不命中。
+def _build_sample_realtime_kpi():
+    rows = [
+        ("00", 1387.795, 1202.416),
+        ("01", 1726.969, 1473.080),
+        ("02", 1758.089, 1409.218),
+        ("03", 1671.006, 1670.051),
+        ("04", 1651.021, 1596.898),
+        ("05", 1642.383, 1518.930),
+        ("06", 1645.222, 1477.255),
+        ("07", 1333.766, 1429.479),
+        ("08", 1357.255, 1390.104),
+        ("09", 1300.000, 1400.000),
+        ("10", 1280.000, 1400.000),
+        ("11", 1250.000, 1400.000),
+        ("12", 700.000, 1400.000),
+        ("13", 1300.000, 1400.000),
+        ("14", 1280.000, 1400.000),
+        ("15", 1250.000, 1400.000),
+        ("16", 1200.000, 1400.000),
+        ("17", 1250.000, 1400.000),
+        ("18", 1300.000, 1400.000),
+        ("19", 1280.000, 1400.000),
+        ("20", 1300.000, 1400.000),
+        ("21", 1250.000, 1400.000),
+        ("22", 1200.000, 1400.000),
+        ("23", 1100.000, 1400.000),
+    ]
+    items = [
+        {
+            "hour": h,
+            "today_revenue": today,
+            "today_clicks": int(today * 1500),
+            "today_conversions": int(today * 4),
+            "yesterday_revenue": yest,
+            "yesterday_clicks": int(yest * 1800),
+            "yesterday_conversions": int(yest * 4),
+        }
+        for h, today, yest in rows
+    ]
+    return {"code": 0, "message": "success", "data": {"items": items}, "meta": ""}
+
+
+_SAMPLE_REALTIME_KPI = _build_sample_realtime_kpi()
 
 
 class DataConnector(Protocol):
@@ -240,8 +273,11 @@ class TeensingDataConnector:
     def fetch_realtime_kpi(self, token: Optional[str] = None) -> dict:
         """拉取实时 KPI 小时级曲线（GET /overview/realtime-kpi）。
 
-        返回结构文档未给字段细节，extract_realtime_anomalies() 做了鲁棒解析，
-        TODO(接入): 拿到真实返回 JSON 后，如有字段差异在该函数/解析处对齐。
+        真实返回结构（已对齐）：
+          {"code":0,"message":"success","data":{"items":[
+            {"hour":"00","today_revenue":..,"today_clicks":..,"today_conversions":..,
+             "yesterday_revenue":..,"yesterday_clicks":..,"yesterday_conversions":..}, ...]}}
+        _unwrap 解包外层提取 data.items；extract_realtime_anomalies() 负责解析与异常判定。
         """
         return self._unwrap(
             self._http_get("/overview/realtime-kpi", token=token)
@@ -349,80 +385,172 @@ def normalize_to_context(raw: dict) -> dict:
     }
 
 
-def extract_realtime_anomalies(
-    raw: dict, threshold: Optional[float] = None, min_points: int = 3
-) -> list[dict]:
-    """把实时 KPI 小时级曲线解析为异常 Context 列表（PRD §4.1 形状）。
+def _hour_int(v):
+    """把 '00'/'0'/0/None 等归一为 int 小时；非法返回 None。"""
+    if v is None:
+        return None
+    try:
+        return int(str(v).strip())
+    except (ValueError, TypeError):
+        return None
 
-    判定逻辑：对曲线中的每个指标，取最新一小时值 vs 前 N 小时基线均值，
-    当跌幅 (baseline - current)/baseline >= 阈值（默认 30%）时，判定该指标当前点异常，
-    生成一个 Context 交由 Tess 诊断。
 
-    TODO(接入): 文档未给 /overview/realtime-kpi 的精确返回结构。当前假设：
-      { "data": { "series": [ {"time": "...", "<metric>": <num>, ...}, ... ] } }
-    若真实返回为「按 metric 分组的 points 列表」等其它形状，在此处做字段对齐即可，
-    下游诊断逻辑无需改动。
+def _num(v):
+    """转 float，失败返回 0.0。"""
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _parse_realtime_items(raw):
+    """从 realtime-kpi 返回中抽出 items 列表（兼容已 unwrap / 未 unwrap 两种形状）。
+
+    真实结构：{"code":0,"data":{"items":[ {hour,today_revenue,...}, ... ]}}
+    TeensingDataConnector._unwrap 已解包外层，故也可能直接是 {"items":[...]}。
     """
-    if threshold is None:
-        try:
-            threshold = float(os.getenv("TESS_REALTIME_DROP_THRESHOLD", "0.3"))
-        except (ValueError, TypeError):
-            threshold = 0.3
-
     if not isinstance(raw, dict):
         return []
-    data = raw.get("data", raw)
-    series = data.get("series") if isinstance(data, dict) else None
-    if not isinstance(series, list) or len(series) < min_points:
-        logger.warning("realtime-kpi 曲线点数不足(%s)，跳过异常检测", len(series) if isinstance(series, list) else "非列表")
-        return []
+    if isinstance(raw.get("items"), list):
+        return raw["items"]
+    data = raw.get("data")
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        return data["items"]
+    return []
 
-    latest = series[-1]
-    if not isinstance(latest, dict):
+
+def _gap_context(start, end, yest_total):
+    """连续掉零聚合为一条「数据中断」告警（PRD §4.1 形状）。"""
+    span = f"{start:02d}-{end:02d}" if start != end else f"{start:02d}"
+    return {
+        "anomaly_metadata": {
+            "event_id": f"REALTIME-GAP-{start:02d}-{end:02d}",
+            "trigger_time": f"hour {span}",
+            "target_metric": "Revenue",
+            "current_value": 0.0,
+            "benchmark_value": round(yest_total, 2),
+            "severity": "HIGH",
+            "calculated_loss": round(yest_total, 2),
+        },
+        "top_contributors": [
+            {
+                "dimension_type": "Hour",
+                "dimension_value": span,
+                "impact_share": "100%",
+                "metric_change": f"今日收益跌至 0，昨日同期合计 {yest_total:,.2f}",
+            }
+        ],
+        "associated_signals": [
+            {
+                "source": "realtime-kpi",
+                "type": "data_gap",
+                "hours": span,
+                "yesterday_revenue_total": round(yest_total, 2),
+            }
+        ],
+    }
+
+
+def _drop_context(it, h, today, yest, drop):
+    """单小时同比暴跌告警（PRD §4.1 形状）。"""
+    return {
+        "anomaly_metadata": {
+            "event_id": f"REALTIME-DROP-{h:02d}",
+            "trigger_time": f"hour {h:02d}",
+            "target_metric": "Revenue",
+            "current_value": today,
+            "benchmark_value": yest,
+            "severity": "HIGH" if drop >= 0.5 else "MEDIUM",
+            "calculated_loss": round(yest - today, 2),
+        },
+        "top_contributors": [
+            {
+                "dimension_type": "Hour",
+                "dimension_value": f"{h:02d}",
+                "impact_share": "100%",
+                "metric_change": f"Revenue {today:,.2f} 较昨日 {yest:,.2f} 下跌 {drop*100:.1f}%",
+            }
+        ],
+        "associated_signals": [
+            {
+                "source": "realtime-kpi",
+                "type": "revenue_drop",
+                "hour": h,
+                "today_revenue": today,
+                "yesterday_revenue": yest,
+                "drop_ratio": round(drop, 4),
+            }
+        ],
+    }
+
+
+def extract_realtime_anomalies(
+    raw: dict, drop_threshold: Optional[float] = None, now_hour: Optional[int] = None
+) -> list[dict]:
+    """把 realtime-kpi 真实返回解析为异常 Context 列表（PRD §4.1 形状）。
+
+    真实返回结构（已对齐）：
+      {"code":0,"message":"success","data":{"items":[
+        {"hour":"00","today_revenue":1387.795,"today_clicks":2645837,
+         "today_conversions":5588,"yesterday_revenue":1202.416,
+         "yesterday_clicks":3489430,"yesterday_conversions":5028}, ...]}}
+
+    检测规则（仅对「已发生小时」h <= now_hour 生效，未来小时今日尚未产生数据，不计异常）：
+    1) 数据掉零：yesterday_revenue > 0 且 today_revenue <= 0 → 严重异常（HIGH）。
+       连续掉零小时聚合为一条「数据中断」告警，避免逐小时刷屏。
+    2) 同比暴跌：today_revenue > 0 且 (1 - today/yesterday) >= drop_threshold
+       （默认 0.3，可配 TESS_REALTIME_DROP_THRESHOLD）→ MEDIUM/HIGH 异常。
+
+    now_hour 默认取服务器本地 hour；测试可显式传入以固定扫描窗口。
+    """
+    if drop_threshold is None:
+        try:
+            drop_threshold = float(os.getenv("TESS_REALTIME_DROP_THRESHOLD", "0.3"))
+        except (ValueError, TypeError):
+            drop_threshold = 0.3
+    if now_hour is None:
+        now_hour = datetime.now().hour
+
+    items = _parse_realtime_items(raw)
+    if not items:
+        logger.warning("realtime-kpi 未解析到 items，跳过异常检测")
         return []
-    metric_keys = [
-        k for k in latest.keys()
-        if k != "time" and isinstance(latest.get(k), (int, float))
-    ]
 
     contexts: list[dict] = []
-    for m in metric_keys:
-        values = [
-            p.get(m)
-            for p in series
-            if isinstance(p, dict) and isinstance(p.get(m), (int, float))
-        ]
-        if len(values) < min_points:
+    gap_start = None
+    gap_prev = None
+    gap_yest_total = 0.0
+
+    for it in sorted(items, key=lambda x: _hour_int(x.get("hour")) or 0):
+        h = _hour_int(it.get("hour"))
+        if h is None or h > now_hour:
+            # 当前小时之后的数据尚未产生，先收尾任何连续掉零段
+            if gap_start is not None:
+                contexts.append(_gap_context(gap_start, gap_prev, gap_yest_total))
+                gap_start, gap_prev, gap_yest_total = None, None, 0.0
             continue
-        current = values[-1]
-        baseline = sum(values[:-1]) / len(values[:-1])
-        if not baseline or current is None:
-            continue
-        drop = (baseline - current) / baseline
-        if drop < threshold:
-            continue
-        ctx = {
-            "anomaly_metadata": {
-                "event_id": f"REALTIME-{m}-{latest.get('time', 'latest')}",
-                "trigger_time": latest.get("time"),
-                "target_metric": m,
-                "current_value": current,
-                "benchmark_value": round(baseline, 4),
-                "calculated_loss": round(abs(current - baseline), 4),
-                "severity": "HIGH" if drop >= 0.5 else "MEDIUM",
-            },
-            "top_contributors": [],
-            "associated_signals": [
-                {
-                    "source": "realtime-kpi",
-                    "metric": m,
-                    "baseline": round(baseline, 4),
-                    "current": current,
-                    "drop_ratio": round(drop, 4),
-                }
-            ],
-        }
-        contexts.append(ctx)
+
+        today = _num(it.get("today_revenue"))
+        yest = _num(it.get("yesterday_revenue"))
+
+        if yest > 0 and today <= 0:
+            # 数据掉零
+            if gap_start is None:
+                gap_start = h
+            gap_prev = h
+            gap_yest_total += yest
+        else:
+            if gap_start is not None:
+                contexts.append(_gap_context(gap_start, gap_prev, gap_yest_total))
+                gap_start, gap_prev, gap_yest_total = None, None, 0.0
+            if yest > 0 and today > 0:
+                drop = (yest - today) / yest
+                if drop >= drop_threshold:
+                    contexts.append(_drop_context(it, h, today, yest, drop))
+
+    if gap_start is not None:
+        contexts.append(_gap_context(gap_start, gap_prev, gap_yest_total))
+
     return contexts
 
 

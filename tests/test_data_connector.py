@@ -175,19 +175,19 @@ def test_audit_log_records_per_operator(client):
 # ---- P7b：实时 KPI 曲线拉取 + 异常提取 ----
 
 def test_mock_connector_realtime_kpi_has_anomaly():
-    """MockDataConnector.fetch_realtime_kpi 返回含骤降的曲线。"""
+    """MockDataConnector.fetch_realtime_kpi 返回真实结构 data.items[]。"""
     c = MockDataConnector()
     kpi = c.fetch_realtime_kpi()
     assert isinstance(kpi, dict)
-    assert "series" in kpi["data"]
+    assert "items" in kpi["data"]
 
 
 def test_extract_realtime_anomalies_flags_drop():
-    """extract_realtime_anomalies 应把骤降指标判为异常 Context。"""
+    """extract_realtime_anomalies 应把同比暴跌小时判为异常 Context。"""
     c = MockDataConnector()
     kpi = c.fetch_realtime_kpi()
-    ctxs = extract_realtime_anomalies(kpi)
-    # 样例曲线 revenue/clicks/profit 末点骤降，应至少识别出 1 个异常
+    ctxs = extract_realtime_anomalies(kpi, now_hour=23)
+    # 样例 hour 12 同比 -50%，应至少识别出 1 个异常
     assert len(ctxs) >= 1
     ids = [x["anomaly_metadata"]["event_id"] for x in ctxs]
     assert any(i.startswith("REALTIME-") for i in ids)
@@ -202,8 +202,56 @@ def test_extract_realtime_anomalies_threshold():
     """阈值抬高到 0.99 时，样例曲线不应触发任何异常。"""
     c = MockDataConnector()
     kpi = c.fetch_realtime_kpi()
-    ctxs = extract_realtime_anomalies(kpi, threshold=0.99)
+    ctxs = extract_realtime_anomalies(kpi, drop_threshold=0.99, now_hour=23)
     assert ctxs == []
+
+
+def test_extract_realtime_anomalies_data_gap():
+    """真实返回（hour 09 起 today 全 0）应识别为数据掉零，并聚合成数据中断告警。"""
+    real_raw = {
+        "code": 0,
+        "message": "success",
+        "data": {
+            "items": [
+                {"hour": "00", "today_revenue": 1387.795, "today_clicks": 2645837, "today_conversions": 5588, "yesterday_revenue": 1202.416, "yesterday_clicks": 3489430, "yesterday_conversions": 5028},
+                {"hour": "01", "today_revenue": 1726.969, "today_clicks": 2886768, "today_conversions": 7324, "yesterday_revenue": 1473.08, "yesterday_clicks": 3697004, "yesterday_conversions": 6927},
+                {"hour": "02", "today_revenue": 1758.089, "today_clicks": 2992134, "today_conversions": 8137, "yesterday_revenue": 1409.218, "yesterday_clicks": 3304045, "yesterday_conversions": 6907},
+                {"hour": "03", "today_revenue": 1671.006, "today_clicks": 2773103, "today_conversions": 7729, "yesterday_revenue": 1670.051, "yesterday_clicks": 3310794, "yesterday_conversions": 8276},
+                {"hour": "04", "today_revenue": 1651.021, "today_clicks": 2714043, "today_conversions": 8392, "yesterday_revenue": 1596.898, "yesterday_clicks": 3156141, "yesterday_conversions": 7727},
+                {"hour": "05", "today_revenue": 1642.383, "today_clicks": 2891099, "today_conversions": 8317, "yesterday_revenue": 1518.93, "yesterday_clicks": 2638601, "yesterday_conversions": 7928},
+                {"hour": "06", "today_revenue": 1645.222, "today_clicks": 2876079, "today_conversions": 8559, "yesterday_revenue": 1477.255, "yesterday_clicks": 2691996, "yesterday_conversions": 8341},
+                {"hour": "07", "today_revenue": 1333.766, "today_clicks": 2853292, "today_conversions": 7016, "yesterday_revenue": 1429.479, "yesterday_clicks": 2667018, "yesterday_conversions": 7657},
+                {"hour": "08", "today_revenue": 1357.255, "today_clicks": 2975250, "today_conversions": 6800, "yesterday_revenue": 1390.104, "yesterday_clicks": 2749025, "yesterday_conversions": 7098},
+                {"hour": "09", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 1424.944, "yesterday_clicks": 2858079, "yesterday_conversions": 7481},
+                {"hour": "10", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 1354.531, "yesterday_clicks": 2797587, "yesterday_conversions": 6864},
+                {"hour": "11", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 1231.165, "yesterday_clicks": 2798602, "yesterday_conversions": 6477},
+                {"hour": "12", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 1242.933, "yesterday_clicks": 2624107, "yesterday_conversions": 6424},
+                {"hour": "13", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 1114.358, "yesterday_clicks": 2561683, "yesterday_conversions": 5874},
+                {"hour": "14", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 1098.172, "yesterday_clicks": 2525926, "yesterday_conversions": 6447},
+                {"hour": "15", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 963.406, "yesterday_clicks": 2534758, "yesterday_conversions": 6084},
+                {"hour": "16", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 910.702, "yesterday_clicks": 2579412, "yesterday_conversions": 5357},
+                {"hour": "17", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 914.082, "yesterday_clicks": 2626853, "yesterday_conversions": 4496},
+                {"hour": "18", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 873.301, "yesterday_clicks": 2514577, "yesterday_conversions": 4050},
+                {"hour": "19", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 716.333, "yesterday_clicks": 2377858, "yesterday_conversions": 2827},
+                {"hour": "20", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 649.714, "yesterday_clicks": 2067953, "yesterday_conversions": 2415},
+                {"hour": "21", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 512.278, "yesterday_clicks": 1600090, "yesterday_conversions": 1978},
+                {"hour": "22", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 479.023, "yesterday_clicks": 1238829, "yesterday_conversions": 1892},
+                {"hour": "23", "today_revenue": 0.0, "today_clicks": 0, "today_conversions": 0, "yesterday_revenue": 442.465, "yesterday_clicks": 1130998, "yesterday_conversions": 1917},
+            ]
+        },
+        "meta": "",
+    }
+    ctxs = extract_realtime_anomalies(real_raw, now_hour=23)
+    # 09-23 连续掉零应聚合成 1 条数据中断告警
+    gap = [c for c in ctxs if c["anomaly_metadata"]["event_id"].startswith("REALTIME-GAP-")]
+    assert len(gap) == 1
+    meta = gap[0]["anomaly_metadata"]
+    assert meta["current_value"] == 0.0
+    assert meta["benchmark_value"] > 0
+    assert meta["severity"] == "HIGH"
+    # 00-08 正常，不应产生暴跌异常
+    drops = [c for c in ctxs if c["anomaly_metadata"]["event_id"].startswith("REALTIME-DROP-")]
+    assert drops == []
 
 
 def test_realtime_kpi_token_forwarded(monkeypatch):
@@ -213,7 +261,7 @@ def test_realtime_kpi_token_forwarded(monkeypatch):
     def fake_get(self, path, params=None, token=None):
         captured["path"] = path
         captured["token"] = token
-        return {"code": 0, "data": {"series": []}}
+        return {"code": 0, "data": {"items": []}}
 
     monkeypatch.setattr(TeensingDataConnector, "_http_get", fake_get)
     c = TeensingDataConnector(base_url="https://saas.example.com/api/v1")
