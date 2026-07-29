@@ -18,8 +18,16 @@ echo "=== Tess 测试服务器一键部署（2vCPU/2GiB）==="
 if ! command -v docker >/dev/null 2>&1; then
   echo "[1/4] 未检测到 Docker，开始安装 ..."
   if command -v dnf >/dev/null 2>&1; then
-    sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin 2>/dev/null || \
-    sudo dnf -y install docker 2>/dev/null || true
+    # Alibaba Cloud Linux 等 RHEL 系：dnf install docker 会装成 podman 垫片，
+    # 且官方源 download.docker.com 国内连不上 → 改用阿里云镜像
+    sudo dnf remove -y podman-docker 2>/dev/null || true
+    if ! rpm -q docker-ce >/dev/null 2>&1; then
+      sudo dnf -y install yum-utils
+      sudo yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo 2>/dev/null || \
+      sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+      sudo sed -i 's/\$releasever/8/g' /etc/yum.repos.d/docker-ce.repo 2>/dev/null || true
+      sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    fi
   fi
   # 兜底：官方便捷脚本（Ubuntu/CentOS 通用）
   if ! command -v docker >/dev/null 2>&1; then

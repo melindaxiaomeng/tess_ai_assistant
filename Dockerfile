@@ -3,7 +3,8 @@ FROM python:3.13-slim
 # 不缓冲日志（容器里实时看到 stdout）、不写 __pycache__ 进镜像
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    TESS_PORT=8080
+    TESS_PORT=8080 \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 WORKDIR /app
 
