@@ -26,6 +26,7 @@ from .remediation import (
     RemediationStore,
     MockRemediationExecutor,
 )
+from .data_connector import get_data_connector, normalize_to_context
 from .gaid_vault import VAULT, RedactFilter
 
 app = FastAPI(title="Tess Diagnose API", version="2.3.0")
@@ -88,6 +89,18 @@ def _get_llm_client() -> LLMClient:
     return HttpLLMClient(base_url, api_key, model, json_mode=True)
 
 
+# P5 数据接入层：惰性初始化（避免 import 期因未配置 teensing 而崩溃）。
+_DATA_CONNECTOR = None
+
+
+def _get_data_connector():
+    """按 TESS_DATA_CONNECTOR 选择 mock / teensing 实现，首次使用时创建并缓存。"""
+    global _DATA_CONNECTOR
+    if _DATA_CONNECTOR is None:
+        _DATA_CONNECTOR = get_data_connector()
+    return _DATA_CONNECTOR
+
+
 @app.post("/tess/diagnose")
 def diagnose(payload: dict) -> dict:
     """接收异常上下文 Input，返回 Gatekeeper 归一化后的归因结果。
@@ -116,6 +129,48 @@ def diagnose(payload: dict) -> dict:
         }
     STORE.observe_diagnosis(event_id, result["status"], result["confidence"])
     return result
+
+
+@app.post("/tess/diagnose-from-source")
+def diagnose_from_source(payload: dict = None) -> dict:
+    """P5 数据接入：从 Teensing 真实异常数据源拉取最近 N 个异常，逐个诊断。
+
+    body: { "limit": 5 }  （默认 5，最多 50）
+    拉取到的原始事件经 normalize_to_context 转成 PRD §4.1 Context 后送编排层；
+    处置执行器不受影响（仍走 Mock / 服务端配置）。
+    诊断失败时单条降级为 INCONCLUSIVE，不影响其余事件。
+    """
+    payload = payload or {}
+    limit = max(1, min(int(payload.get("limit", 5)), 50))
+    try:
+        connector = _get_data_connector()
+    except Exception as e:  # 接入层未配置（如 teensing 缺 base_url）
+        raise HTTPException(status_code=503, detail=f"数据接入层初始化失败：{e}")
+    raw_events = connector.fetch_recent_anomalies(limit)
+    llm = _get_llm_client()
+    results = []
+    for raw in raw_events:
+        ctx = normalize_to_context(raw)
+        VAULT.ingest(ctx)
+        policy = load_policy()
+        event_id = (ctx.get("anomaly_metadata") or {}).get("event_id", "UNKNOWN")
+        try:
+            diag = run_diagnosis(ctx, llm, policy=policy)
+        except HTTPException:
+            raise
+        except Exception as e:  # 单条异常不拖垮整批
+            diag = {
+                "status": "INCONCLUSIVE",
+                "confidence": 0.0,
+                "summary": f"Tess 诊断链路异常，已自动切入人工排查：{type(e).__name__}",
+                "root_cause_analysis": {
+                    "primary_factor": f"系统异常：{type(e).__name__}",
+                    "causal_chain": ["编排链路异常", "转人工处理"],
+                },
+            }
+        STORE.observe_diagnosis(event_id, diag.get("status", "UNKNOWN"), diag.get("confidence", 0.0))
+        results.append({"event_id": event_id, "diagnosis": diag})
+    return {"count": len(results), "results": results}
 
 @app.post("/tess/gaid/resolve")
 def gaid_resolve(payload: dict = None) -> dict:
