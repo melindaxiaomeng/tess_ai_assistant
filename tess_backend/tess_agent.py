@@ -8,9 +8,12 @@
 """
 
 import json
+import logging
 import re
 import time
 from typing import List, Protocol, runtime_checkable
+
+logger = logging.getLogger(__name__)
 
 from .contracts import STATUS_INCONCLUSIVE
 from .gatekeeper import validate_tess_output
@@ -205,6 +208,7 @@ class TessAgent:
                 return validate_tess_output(parsed, input_data, self.policy)
             except Exception as e:  # 网络 / 解析异常 -> 重试
                 last_err = e
+                logger.warning("LLM 调用第 %d 次失败：%r", attempt + 1, e)
                 time.sleep(min(0.1 * (attempt + 1), 1.0))  # 轻微退避
 
         # 重试耗尽仍未拿到合法输出
