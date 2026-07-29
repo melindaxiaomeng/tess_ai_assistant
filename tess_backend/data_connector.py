@@ -21,7 +21,6 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
 from typing import Optional, Protocol
 
 logger = logging.getLogger("tess_backend.data_connector")
@@ -485,7 +484,10 @@ def _drop_context(it, h, today, yest, drop):
 
 
 def extract_realtime_anomalies(
-    raw: dict, drop_threshold: Optional[float] = None, now_hour: Optional[int] = None
+    raw: dict,
+    drop_threshold: Optional[float] = None,
+    as_of_hour: Optional[int] = None,
+    grace_hours: Optional[int] = None,
 ) -> list[dict]:
     """把 realtime-kpi 真实返回解析为异常 Context 列表（PRD §4.1 形状）。
 
@@ -495,27 +497,50 @@ def extract_realtime_anomalies(
          "today_conversions":5588,"yesterday_revenue":1202.416,
          "yesterday_clicks":3489430,"yesterday_conversions":5028}, ...]}}
 
-    检测规则（仅对「已发生小时」h <= now_hour 生效，未来小时今日尚未产生数据，不计异常）：
-    1) 数据掉零：yesterday_revenue > 0 且 today_revenue <= 0 → 严重异常（HIGH）。
-       连续掉零小时聚合为一条「数据中断」告警，避免逐小时刷屏。
+    锚定策略（关键，避免误报）：
+    - as_of_hour（数据「更新到的小时」）默认**从数据自身推断** = 最后一个 today_revenue>0 的小时。
+      这样能天然区分「已完整过去的时段」与「接口每小时滚动更新、快照尚未覆盖的未来时段」，
+      避免把尾部全 0（数据未就绪）误判为掉零。
+    - grace_hours（延迟容忍窗口，默认 1，可配 TESS_REALTIME_GRACE_HOURS）：
+      当前小时及延迟窗口内 today_revenue=0 视为「数据尚未就绪（接口滞后 15-30min）」，不报掉零。
+      仅对 h <= as_of_hour - grace_hours 的「已完整过去」小时做判定。
+
+    异常规则（仅对已完整过去的小时生效）：
+    1) 数据掉零：yesterday_revenue > 0 且 today_revenue <= 0 → HIGH，连续掉零聚合为一条「数据中断」告警。
     2) 同比暴跌：today_revenue > 0 且 (1 - today/yesterday) >= drop_threshold
        （默认 0.3，可配 TESS_REALTIME_DROP_THRESHOLD）→ MEDIUM/HIGH 异常。
 
-    now_hour 默认取服务器本地 hour；测试可显式传入以固定扫描窗口。
+    若所有 today_revenue 均为 0（无法锚定 as_of_hour），返回空——不误报。
     """
     if drop_threshold is None:
         try:
             drop_threshold = float(os.getenv("TESS_REALTIME_DROP_THRESHOLD", "0.3"))
         except (ValueError, TypeError):
             drop_threshold = 0.3
-    if now_hour is None:
-        now_hour = datetime.now().hour
+    if grace_hours is None:
+        try:
+            grace_hours = int(os.getenv("TESS_REALTIME_GRACE_HOURS", "1"))
+        except (ValueError, TypeError):
+            grace_hours = 1
 
     items = _parse_realtime_items(raw)
     if not items:
         logger.warning("realtime-kpi 未解析到 items，跳过异常检测")
         return []
 
+    # 从数据推断「更新到的小时」；调用方可显式覆盖（如测试固定窗口）
+    if as_of_hour is None:
+        hrs = [
+            _hour_int(it.get("hour"))
+            for it in items
+            if _num(it.get("today_revenue")) > 0
+        ]
+        as_of_hour = max(hrs) if hrs else None
+    if as_of_hour is None:
+        logger.warning("realtime-kpi 所有 today_revenue 均为 0，无法锚定更新小时，跳过检测")
+        return []
+
+    cutoff = as_of_hour - grace_hours  # 仅 h <= cutoff 的小时参与掉零/暴跌判定
     contexts: list[dict] = []
     gap_start = None
     gap_prev = None
@@ -523,8 +548,8 @@ def extract_realtime_anomalies(
 
     for it in sorted(items, key=lambda x: _hour_int(x.get("hour")) or 0):
         h = _hour_int(it.get("hour"))
-        if h is None or h > now_hour:
-            # 当前小时之后的数据尚未产生，先收尾任何连续掉零段
+        if h is None or h > cutoff:
+            # 当前小时及延迟窗口内 / 未来小时：数据尚未就绪，不判掉零
             if gap_start is not None:
                 contexts.append(_gap_context(gap_start, gap_prev, gap_yest_total))
                 gap_start, gap_prev, gap_yest_total = None, None, 0.0
@@ -534,7 +559,7 @@ def extract_realtime_anomalies(
         yest = _num(it.get("yesterday_revenue"))
 
         if yest > 0 and today <= 0:
-            # 数据掉零
+            # 数据掉零（已完整过去的小时仍无数据）
             if gap_start is None:
                 gap_start = h
             gap_prev = h

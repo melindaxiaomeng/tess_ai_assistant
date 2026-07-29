@@ -183,14 +183,14 @@ def test_mock_connector_realtime_kpi_has_anomaly():
 
 
 def test_extract_realtime_anomalies_flags_drop():
-    """extract_realtime_anomalies 应把同比暴跌小时判为异常 Context。"""
+    """extract_realtime_anomalies 应把同比暴跌小时判为异常 Context（as_of_hour 从数据推断）。"""
     c = MockDataConnector()
     kpi = c.fetch_realtime_kpi()
-    ctxs = extract_realtime_anomalies(kpi, now_hour=23)
+    ctxs = extract_realtime_anomalies(kpi)
     # 样例 hour 12 同比 -50%，应至少识别出 1 个异常
     assert len(ctxs) >= 1
     ids = [x["anomaly_metadata"]["event_id"] for x in ctxs]
-    assert any(i.startswith("REALTIME-") for i in ids)
+    assert any(i.startswith("REALTIME-DROP-") for i in ids)
     # 异常点是 PRD §4.1 Context 形状，且 current < benchmark
     first = ctxs[0]
     meta = first["anomaly_metadata"]
@@ -202,12 +202,13 @@ def test_extract_realtime_anomalies_threshold():
     """阈值抬高到 0.99 时，样例曲线不应触发任何异常。"""
     c = MockDataConnector()
     kpi = c.fetch_realtime_kpi()
-    ctxs = extract_realtime_anomalies(kpi, drop_threshold=0.99, now_hour=23)
+    ctxs = extract_realtime_anomalies(kpi, drop_threshold=0.99)
     assert ctxs == []
 
 
-def test_extract_realtime_anomalies_data_gap():
-    """真实返回（hour 09 起 today 全 0）应识别为数据掉零，并聚合成数据中断告警。"""
+def test_extract_realtime_trailing_zeros_not_gap():
+    """真实返回（hour 09 起 today 全 0）是「每小时滚动更新、快照尚未覆盖」的正常尾部，
+    不应误判为数据掉零——as_of_hour 从数据推断=08，09-23 属未来/未就绪，零告警。"""
     real_raw = {
         "code": 0,
         "message": "success",
@@ -241,17 +242,30 @@ def test_extract_realtime_anomalies_data_gap():
         },
         "meta": "",
     }
-    ctxs = extract_realtime_anomalies(real_raw, now_hour=23)
-    # 09-23 连续掉零应聚合成 1 条数据中断告警
-    gap = [c for c in ctxs if c["anomaly_metadata"]["event_id"].startswith("REALTIME-GAP-")]
-    assert len(gap) == 1
-    meta = gap[0]["anomaly_metadata"]
-    assert meta["current_value"] == 0.0
-    assert meta["benchmark_value"] > 0
-    assert meta["severity"] == "HIGH"
-    # 00-08 正常，不应产生暴跌异常
-    drops = [c for c in ctxs if c["anomaly_metadata"]["event_id"].startswith("REALTIME-DROP-")]
-    assert drops == []
+    ctxs = extract_realtime_anomalies(real_raw)
+    # 尾部全 0 是快照边界，不是异常
+    assert ctxs == []
+
+
+def test_extract_realtime_single_hour_gap_detected():
+    """若数据更新到 16h，但 14h 单点掉零（13/15/16 有值），应识别出 14h 掉零。"""
+    raw = {
+        "code": 0,
+        "data": {
+            "items": [
+                {"hour": "13", "today_revenue": 1300.0, "yesterday_revenue": 1400.0},
+                {"hour": "14", "today_revenue": 0.0, "yesterday_revenue": 1400.0},
+                {"hour": "15", "today_revenue": 1300.0, "yesterday_revenue": 1400.0},
+                {"hour": "16", "today_revenue": 1300.0, "yesterday_revenue": 1400.0},
+            ]
+        },
+    }
+    ctxs = extract_realtime_anomalies(raw)
+    gaps = [c for c in ctxs if c["anomaly_metadata"]["event_id"].startswith("REALTIME-GAP-")]
+    assert len(gaps) == 1
+    assert gaps[0]["anomaly_metadata"]["event_id"] == "REALTIME-GAP-14-14"
+    assert gaps[0]["anomaly_metadata"]["current_value"] == 0.0
+    assert gaps[0]["anomaly_metadata"]["severity"] == "HIGH"
 
 
 def test_realtime_kpi_token_forwarded(monkeypatch):
