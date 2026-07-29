@@ -26,3 +26,7 @@ tess_backend/thresholds.json
 # 本机工具 / 导出产物（非源码，勿入库）
 .workbuddy/
 *.zip
+
+# 前端演示工程（构建产物 / 依赖不入库）
+tess-drawer-demo/node_modules/
+tess-drawer-demo/dist/

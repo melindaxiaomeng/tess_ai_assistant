@@ -1,0 +1,18 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 渲染屏障：Severity 业务标签配色（设计令牌替换点）。
+   注意：这些颜色是「算法层算好的 severity」展示用，LLM 无权生成或修改。 */
+.severity-badge.critical { background: #fee2e2; color: #b91c1c; }
+.severity-badge.high     { background: #ffedd5; color: #c2410c; }
+.severity-badge.medium   { background: #fef9c3; color: #a16207; }
+.severity-badge.low      { background: #dcfce7; color: #15803d; }
+.severity-badge.unknown  { background: #f1f5f9; color: #475569; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  background: #f5f7fa;
+  color: #1f2937;
+}
