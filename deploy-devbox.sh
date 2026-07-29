@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Tess · 北京开发盒（阿里云 99 套餐：2vCPU / 2GiB / Alibaba Cloud Linux 3）一键部署
+# Tess · 测试服务器（2vCPU / 2GiB / Alibaba Cloud Linux 3）一键部署
 #
 # 用法（在云机器上、已含本项目的目录内执行）：
 #   1) 把代码上传到云机器（见 DEPLOY.md §10.2）
@@ -12,7 +12,7 @@
 # =============================================================================
 set -euo pipefail
 
-echo "=== Tess 开发盒一键部署（阿里云 2vCPU/2GiB）==="
+echo "=== Tess 测试服务器一键部署（2vCPU/2GiB）==="
 
 # ---- 1. 安装 Docker（Alibaba Cloud Linux 3 / RHEL 系，dnf）----
 if ! command -v docker >/dev/null 2>&1; then
