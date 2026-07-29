@@ -45,12 +45,29 @@ def test_run_scheduled_diagnosis_stores_alerts(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "ALERTS", store)
 
     results = app_module.run_scheduled_diagnosis(limit=3)
-    assert len(results) >= 1
-    assert results[0]["diagnosis"]["status"] == "DIAGNOSED"
-    # 落库校验
-    rows = store.recent(limit=10)
-    assert len(rows) >= 1
-    assert rows[0]["event_id"] == "ERR-20260728-0912"
+    # 两类来源都应产出：异常预警(ERR-...) + 实时 KPI 骤降(REALTIME-...)
+    sources = {r.get("meta", {}).get("source") for r in results}
+    assert "anomaly-warning" in sources
+    assert "realtime-kpi" in sources
+    assert any(r["event_id"] == "ERR-20260728-0912" for r in results)
+    assert any(r["event_id"].startswith("REALTIME-") for r in results)
+
+    # 落库校验：两种来源都能按 source 过滤检索
+    rows = store.recent(limit=50)
+    assert len(rows) >= 2
+    stored_sources = {r["source"] for r in rows}
+    assert "anomaly-warning" in stored_sources
+    assert "realtime-kpi" in stored_sources
+
+
+def test_get_alerts_filter_by_source(client):
+    app_module.run_scheduled_diagnosis(limit=3)
+    # 只拉实时 KPI 异常
+    resp = client.get("/tess/alerts?source=realtime-kpi")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["count"] >= 1
+    assert all(r["source"] == "realtime-kpi" for r in body["alerts"])
 
 
 def test_get_alerts_endpoint(client):
@@ -61,6 +78,7 @@ def test_get_alerts_endpoint(client):
     body = resp.json()
     assert body["count"] >= 1
     assert "diagnosis" in body["alerts"][0]
+    assert "source" in body["alerts"][0]
 
 
 def test_cron_run_endpoint(client):

@@ -45,13 +45,27 @@ _SAMPLE_RAW = {
             "metric_change": "Margin 从 15.1% 降至 -2.4%",
         }
     ],
-    "associated_signals": [
+        "associated_signals": [
         {
             "source": "AppsFlyer_Pull_API",
             "status": "WARNING",
             "detail": "13:30-14:00 期间 Postback 接口 HTTP 504 (Gateway Timeout) 占比 45%",
         }
     ],
+}
+
+# 开发/测试用样例：实时 KPI 小时级曲线（最后一点 revenue/clicks/profit 骤降，可触发异常）
+_SAMPLE_REALTIME_KPI = {
+    "success": True,
+    "data": {
+        "series": [
+            {"time": "2026-07-29 09:00", "revenue": 1200, "clicks": 8000, "profit": 300},
+            {"time": "2026-07-29 10:00", "revenue": 1180, "clicks": 7900, "profit": 290},
+            {"time": "2026-07-29 11:00", "revenue": 1210, "clicks": 8100, "profit": 305},
+            {"time": "2026-07-29 12:00", "revenue": 1190, "clicks": 8050, "profit": 298},
+            {"time": "2026-07-29 13:00", "revenue": 200, "clicks": 1500, "profit": 40},
+        ]
+    },
 }
 
 
@@ -70,6 +84,10 @@ class DataConnector(Protocol):
         """按 event_id 拉取单个原始异常事件；不存在返回 None。"""
         ...
 
+    def fetch_realtime_kpi(self, token: Optional[str] = None) -> dict:
+        """拉取实时 KPI 小时级曲线（GET /overview/realtime-kpi）。"""
+        ...
+
 
 class MockDataConnector:
     """开发/测试用：返回内置样例原始事件，无需任何外部依赖。"""
@@ -85,6 +103,10 @@ class MockDataConnector:
             if s.get("event_id") == event_id:
                 return s
         return None
+
+    def fetch_realtime_kpi(self, token: Optional[str] = None) -> dict:
+        """返回内置样例实时 KPI 曲线，含一处骤降异常，供开发/测试直接跑通。"""
+        return _SAMPLE_REALTIME_KPI
 
 
 class TeensingDataConnector:
@@ -215,6 +237,16 @@ class TeensingDataConnector:
                         return merged
         return None
 
+    def fetch_realtime_kpi(self, token: Optional[str] = None) -> dict:
+        """拉取实时 KPI 小时级曲线（GET /overview/realtime-kpi）。
+
+        返回结构文档未给字段细节，extract_realtime_anomalies() 做了鲁棒解析，
+        TODO(接入): 拿到真实返回 JSON 后，如有字段差异在该函数/解析处对齐。
+        """
+        return self._unwrap(
+            self._http_get("/overview/realtime-kpi", token=token)
+        )
+
 
 # ----- 归一化：Teensing 原始事件 -> PRD §4.1 Context -----
 
@@ -315,6 +347,83 @@ def normalize_to_context(raw: dict) -> dict:
         "top_contributors": top_contributors,
         "associated_signals": [],
     }
+
+
+def extract_realtime_anomalies(
+    raw: dict, threshold: Optional[float] = None, min_points: int = 3
+) -> list[dict]:
+    """把实时 KPI 小时级曲线解析为异常 Context 列表（PRD §4.1 形状）。
+
+    判定逻辑：对曲线中的每个指标，取最新一小时值 vs 前 N 小时基线均值，
+    当跌幅 (baseline - current)/baseline >= 阈值（默认 30%）时，判定该指标当前点异常，
+    生成一个 Context 交由 Tess 诊断。
+
+    TODO(接入): 文档未给 /overview/realtime-kpi 的精确返回结构。当前假设：
+      { "data": { "series": [ {"time": "...", "<metric>": <num>, ...}, ... ] } }
+    若真实返回为「按 metric 分组的 points 列表」等其它形状，在此处做字段对齐即可，
+    下游诊断逻辑无需改动。
+    """
+    if threshold is None:
+        try:
+            threshold = float(os.getenv("TESS_REALTIME_DROP_THRESHOLD", "0.3"))
+        except (ValueError, TypeError):
+            threshold = 0.3
+
+    if not isinstance(raw, dict):
+        return []
+    data = raw.get("data", raw)
+    series = data.get("series") if isinstance(data, dict) else None
+    if not isinstance(series, list) or len(series) < min_points:
+        logger.warning("realtime-kpi 曲线点数不足(%s)，跳过异常检测", len(series) if isinstance(series, list) else "非列表")
+        return []
+
+    latest = series[-1]
+    if not isinstance(latest, dict):
+        return []
+    metric_keys = [
+        k for k in latest.keys()
+        if k != "time" and isinstance(latest.get(k), (int, float))
+    ]
+
+    contexts: list[dict] = []
+    for m in metric_keys:
+        values = [
+            p.get(m)
+            for p in series
+            if isinstance(p, dict) and isinstance(p.get(m), (int, float))
+        ]
+        if len(values) < min_points:
+            continue
+        current = values[-1]
+        baseline = sum(values[:-1]) / len(values[:-1])
+        if not baseline or current is None:
+            continue
+        drop = (baseline - current) / baseline
+        if drop < threshold:
+            continue
+        ctx = {
+            "anomaly_metadata": {
+                "event_id": f"REALTIME-{m}-{latest.get('time', 'latest')}",
+                "trigger_time": latest.get("time"),
+                "target_metric": m,
+                "current_value": current,
+                "benchmark_value": round(baseline, 4),
+                "calculated_loss": round(abs(current - baseline), 4),
+                "severity": "HIGH" if drop >= 0.5 else "MEDIUM",
+            },
+            "top_contributors": [],
+            "associated_signals": [
+                {
+                    "source": "realtime-kpi",
+                    "metric": m,
+                    "baseline": round(baseline, 4),
+                    "current": current,
+                    "drop_ratio": round(drop, 4),
+                }
+            ],
+        }
+        contexts.append(ctx)
+    return contexts
 
 
 def get_data_connector() -> DataConnector:

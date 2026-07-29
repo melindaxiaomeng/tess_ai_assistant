@@ -23,6 +23,8 @@ services:
       TESS_SCHEDULE_INTERVAL: "${TESS_SCHEDULE_INTERVAL:-3600}"
       TESS_SCHEDULE_LIMIT: "${TESS_SCHEDULE_LIMIT:-20}"
       TESS_SYSTEM_TOKEN: "${TESS_SYSTEM_TOKEN:-}"
+      # 实时 KPI 异常判定阈值（最新一小时较前 N 小时基线跌幅超此比例即判异常，默认 0.3）
+      TESS_REALTIME_DROP_THRESHOLD: "${TESS_REALTIME_DROP_THRESHOLD:-0.3}"
     volumes:
       - tess-data:/data
     restart: unless-stopped

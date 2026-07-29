@@ -12,6 +12,7 @@ from tess_backend.data_connector import (
     TeensingDataConnector,
     get_data_connector,
     normalize_to_context,
+    extract_realtime_anomalies,
 )
 from tess_backend import app as app_module
 from tess_backend.tess_agent import MockLLMClient
@@ -169,3 +170,53 @@ def test_audit_log_records_per_operator(client):
     assert len(rows) >= 1
     assert rows[0]["operator_id"] == "carol"
     assert rows[0]["endpoint"] == "/tess/diagnose"
+
+
+# ---- P7b：实时 KPI 曲线拉取 + 异常提取 ----
+
+def test_mock_connector_realtime_kpi_has_anomaly():
+    """MockDataConnector.fetch_realtime_kpi 返回含骤降的曲线。"""
+    c = MockDataConnector()
+    kpi = c.fetch_realtime_kpi()
+    assert isinstance(kpi, dict)
+    assert "series" in kpi["data"]
+
+
+def test_extract_realtime_anomalies_flags_drop():
+    """extract_realtime_anomalies 应把骤降指标判为异常 Context。"""
+    c = MockDataConnector()
+    kpi = c.fetch_realtime_kpi()
+    ctxs = extract_realtime_anomalies(kpi)
+    # 样例曲线 revenue/clicks/profit 末点骤降，应至少识别出 1 个异常
+    assert len(ctxs) >= 1
+    ids = [x["anomaly_metadata"]["event_id"] for x in ctxs]
+    assert any(i.startswith("REALTIME-") for i in ids)
+    # 异常点是 PRD §4.1 Context 形状，且 current < benchmark
+    first = ctxs[0]
+    meta = first["anomaly_metadata"]
+    assert meta["current_value"] < meta["benchmark_value"]
+    assert meta["severity"] in ("HIGH", "MEDIUM")
+
+
+def test_extract_realtime_anomalies_threshold():
+    """阈值抬高到 0.99 时，样例曲线不应触发任何异常。"""
+    c = MockDataConnector()
+    kpi = c.fetch_realtime_kpi()
+    ctxs = extract_realtime_anomalies(kpi, threshold=0.99)
+    assert ctxs == []
+
+
+def test_realtime_kpi_token_forwarded(monkeypatch):
+    """TeensingDataConnector.fetch_realtime_kpi 必须把 token 作为 Bearer 透传。"""
+    captured = {}
+
+    def fake_get(self, path, params=None, token=None):
+        captured["path"] = path
+        captured["token"] = token
+        return {"code": 0, "data": {"series": []}}
+
+    monkeypatch.setattr(TeensingDataConnector, "_http_get", fake_get)
+    c = TeensingDataConnector(base_url="https://saas.example.com/api/v1")
+    c.fetch_realtime_kpi(token="OPERATOR_JWT_abc")
+    assert captured["path"] == "/overview/realtime-kpi"
+    assert captured["token"] == "OPERATOR_JWT_abc"

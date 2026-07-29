@@ -38,6 +38,7 @@ class AlertStore:
                     event_id   TEXT,                          -- 异常实体标识
                     status     TEXT,                          -- DIAGNOSED / INCONCLUSIVE ...
                     confidence REAL,                          -- 诊断置信度
+                    source     TEXT,                          -- 数据来源: anomaly-warning | realtime-kpi
                     diagnosis  TEXT                           -- Gatekeeper 归一化诊断（JSON）
                 )
                 """
@@ -47,12 +48,14 @@ class AlertStore:
     def _normalize_result(r: dict) -> dict:
         """兼容 {event_id, diagnosis, meta} 与 {event_id, diagnosis} 两种结果形状。"""
         if not isinstance(r, dict):
-            return {"event_id": None, "diagnosis": {}}
+            return {"event_id": None, "diagnosis": {}, "source": None}
         diag = r.get("diagnosis") or {}
         event_id = r.get("event_id")
         if not event_id and isinstance(diag, dict):
             event_id = (diag.get("anomaly_metadata") or {}).get("event_id")
-        return {"event_id": event_id, "diagnosis": diag}
+        meta = r.get("meta") or {}
+        source = meta.get("source")
+        return {"event_id": event_id, "diagnosis": diag, "source": source}
 
     def save_batch(self, results: list, run_time: Optional[str] = None) -> int:
         """把一轮诊断的结果列表批量写入预警库。返回写入条数。"""
@@ -67,6 +70,7 @@ class AlertStore:
                     n["event_id"],
                     diag.get("status") if isinstance(diag, dict) else None,
                     diag.get("confidence") if isinstance(diag, dict) else None,
+                    n["source"],
                     json.dumps(diag, ensure_ascii=False),
                 )
             )
@@ -74,20 +78,27 @@ class AlertStore:
             return 0
         with self._conn() as c:
             c.executemany(
-                "INSERT INTO alerts (run_time, event_id, status, confidence, diagnosis) "
-                "VALUES (?,?,?,?,?)",
+                "INSERT INTO alerts (run_time, event_id, status, confidence, source, diagnosis) "
+                "VALUES (?,?,?,?,?,?)",
                 rows,
             )
         return len(rows)
 
-    def recent(self, limit: int = 50) -> list:
-        """按时间倒序返回最近 limit 条预警。"""
+    def recent(self, limit: int = 50, source: Optional[str] = None) -> list:
+        """按时间倒序返回最近 limit 条预警；source 非空时按来源过滤。"""
         with self._conn() as c:
-            cur = c.execute(
-                "SELECT id, run_time, event_id, status, confidence, diagnosis "
-                "FROM alerts ORDER BY id DESC LIMIT ?",
-                (limit,),
-            )
+            if source:
+                cur = c.execute(
+                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis "
+                    "FROM alerts WHERE source = ? ORDER BY id DESC LIMIT ?",
+                    (source, limit),
+                )
+            else:
+                cur = c.execute(
+                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis "
+                    "FROM alerts ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                )
             out = []
             for row in cur.fetchall():
                 out.append(
@@ -97,7 +108,8 @@ class AlertStore:
                         "event_id": row[2],
                         "status": row[3],
                         "confidence": row[4],
-                        "diagnosis": json.loads(row[5]) if row[5] else None,
+                        "source": row[5],
+                        "diagnosis": json.loads(row[6]) if row[6] else None,
                     }
                 )
             return out

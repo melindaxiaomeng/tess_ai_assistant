@@ -27,7 +27,12 @@ from .remediation import (
     RemediationStore,
     MockRemediationExecutor,
 )
-from .data_connector import get_data_connector, normalize_to_context, TeensingDataConnector
+from .data_connector import (
+    get_data_connector,
+    normalize_to_context,
+    extract_realtime_anomalies,
+    TeensingDataConnector,
+)
 from .gaid_vault import VAULT, RedactFilter
 from .audit_log import QueryLogStore
 from .alerts_store import AlertStore
@@ -112,40 +117,69 @@ def _get_data_connector():
 def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None) -> list:
     """P7 定时预警：用共享服务 token 拉异常 → 诊断 → 存预警库。
 
-    默认使用环境变量配置的 connector 与 LLM；测试可注入 connector/llm。
+    数据来源（两轮，统一进同一批预警）：
+    (1) 异常预警 + 涨跌榜（/overview/ranking/*）→ 归一化 → 诊断（source="anomaly-warning"）
+    (2) 实时 KPI 小时级曲线（/overview/realtime-kpi）→ 提取骤降异常点 → 诊断（source="realtime-kpi"）
+
     token：优先 TESS_SYSTEM_TOKEN，回退 TESS_DATA_API_KEY（共享服务 token，不按人过滤）。
-    返回本轮诊断结果列表（同 /tess/diagnose-from-source 的 results 形状）。
+    返回本轮诊断结果列表（同 /tess/diagnose-from-source 的 results 形状，meta 含 source 标签）。
     """
     connector = connector or _get_data_connector()
     llm = llm or _get_llm_client()
     token = os.getenv("TESS_SYSTEM_TOKEN") or None
-    raw_events = connector.fetch_recent_anomalies(limit, token=token)
     policy = load_policy()
-    results = []
+    results: list = []
+
+    # (1) 异常预警 + 涨跌榜
+    raw_events = connector.fetch_recent_anomalies(limit, token=token)
     for raw in raw_events:
         ctx = normalize_to_context(raw)
         VAULT.ingest(ctx)
         event_id = (ctx.get("anomaly_metadata") or {}).get("event_id", "UNKNOWN")
-        try:
-            diag = run_diagnosis(ctx, llm, policy=policy)
-        except HTTPException:
-            raise
-        except Exception as e:  # 单条异常不拖垮整批
-            diag = {
-                "status": "INCONCLUSIVE",
-                "confidence": 0.0,
-                "summary": f"Tess 诊断链路异常，已自动切入人工排查：{type(e).__name__}",
-                "root_cause_analysis": {
-                    "primary_factor": f"系统异常：{type(e).__name__}",
-                    "causal_chain": ["编排链路异常", "转人工处理"],
-                },
-            }
+        diag = _safe_diagnose(ctx, llm, policy)
         STORE.observe_diagnosis(
             event_id, diag.get("status", "UNKNOWN"), diag.get("confidence", 0.0)
         )
-        results.append({"event_id": event_id, "diagnosis": diag, "meta": {"source_limit": limit}})
+        results.append(
+            {"event_id": event_id, "diagnosis": diag, "meta": {"source": "anomaly-warning"}}
+        )
+
+    # (2) 实时 KPI 小时级曲线：每小时也拉一遍，看是否数据异常
+    try:
+        raw_kpi = connector.fetch_realtime_kpi(token=token)
+        for ctx in extract_realtime_anomalies(raw_kpi):
+            VAULT.ingest(ctx)
+            event_id = (ctx.get("anomaly_metadata") or {}).get("event_id", "UNKNOWN")
+            diag = _safe_diagnose(ctx, llm, policy)
+            STORE.observe_diagnosis(
+                event_id, diag.get("status", "UNKNOWN"), diag.get("confidence", 0.0)
+            )
+            results.append(
+                {"event_id": event_id, "diagnosis": diag, "meta": {"source": "realtime-kpi"}}
+            )
+    except Exception as e:  # realtime 拉取/解析失败不应拖垮整批预警
+        logger.warning("realtime-kpi 拉取或分析失败，本轮跳过实时异常检测: %s", e)
+
     ALERTS.save_batch(results)
     return results
+
+
+def _safe_diagnose(ctx: dict, llm, policy) -> dict:
+    """单条诊断；异常不拖垮整批，降级为 INCONCLUSIVE。"""
+    try:
+        return run_diagnosis(ctx, llm, policy=policy)
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {
+            "status": "INCONCLUSIVE",
+            "confidence": 0.0,
+            "summary": f"Tess 诊断链路异常，已自动切入人工排查：{type(e).__name__}",
+            "root_cause_analysis": {
+                "primary_factor": f"系统异常：{type(e).__name__}",
+                "causal_chain": ["编排链路异常", "转人工处理"],
+            },
+        }
 
 
 def _operator_id(request: Request) -> str:
@@ -274,13 +308,14 @@ def query_log(operator_id: str = None, limit: int = 100) -> dict:
 
 
 @app.get("/tess/alerts")
-def get_alerts(limit: int = 50) -> dict:
+def get_alerts(limit: int = 50, source: str = None) -> dict:
     """P7 定时预警拉取接口：Teensing / SaaS 后端可轮询此接口获取每小时诊断结果。
 
-    返回最近 limit 条预警（含 run_time / event_id / status / confidence / diagnosis）。
+    返回最近 limit 条预警（含 run_time / event_id / status / confidence / source / diagnosis）。
+    source 过滤：?source=realtime-kpi 只看实时 KPI 异常；?source=anomaly-warning 只看异常预警。
     受全局 X-API-Key 守卫（若生产已开启）。共享 token 模式：全局可读，不按人过滤。
     """
-    rows = ALERTS.recent(limit=limit)
+    rows = ALERTS.recent(limit=limit, source=source or None)
     return {"count": len(rows), "alerts": rows}
 
 
