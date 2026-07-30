@@ -44,6 +44,10 @@ services:
       TESS_DATA_API_KEY: "${TESS_DATA_API_KEY}"
     volumes:
       - tess-data:/data
+    # 让容器内 host.docker.internal 解析到宿主网关（生产用宿主原生 PG 时必填，
+    # 否则容器连不上宿主 5432）。本地 --profile db 场景无影响。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
       # 调 /healthz（不依赖 LLM，纯进程探针）
