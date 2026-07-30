@@ -377,9 +377,7 @@ def normalize_to_context(raw: dict) -> dict:
         target_metric = "Metric"
         current_value = None
 
-    benchmark_value = None
-    if isinstance(change, (int, float)) and isinstance(current_value, (int, float)):
-        benchmark_value = round(current_value - change, 4)
+    benchmark_value = _safe_benchmark(current_value, change)
 
     # severity：有环比变化按幅度（下跌>=50% 或 <= -10 判 HIGH）；无变化但有负毛利则 MEDIUM
     severity = "LOW"
@@ -454,6 +452,29 @@ def _num(v):
         return float(v)
     except (ValueError, TypeError):
         return 0.0
+
+
+def _safe_benchmark(current_value, change):
+    """由 current 与环比变化推算上一周期基线，杜绝不可能的负收入基线。
+
+    revenue 类指标非负。若按绝对差 (current - change) 推出负基线，说明 Teensing 的
+    revenue_change 更可能是**百分比**（如 +107.2 表示上涨 107.2%），则按
+    current / (1 + change/100) 反推；仍不合理则置空，绝不向 LLM 投喂荒谬数值。
+    """
+    if not isinstance(change, (int, float)) or not isinstance(current_value, (int, float)):
+        return None
+    additive = current_value - change
+    # 收入类指标的上一周期基线不应为负；出现负值时改用百分比解释
+    if additive < 0 and change > 0 and current_value > 0:
+        denom = 1.0 + change / 100.0
+        if denom > 0:
+            pct = current_value / denom
+            if pct >= 0:
+                return round(pct, 4)
+        return None
+    if additive < 0:
+        return None
+    return round(additive, 4)
 
 
 def _parse_realtime_items(raw):

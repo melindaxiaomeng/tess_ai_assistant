@@ -14,6 +14,7 @@ from tess_backend.data_connector import (
     normalize_to_context,
     extract_realtime_anomalies,
     _severity_for_drop,
+    _safe_benchmark,
 )
 from tess_backend import app as app_module
 from tess_backend.tess_agent import MockLLMClient
@@ -50,6 +51,41 @@ def test_normalize_to_context_maps_fields():
     assert meta["severity"] == "HIGH"
     assert ctx["top_contributors"][0]["dimension_value"] == "Pub_Media_802"
     assert ctx["associated_signals"][0]["source"] == "AppsFlyer_Pull_API"
+
+
+def test_safe_benchmark_absolute_when_sensible():
+    # 普通绝对差：413.896 相对 +321.86 -> 基线 92.036
+    assert _safe_benchmark(413.896, 321.86) == 92.036
+
+
+def test_safe_benchmark_negative_base_falls_back_to_percent():
+    # 当前 14.4、环比 +107.2 按绝对差会得 -92.8（不可能）；应回退百分比 -> 6.95
+    b = _safe_benchmark(14.4, 107.2)
+    assert b is not None and b >= 0
+    assert abs(b - 6.95) < 0.1
+
+
+def test_safe_benchmark_no_change_is_none():
+    assert _safe_benchmark(14.4, None) is None
+
+
+def test_normalize_benchmark_never_negative_for_rising_spike():
+    # 复现 6797051：anomaly-warning revenue 14.4 + fluctuation revenue_change 107.2
+    raw = {
+        "campaign_id": 6797051,
+        "campaign_name": "recl-game.friends-RU",
+        "revenue": 14.4,
+        "profit": 1.2,
+        "cvr": 0.057878,
+        "margin": 9.72,
+        "revenue_change": 107.2,
+        "_direction": "rising",
+    }
+    ctx = normalize_to_context(raw)
+    meta = ctx["anomaly_metadata"]
+    assert meta["benchmark_value"] is not None
+    assert meta["benchmark_value"] >= 0, "基线收入不得为负"
+    assert meta["current_value"] == 14.4
 
 
 def test_get_data_connector_default_is_mock(monkeypatch):
@@ -103,13 +139,23 @@ def test_teensing_token_is_forwarded(monkeypatch):
 
     def fake_get(self, path, params=None, token=None):
         captured["token"] = token
-        # 模拟 Teensing 统一返回结构 {code,data,...} 与 fluctuation 形状
+        # 真实 Teensing 结构：anomaly-warning 返回 data.items[]，fluctuation 返回
+        # data.rising/falling[]（含 revenue_change 环比）
         if path == "/overview/ranking/anomaly-warning":
             return {
                 "code": 0,
                 "data": {
-                    "falling": [{"name": "Pub_A", "entity_type": "publisher"}],
-                    "rising": [],
+                    "total": 1,
+                    "items": [
+                        {
+                            "campaign_id": 111,
+                            "campaign_name": "Pub_A",
+                            "revenue": 500.0,
+                            "profit": 120.0,
+                            "cvr": 0.1,
+                            "margin": 5.0,
+                        }
+                    ],
                 },
             }
         if path == "/overview/ranking/fluctuation":
@@ -117,7 +163,15 @@ def test_teensing_token_is_forwarded(monkeypatch):
                 "code": 0,
                 "data": {
                     "falling": [
-                        {"name": "Pub_A", "change": -15.0, "profit": 120.0, "revenue": 500.0}
+                        {
+                            "campaign_id": 111,
+                            "campaign_name": "Pub_A",
+                            "revenue": 500.0,
+                            "revenue_change": -15.0,
+                            "profit": 120.0,
+                            "cvr": 0.1,
+                            "margin": 5.0,
+                        }
                     ],
                     "rising": [],
                 },
@@ -129,17 +183,18 @@ def test_teensing_token_is_forwarded(monkeypatch):
     raws = c.fetch_recent_anomalies(limit=5, token="OPERATOR_JWT_xyz")
     # token 透传校验
     assert captured["token"] == "OPERATOR_JWT_xyz"
-    # 归并：anomaly-warning 的实体 + fluctuation 的量化字段
+    # 归并：anomaly-warning 的 items + fluctuation 的量化字段(revenue_change)
     assert len(raws) == 1
-    assert raws[0]["name"] == "Pub_A"
-    assert raws[0]["change"] == -15.0  # 来自 fluctuation
+    assert raws[0]["campaign_name"] == "Pub_A"
+    assert raws[0]["revenue_change"] == -15.0  # 来自 fluctuation
+    assert raws[0]["_direction"] == "falling"
     ctx = normalize_to_context(raws[0])
     meta = ctx["anomaly_metadata"]
-    assert meta["event_id"] == "Pub_A"
+    assert meta["event_id"] == "111"  # campaign_id 优先
     assert meta["severity"] == "HIGH"  # change <= -10
-    assert meta["target_metric"] == "Profit"
-    assert meta["current_value"] == 120.0
-    assert meta["benchmark_value"] == 135.0  # 120 - (-15)
+    assert meta["target_metric"] == "Revenue"  # 有环比+revenue 优先 Revenue
+    assert meta["current_value"] == 500.0
+    assert meta["benchmark_value"] == 515.0  # 500 - (-15)
 
 
 def test_teensing_requires_token_via_app(client, monkeypatch):
