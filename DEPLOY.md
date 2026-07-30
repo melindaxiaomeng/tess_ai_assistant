@@ -325,6 +325,20 @@ curl "http://localhost:8080/tess/query-log?operator_id=alice" \
 
 ## 12. P7 主动预警 + Teensing 拉取接口
 
+### 12.0 存储后端（SQLite / PostgreSQL，由 `TESS_DATABASE_URL` 决定）
+P7 预警库已统一迁移到 SQLAlchemy 访问层（`tess_backend/db.py`），**后端通过环境变量 `TESS_DATABASE_URL` 切换，业务代码无需改动**：
+
+- **开发 / 单测（默认）**：`sqlite:///tess_alerts.db` —— 零外部依赖，直接落本地文件。
+- **生产 / 多模块 / 数据分析（推荐）**：`postgresql+psycopg://<user>:<pass>@<host>:5432/<db>`。
+  Postgres 更适合「Tess 多模块共用同一实例 + 未来数据分析」：并发读写、JSONB、窗口函数/分析查询、HA 复制都更强。
+- **容器化部署**：仓库 `docker-compose.yml` 已内置 `db` 服务（Postgres 16-alpine），`tess` 服务通过
+  `TESS_DATABASE_URL=postgresql+psycopg://tess:tess@db:5432/tess` 自动连库，并用 `depends_on: db.service_healthy`
+  保证库先就绪。直接 `docker compose up -d` 即可。
+- **本地裸跑（无 Docker）**：`brew install postgresql` 起一个本地实例，建库 `createdb tess`，再把
+  `TESS_DATABASE_URL` 指向它（如 `postgresql+psycopg://$(whoami)@localhost/tess`）。
+- **向后兼容**：旧版 `TESS_ALERTS_DB`（SQLite 文件路径）仍生效，仅当 `TESS_DATABASE_URL` 未设置时作为回退。
+- **迁移注意**：问答审计库（`TESS_AUDIT_DB`，见 11.3）目前仍走独立 SQLite，后续可一并迁入同一 Postgres 实例。
+
 Tess 在进程内每小时（间隔可配 `TESS_SCHEDULE_INTERVAL`）自动：拉异常/实时 KPI → 诊断 → 落预警库。
 **Teensing 后端无需前端点击，定时轮询下方接口即可拿到 Tess 算出的异常结果。**
 

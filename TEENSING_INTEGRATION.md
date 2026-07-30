@@ -35,6 +35,7 @@ TESS_API_KEY=<强随机值>             # 开启拉取接口鉴权（Teensing �
 ```
 
 开启后 Tess 每小时会把 realtime-kpi 异常诊断写入预警库，Teensing 即可拉取。
+（预警库后端由 `TESS_DATABASE_URL` 配置：默认本地 SQLite，生产建议 PostgreSQL；详见 DEPLOY.md §12.0。）
 手动立即产出一轮（联调用）：`POST /tess/cron/run {"limit":20}`。
 
 ---

@@ -6,3 +6,6 @@ httpx>=0.27
 jsonschema>=4.21
 # 可选：GAID 金库优先用 Fernet 做静态加密；未装则自动回退 stdlib HMAC 流密码
 cryptography>=42.0
+# P7 预警存储：SQLAlchemy 访问层（后端可切 Postgres）；psycopg[binary] 自带 libpq，免系统依赖
+sqlalchemy>=2.0
+psycopg[binary]>=3.1

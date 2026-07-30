@@ -25,8 +25,13 @@ services:
       TESS_SYSTEM_TOKEN: "${TESS_SYSTEM_TOKEN:-}"
       # 实时 KPI 异常判定阈值（最新一小时较前 N 小时基线跌幅超此比例即判异常，默认 0.3）
       TESS_REALTIME_DROP_THRESHOLD: "${TESS_REALTIME_DROP_THRESHOLD:-0.3}"
+      # P7 预警存储：指向同一 compose 网络内的 Postgres（服务名 db 互通）
+      TESS_DATABASE_URL: "postgresql+psycopg://tess:tess@db:5432/tess"
     volumes:
       - tess-data:/data
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       # 调 /healthz（不依赖 LLM，纯进程探针）
@@ -36,5 +41,23 @@ services:
       retries: 3
       start_period: 10s
 
+  # P7 预警存储后端：PostgreSQL（与未来数据分析等模块共用同一实例）
+  db:
+    image: postgres:16-alpine
+    container_name: tess-db
+    environment:
+      POSTGRES_USER: tess
+      POSTGRES_PASSWORD: tess
+      POSTGRES_DB: tess
+    volumes:
+      - tess-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tess -d tess"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
 volumes:
   tess-data:
+  tess-db-data:
