@@ -331,3 +331,54 @@ def test_realtime_kpi_token_forwarded(monkeypatch):
     c.fetch_realtime_kpi(token="OPERATOR_JWT_abc")
     assert captured["path"] == "/overview/realtime-kpi"
     assert captured["token"] == "OPERATOR_JWT_abc"
+
+
+def test_realtime_calculated_loss_is_dict_not_scalar():
+    """回归：_drop_context / _gap_context 必须把 calculated_loss 写成 dict
+    {"loss_per_hour_usd": ...}，否则 enrich_with_rule_engine 会对 float 调 .get()
+    抛 AttributeError。契约见 contracts.py:174。"""
+    from tess_backend.orchestrator import run_diagnosis
+
+    raw = {
+        "code": 0,
+        "message": "success",
+        "data": {
+            "items": [
+                # 同比暴跌 -> _drop_context
+                {"hour": "00", "today_revenue": 900.0, "today_clicks": 100,
+                 "yesterday_revenue": 1500.0, "yesterday_clicks": 100, "yesterday_conversions": 50},
+                # 连续掉零 -> _gap_context
+                {"hour": "01", "today_revenue": 0.0, "today_clicks": 0,
+                 "yesterday_revenue": 800.0, "yesterday_clicks": 0, "yesterday_conversions": 0},
+                {"hour": "02", "today_revenue": 0.0, "today_clicks": 0,
+                 "yesterday_revenue": 700.0, "yesterday_clicks": 0, "yesterday_conversions": 0},
+            ]
+        },
+    }
+    ctxs = extract_realtime_anomalies(raw, as_of_hour=23, grace_hours=0)
+    assert ctxs, "应至少提取出一条 realtime 异常"
+
+    for ctx in ctxs:
+        cl = (ctx.get("anomaly_metadata") or {}).get("calculated_loss")
+        # 必须是 dict 形状，不能是标量 float
+        assert isinstance(cl, dict) and "loss_per_hour_usd" in cl, (
+            f"calculated_loss 必须是 dict，实际: {cl!r}"
+        )
+
+    # 端到端：run_diagnosis 不应因标量 calculated_loss 抛 AttributeError
+    mock_llm = MockLLMClient(
+        {
+            "status": STATUS_DIAGNOSED,
+            "confidence": 0.9,
+            "summary": "demo",
+            "primary_contributor_id": (ctxs[0]["top_contributors"][0]["dimension_value"]),
+            "root_cause_analysis": {"primary_factor": "x", "causal_chain": ["a"]},
+        }
+    )
+    for ctx in ctxs:
+        diag = run_diagnosis(ctx, mock_llm)  # 不抛异常即通过
+        assert diag.get("status") in (
+            "DIAGNOSED",
+            "DIAGNOSED_SUSPECT",
+            "INCONCLUSIVE",
+        )

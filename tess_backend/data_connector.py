@@ -447,7 +447,7 @@ def _gap_context(start, end, yest_total):
             "current_value": 0.0,
             "benchmark_value": round(yest_total, 2),
             "severity": "HIGH",
-            "calculated_loss": round(yest_total, 2),
+            "calculated_loss": {"loss_per_hour_usd": round(yest_total, 2)},
         },
         "top_contributors": [
             {
@@ -478,7 +478,7 @@ def _drop_context(it, h, today, yest, drop):
             "current_value": today,
             "benchmark_value": yest,
             "severity": _severity_for_drop(drop),
-            "calculated_loss": round(yest - today, 2),
+            "calculated_loss": {"loss_per_hour_usd": round(yest - today, 2)},
         },
         "top_contributors": [
             {
