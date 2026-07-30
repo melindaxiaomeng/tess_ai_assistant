@@ -318,20 +318,40 @@ def query_log(operator_id: str = None, limit: int = 100) -> dict:
     return {"count": len(rows), "logs": rows}
 
 
+_SEVERITY_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+
+
+def _filter_by_min_severity(items: list, min_severity: str) -> list:
+    """按最低严重度过滤（LOW < MEDIUM < HIGH）；min_severity 为空则不过滤。"""
+    if not min_severity:
+        return items
+    floor = _SEVERITY_RANK.get(min_severity.upper())
+    if floor is None:
+        return items
+    out = []
+    for it in items:
+        sev = (it.get("anomaly_metadata") or {}).get("severity")
+        if sev and _SEVERITY_RANK.get(sev, 0) >= floor:
+            out.append(it)
+    return out
+
+
 @app.get("/tess/alerts")
-def get_alerts(limit: int = 50, source: str = None) -> dict:
+def get_alerts(limit: int = 50, source: str = None, min_severity: str = None) -> dict:
     """P7 定时预警拉取接口：Teensing / SaaS 后端可轮询此接口获取每小时诊断结果。
 
     返回最近 limit 条预警（含 run_time / event_id / status / confidence / source / diagnosis）。
     source 过滤：?source=realtime-kpi 只看实时 KPI 异常；?source=anomaly-warning 只看异常预警。
+    min_severity 过滤：?min_severity=MEDIUM 只看 >= MEDIUM 的告警（LOW/MEDIUM/HIGH）。
     受全局 X-API-Key 守卫（若生产已开启）。共享 token 模式：全局可读，不按人过滤。
     """
     rows = ALERTS.recent(limit=limit, source=source or None)
+    rows = _filter_by_min_severity(rows, min_severity)
     return {"count": len(rows), "alerts": rows}
 
 
 @app.get("/tess/realtime-kpi/alerts")
-def get_realtime_kpi_alerts(limit: int = 50) -> dict:
+def get_realtime_kpi_alerts(limit: int = 50, min_severity: str = None) -> dict:
     """Teensing 专用拉取接口：返回最近一轮对 realtime-kpi 的诊断结果批次。
 
     与通用 /tess/alerts 的区别：只针对 realtime-kpi 来源，且返回「最近一次整批」
@@ -342,18 +362,23 @@ def get_realtime_kpi_alerts(limit: int = 50) -> dict:
       "as_of": "<批次时间 run_time>",        # Teensing 据此去重：相同 as_of 即同批
       "generated_at": "<响应生成时间>",
       "count": N,
-      "items": [ { id, run_time, event_id, status, confidence, source, diagnosis }, ... ]
+      "items": [ { id, run_time, event_id, status, confidence, source, diagnosis,
+                   anomaly_metadata: { severity, current_value, benchmark_value, ... } }, ... ]
     }
+
+    min_severity 过滤：?min_severity=MEDIUM 只返回 >= MEDIUM 的告警，
+    可避免大量 LOW（微跌）刷屏。
 
     鉴权：受全局 X-API-Key 守卫（生产设 TESS_API_KEY 后，Teensing 请求头带
     X-API-Key: <共享密钥> 即可）。共享 token 模式：全局可读，不按人过滤。
     """
     batch = ALERTS.latest_batch(source="realtime-kpi", limit=limit)
+    items = _filter_by_min_severity(batch["alerts"], min_severity)
     return {
         "as_of": batch["run_time"],
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "count": batch["count"],
-        "items": batch["alerts"],
+        "count": len(items),
+        "items": items,
     }
 
 

@@ -13,6 +13,7 @@ from tess_backend.data_connector import (
     get_data_connector,
     normalize_to_context,
     extract_realtime_anomalies,
+    _severity_for_drop,
 )
 from tess_backend import app as app_module
 from tess_backend.tess_agent import MockLLMClient
@@ -182,20 +183,61 @@ def test_mock_connector_realtime_kpi_has_anomaly():
     assert "items" in kpi["data"]
 
 
-def test_extract_realtime_anomalies_flags_drop():
-    """extract_realtime_anomalies 应把同比暴跌小时判为异常 Context（as_of_hour 从数据推断）。"""
+def test_extract_realtime_anomalies_banding():
+    """样例：hour 12 同比 -50% 判 HIGH；其余微跌(7%~11%)判 LOW。任何下跌都算异常。"""
     c = MockDataConnector()
     kpi = c.fetch_realtime_kpi()
     ctxs = extract_realtime_anomalies(kpi)
-    # 样例 hour 12 同比 -50%，应至少识别出 1 个异常
     assert len(ctxs) >= 1
     ids = [x["anomaly_metadata"]["event_id"] for x in ctxs]
     assert any(i.startswith("REALTIME-DROP-") for i in ids)
-    # 异常点是 PRD §4.1 Context 形状，且 current < benchmark
-    first = ctxs[0]
-    meta = first["anomaly_metadata"]
-    assert meta["current_value"] < meta["benchmark_value"]
-    assert meta["severity"] in ("HIGH", "MEDIUM")
+    # hour 12 同比 -50% -> HIGH，且 current < benchmark
+    h12 = [x for x in ctxs if x["anomaly_metadata"]["event_id"] == "REALTIME-DROP-12"][0]
+    assert h12["anomaly_metadata"]["severity"] == "HIGH"
+    assert h12["anomaly_metadata"]["current_value"] < h12["anomaly_metadata"]["benchmark_value"]
+    # 至少一条微跌被判定为 LOW（任何下跌都报）
+    lows = [x for x in ctxs if x["anomaly_metadata"]["severity"] == "LOW"]
+    assert len(lows) >= 1
+
+
+def test_severity_bands_for_drops():
+    """跌幅分档：<=30% LOW, 30%<drop<50% MEDIUM, >=50% HIGH。"""
+    assert _severity_for_drop(0.10) == "LOW"
+    assert _severity_for_drop(0.30) == "LOW"
+    assert _severity_for_drop(0.31) == "MEDIUM"
+    assert _severity_for_drop(0.49) == "MEDIUM"
+    assert _severity_for_drop(0.50) == "HIGH"
+    assert _severity_for_drop(1.0) == "HIGH"
+
+
+def test_any_drop_flagged_as_low():
+    """任何下跌都报：1% 微跌 -> LOW 异常（grace_hours=0 解除延迟窗口约束）。"""
+    raw = {"code": 0, "data": {"items": [
+        {"hour": "10", "today_revenue": 990.0, "yesterday_revenue": 1000.0},
+    ]}}
+    ctxs = extract_realtime_anomalies(raw, grace_hours=0)
+    assert len(ctxs) == 1
+    meta = ctxs[0]["anomaly_metadata"]
+    assert meta["event_id"] == "REALTIME-DROP-10"
+    assert meta["severity"] == "LOW"
+    assert meta["current_value"] == 990.0
+    assert meta["benchmark_value"] == 1000.0
+
+
+def test_40pct_drop_is_medium():
+    raw = {"code": 0, "data": {"items": [
+        {"hour": "10", "today_revenue": 600.0, "yesterday_revenue": 1000.0},
+    ]}}
+    ctxs = extract_realtime_anomalies(raw, grace_hours=0)
+    assert ctxs[0]["anomaly_metadata"]["severity"] == "MEDIUM"
+
+
+def test_60pct_drop_is_high():
+    raw = {"code": 0, "data": {"items": [
+        {"hour": "10", "today_revenue": 400.0, "yesterday_revenue": 1000.0},
+    ]}}
+    ctxs = extract_realtime_anomalies(raw, grace_hours=0)
+    assert ctxs[0]["anomaly_metadata"]["severity"] == "HIGH"
 
 
 def test_extract_realtime_anomalies_threshold():
@@ -208,7 +250,9 @@ def test_extract_realtime_anomalies_threshold():
 
 def test_extract_realtime_trailing_zeros_not_gap():
     """真实返回（hour 09 起 today 全 0）是「每小时滚动更新、快照尚未覆盖」的正常尾部，
-    不应误判为数据掉零——as_of_hour 从数据推断=08，09-23 属未来/未就绪，零告警。"""
+    不应误判为数据掉零(GAP)。as_of_hour 从数据推断=08，09-23 属未来/未就绪。
+    关键正确性：尾零绝不聚合成「数据中断」告警；任何出现的告警都只来自已完整过去、
+    且今日<昨日的真实微跌（如 hour 07），且时段 <= 08。"""
     real_raw = {
         "code": 0,
         "message": "success",
@@ -243,8 +287,13 @@ def test_extract_realtime_trailing_zeros_not_gap():
         "meta": "",
     }
     ctxs = extract_realtime_anomalies(real_raw)
-    # 尾部全 0 是快照边界，不是异常
-    assert ctxs == []
+    # 关键正确性：尾部全 0 绝不聚合成「数据中断」(GAP) 告警
+    gaps = [c for c in ctxs if c["anomaly_metadata"]["event_id"].startswith("REALTIME-GAP-")]
+    assert gaps == []
+    # 所有出现的告警时段都 <= 08（09-23 尾零绝不参与判定），且仅来自真实今日<昨日
+    for c in ctxs:
+        h = int(c["anomaly_metadata"]["event_id"].split("-")[-1])
+        assert h <= 8
 
 
 def test_extract_realtime_single_hour_gap_detected():

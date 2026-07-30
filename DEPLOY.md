@@ -338,8 +338,8 @@ TESS_REALTIME_DROP_THRESHOLD=0.3    # 实时 KPI 同比跌幅阈值，超此判�
 ```
 
 ### 12.2 Teensing 拉取接口（二选一）
-- **通用**：`GET /tess/alerts?source=realtime-kpi` —— 最近 N 条（跨批次混合）。
-- **Teensing 专用（推荐）**：`GET /tess/realtime-kpi/alerts` —— 只返回**最近一轮整批** realtime-kpi 诊断，结构更干净：
+- **通用**：`GET /tess/alerts?source=realtime-kpi` —— 最近 N 条（跨批次混合）；支持 `?min_severity=MEDIUM` 按级别过滤。
+- **Teensing 专用（推荐）**：`GET /tess/realtime-kpi/alerts` —— 只返回**最近一轮整批** realtime-kpi 诊断，结构更干净；支持 `?min_severity=MEDIUM`（或 `HIGH`）过滤掉 `LOW` 微跌：
   ```json
   {
     "as_of": "2026-07-30 13:00:00",     // 批次时间，Teensing 据此去重：相同 as_of 即同一批
@@ -354,6 +354,10 @@ TESS_REALTIME_DROP_THRESHOLD=0.3    # 实时 KPI 同比跌幅阈值，超此判�
     ]
   }
   ```
+
+> 实时 KPI 异常口径：任何「今日<昨日」的下跌都判异常，严重度按跌幅分档
+> `drop<=30% LOW` / `30%<drop<50% MEDIUM` / `drop>=50% HIGH`（`TESS_REALTIME_DROP_THRESHOLD`
+> 默认 0.0 = 任何下跌都报，可调高以忽略微跌）。详见 `TEENSING_INTEGRATION.md` 第 8 节。
 
 ### 12.3 鉴权
 - 生产设 `TESS_API_KEY=<强随机值>` 后，所有 `/tess/*`（含上面拉取接口）强制要求 `X-API-Key` 请求头，否则 401。

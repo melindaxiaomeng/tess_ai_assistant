@@ -204,7 +204,7 @@ curl "https://<tess-host>:8080/tess/realtime-kpi/alerts?limit=50" \
 |------|------|---------------|
 | `current_value` | 异常时段今日值（如收益） | 展示"今日" |
 | `benchmark_value` | 昨日同期基准值 | 展示"昨日基准"、算跌幅 |
-| `severity` | `HIGH` / `MEDIUM` | 告警级别配色 |
+| `severity` | `HIGH` / `MEDIUM` / `LOW` | 告警级别配色/过滤 |
 | `calculated_loss` | 估算损失（≈昨日基准合计） | 展示影响面 |
 | `trigger_time` / `event_id` | 时段 / 异常标识 | 定位 |
 
@@ -225,8 +225,8 @@ curl "https://<tess-host>:8080/tess/realtime-kpi/alerts?limit=50" \
 
 ## 7. 可选增强（按需让 Tess 加）
 
-1. **按 severity 过滤**：接口加 `?min_severity=HIGH`，只拉高危。
-2. **增量游标**：接口加 `?since_as_of=...`，只拉比某批次更新的结果，省流量。
+1. **按 severity 过滤（已实现）**：接口支持 `?min_severity=MEDIUM`（或 `HIGH`），只拉 >= 指定级别的告警，可避免大量 `LOW` 微跌刷屏。例：`GET /tess/realtime-kpi/alerts?min_severity=MEDIUM`。
+2. **增量游标**：接口加 `?since_as_of=...`，只拉比某批次更新的结果，省流量（尚未实现，需要可提）。
 
 > 注：「透传原始数值」已完成（见第 3/5 节 `anomaly_metadata`），不再列为待办。
 
@@ -249,20 +249,27 @@ curl "https://<tess-host>:8080/tess/realtime-kpi/alerts?limit=50" \
 - `grace_hours` 内（当前小时及前 1 小时）的 `today=0` 视为"数据未就绪"，**不报**。
 - 仅对 `h <= as_of_hour - grace_hours` 的"已完整过去"小时做判定。
 
-### 8.3 两类异常规则
-1. **数据掉零（数据中断）**：`yesterday_revenue > 0` 且 `today_revenue <= 0` → `HIGH`。
+### 8.3 异常规则（任何下跌都算异常，按跌幅分档）
+
+1. **数据掉零（数据中断）**：`yesterday_revenue > 0` 且 `today_revenue <= 0` → 跌幅 100% → `HIGH`。
    - **连续掉零小时聚合成一条告警** `REALTIME-GAP-{起}-{止}`（如 `REALTIME-GAP-09-17`），不逐小时刷屏。
-2. **同比暴跌**：`today_revenue > 0` 且 `(1 - today/yesterday) >= TESS_REALTIME_DROP_THRESHOLD`（默认 0.3，即同比跌 30%）→ `MEDIUM`；跌 ≥ 50% 为 `HIGH`。
+2. **同比下跌（任何跌幅都判异常）**：`today_revenue > 0` 且 `today < yesterday`（即 `drop = (yesterday - today)/yesterday > 0`）即判异常，按跌幅分档严重度：
+   - `drop <= 30%` → **LOW**
+   - `30% < drop < 50%` → **MEDIUM**
+   - `drop >= 50%` → **HIGH**
    - 单小时一条 `REALTIME-DROP-{小时}`。
+   - `TESS_REALTIME_DROP_THRESHOLD`（默认 `0.0`）作为「最低跌幅门槛」：`drop > 阈值` 才上报，默认 `0.0` 表示任何下跌都报；调高（如 `0.05`）可忽略 <5% 的微跌噪声。
+
+> 说明：之前"跌满 30% 才报"的口径已改为"任何下跌都报"，严重度只是分档（LOW/MEDIUM/HIGH），不再作为是否上报的门槛。
 
 ### 8.4 判定后
-- 每条命中的 Context 送入 LLM 诊断（Gatekeeper 归一化），结论进 `diagnosis`；原始数值进 `anomaly_metadata`；两者一起落预警库，供 Teensing 拉取。
+- 每条命中的 Context 送入 LLM 诊断（Gatekeeper 归一化），结论进 `diagnosis`；原始数值进 `anomaly_metadata`（含 `severity`/`current_value`/`benchmark_value`）；两者一起落预警库，供 Teensing 拉取。
 - **若所有 `today_revenue` 全为 0**（无法锚定）→ 直接跳过、不报，避免整表空时误报。
 
 ### 8.5 可调参数
 | 参数 | 默认 | 作用 |
 |------|------|------|
-| `TESS_REALTIME_DROP_THRESHOLD` | 0.3 | 同比暴跌触发阈值 |
+| `TESS_REALTIME_DROP_THRESHOLD` | `0.0` | 最低跌幅门槛（默认 0.0 = 任何下跌都报；调高可忽略微跌） |
 | `TESS_REALTIME_GRACE_HOURS` | 1 | 延迟容忍窗口（小时） |
 | `TESS_SCHEDULE_INTERVAL` | 3600 | 检测频率（秒） |
 

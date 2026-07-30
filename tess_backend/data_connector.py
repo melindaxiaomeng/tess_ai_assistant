@@ -418,6 +418,20 @@ def _parse_realtime_items(raw):
     return []
 
 
+def _severity_for_drop(drop: float) -> str:
+    """按同比跌幅分档严重度（用户规则）：
+    - 跌幅 <= 30%          -> LOW
+    - 30% < 跌幅 < 50%     -> MEDIUM
+    - 跌幅 >= 50%          -> HIGH
+    drop = (yesterday - today) / yesterday，取值范围 [0, 1]（1 即掉零/100% 跌）。
+    """
+    if drop >= 0.50:
+        return "HIGH"
+    if drop > 0.30:
+        return "MEDIUM"
+    return "LOW"
+
+
 def _gap_context(start, end, yest_total):
     """连续掉零聚合为一条「数据中断」告警（PRD §4.1 形状）。"""
     span = f"{start:02d}-{end:02d}" if start != end else f"{start:02d}"
@@ -459,7 +473,7 @@ def _drop_context(it, h, today, yest, drop):
             "target_metric": "Revenue",
             "current_value": today,
             "benchmark_value": yest,
-            "severity": "HIGH" if drop >= 0.5 else "MEDIUM",
+            "severity": _severity_for_drop(drop),
             "calculated_loss": round(yest - today, 2),
         },
         "top_contributors": [
@@ -506,17 +520,23 @@ def extract_realtime_anomalies(
       仅对 h <= as_of_hour - grace_hours 的「已完整过去」小时做判定。
 
     异常规则（仅对已完整过去的小时生效）：
-    1) 数据掉零：yesterday_revenue > 0 且 today_revenue <= 0 → HIGH，连续掉零聚合为一条「数据中断」告警。
-    2) 同比暴跌：today_revenue > 0 且 (1 - today/yesterday) >= drop_threshold
-       （默认 0.3，可配 TESS_REALTIME_DROP_THRESHOLD）→ MEDIUM/HIGH 异常。
+    1) 数据掉零：yesterday_revenue > 0 且 today_revenue <= 0 → 100% 跌幅，判 HIGH，
+       连续掉零聚合为一条「数据中断」告警。
+    2) 同比下跌（任何跌幅都算异常）：today_revenue > 0 且 today < yesterday，即
+       drop = (yesterday-today)/yesterday > 0 即判异常，按跌幅分档严重度：
+       - drop <= 30%        -> LOW
+       - 30% < drop < 50%  -> MEDIUM
+       - drop >= 50%        -> HIGH
+       drop_threshold（可配 TESS_REALTIME_DROP_THRESHOLD，默认 0.0）作为「最低跌幅门槛」：
+       仅当 drop > drop_threshold 才上报，默认 0.0 表示任何下跌都报；调高可忽略微跌噪声。
 
     若所有 today_revenue 均为 0（无法锚定 as_of_hour），返回空——不误报。
     """
     if drop_threshold is None:
         try:
-            drop_threshold = float(os.getenv("TESS_REALTIME_DROP_THRESHOLD", "0.3"))
+            drop_threshold = float(os.getenv("TESS_REALTIME_DROP_THRESHOLD", "0.0"))
         except (ValueError, TypeError):
-            drop_threshold = 0.3
+            drop_threshold = 0.0
     if grace_hours is None:
         try:
             grace_hours = int(os.getenv("TESS_REALTIME_GRACE_HOURS", "1"))
@@ -570,7 +590,7 @@ def extract_realtime_anomalies(
                 gap_start, gap_prev, gap_yest_total = None, None, 0.0
             if yest > 0 and today > 0:
                 drop = (yest - today) / yest
-                if drop >= drop_threshold:
+                if drop > drop_threshold:
                     contexts.append(_drop_context(it, h, today, yest, drop))
 
     if gap_start is not None:

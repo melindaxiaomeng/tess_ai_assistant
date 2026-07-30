@@ -163,3 +163,26 @@ def test_realtime_kpi_alerts_endpoint_empty(kpi_alert_client):
     assert body["as_of"] is None
     assert body["count"] == 0
     assert body["items"] == []
+
+
+def test_realtime_kpi_alerts_min_severity(kpi_alert_client):
+    """min_severity 过滤：只返回 >= 指定严重度的告警，避免 LOW 微跌刷屏。"""
+    app_module.ALERTS.save_batch([
+        {"event_id": "H", "diagnosis": {"status": "DIAGNOSED"}, "meta": {"source": "realtime-kpi"},
+         "anomaly_metadata": {"severity": "HIGH"}},
+        {"event_id": "M", "diagnosis": {"status": "DIAGNOSED"}, "meta": {"source": "realtime-kpi"},
+         "anomaly_metadata": {"severity": "MEDIUM"}},
+        {"event_id": "L", "diagnosis": {"status": "DIAGNOSED"}, "meta": {"source": "realtime-kpi"},
+         "anomaly_metadata": {"severity": "LOW"}},
+    ])
+    # 不过滤：3 条全返回
+    all_ = kpi_alert_client.get("/tess/realtime-kpi/alerts").json()
+    assert all_["count"] == 3
+    # min_severity=MEDIUM：仅 HIGH + MEDIUM 共 2 条
+    med = kpi_alert_client.get("/tess/realtime-kpi/alerts?min_severity=MEDIUM").json()
+    assert med["count"] == 2
+    assert {i["event_id"] for i in med["items"]} == {"H", "M"}
+    # min_severity=HIGH：仅 1 条
+    high = kpi_alert_client.get("/tess/realtime-kpi/alerts?min_severity=HIGH").json()
+    assert high["count"] == 1
+    assert high["items"][0]["event_id"] == "H"
