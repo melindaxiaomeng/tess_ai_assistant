@@ -325,3 +325,44 @@ curl "https://<tess-host>:8080/tess/realtime-kpi/alerts?limit=50" \
 | `TESS_REALTIME_GRACE_HOURS` | 1 | 延迟容忍窗口（小时） |
 | `TESS_SCHEDULE_INTERVAL` | 3600 | 检测频率（秒） |
 
+---
+
+## 9. 生产部署：Nginx 转发 `/tess`（注入 X-API-Key）
+
+dev 环境 Teensing 用 Vite 代理（`/tess` → `Tess host:8080`）即可。生产部署时，**不要**把 `TESS_API_KEY` 暴露给前端，而是在 Teensing 站点的 Nginx 上加一段：把 `/tess/*` 转发到 Tess 并**由 Nginx 注入 `X-API-Key`**。前端只调自己域名的 `/tess/*`，密钥在网关侧注入。
+
+完整片段见仓库 `deploy/nginx-tess-proxy.conf`，核心如下（放入 Teensing 站点的 `server {}` 内）：
+
+```nginx
+location /tess/ {
+    # 仅允许 Teensing 后端/内网访问（接口含写入，勿裸露公网）
+    # allow 10.0.0.0/8; deny all;
+
+    # 注入共享密钥（与 Tess 启动的 TESS_API_KEY 一致）
+    proxy_set_header X-API-Key "<TESS_API_KEY>";
+    # 转发到 Tess（保留 /tess/ 前缀）
+    proxy_pass http://<TESS_HOST>:8080/tess/;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+location = /tess { return 301 /tess/; }
+```
+
+替换占位符：
+
+- `<TESS_HOST>`：Tess 服务可达地址。若 Nginx 与 Tess 同机，`127.0.0.1` 或 docker 网关 `172.17.0.1`；跨机用内网 IP（**不要**用公网 IP 裸跑）。
+- `<TESS_API_KEY>`：与 Tess 容器 `TESS_API_KEY` 环境变量**完全一致**的值。
+
+### 9.1 为什么这样更安全
+- 前端（浏览器）调用的是 Teensing 自己域名下的 `/tess/*`，同源、无 CORS 问题，且**永远拿不到密钥**。
+- 密钥只在 Teensing 服务端（Nginx）与 Tess 之间传递。
+- `POST /tess/alerts/{id}/ack` 是写操作，建议用 `allow/deny` 限制在 Teensing 内网/后端 IP，避免被公网任意 ack。
+
+### 9.2 对应的 Tess 侧配置
+Nginx 注入的 `<TESS_API_KEY>` 必须与 Tess 容器启动时的 `TESS_API_KEY` 相同（见 `.env` 与 `docker-compose.yml` 的 `TESS_API_KEY: "${TESS_API_KEY}"`）。Tess 端设了该值后，所有 `/tess/*` 接口强制校验 `X-API-Key`，否则 401。
+

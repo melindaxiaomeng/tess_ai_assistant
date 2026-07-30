@@ -3,6 +3,9 @@
 # LLM Key 通过宿主机环境变量注入（绝不写进镜像或仓库）
 #
 # 前置：在宿主机 export TESS_LLM_API_KEY=sk-xxx   （或建一个 .env 文件，见 DEPLOY.md）
+#
+# 数据库：默认由 .env 的 TESS_DATABASE_URL 决定（留空=SQLite，生产填宿主原生 PG）。
+#   若想用本仓库自带的 Postgres 容器，执行：  docker compose --profile db up --build -d
 
 services:
   tess:
@@ -23,15 +26,24 @@ services:
       TESS_SCHEDULE_INTERVAL: "${TESS_SCHEDULE_INTERVAL:-3600}"
       TESS_SCHEDULE_LIMIT: "${TESS_SCHEDULE_LIMIT:-20}"
       TESS_SYSTEM_TOKEN: "${TESS_SYSTEM_TOKEN:-}"
-      # 实时 KPI 异常判定阈值（最新一小时较前 N 小时基线跌幅超此比例即判异常，默认 0.3）
-      TESS_REALTIME_DROP_THRESHOLD: "${TESS_REALTIME_DROP_THRESHOLD:-0.3}"
-      # P7 预警存储：指向同一 compose 网络内的 Postgres（服务名 db 互通）
-      TESS_DATABASE_URL: "postgresql+psycopg://tess:tess@db:5432/tess"
+      # 实时 KPI 异常判定阈值（默认 0.0 = 任何「今日<昨日」的下跌都判异常；分档见附录）
+      TESS_REALTIME_DROP_THRESHOLD: "${TESS_REALTIME_DROP_THRESHOLD:-0.0}"
+      # P7 预警存储：由 TESS_DATABASE_URL 决定后端。
+      #   - 留空            → 代码回退 SQLite（纯本地零依赖开发）
+      #   - ...@host.docker.internal:5432/tess → 生产用宿主原生 PG（容器经网关连，推荐）
+      #   - ...@db:5432/tess → 本仓库自带 db 服务（需 `docker compose --profile db up -d`）
+      TESS_DATABASE_URL: "${TESS_DATABASE_URL}"
+      # === Teensing 闭环：对外 API 鉴权 + 拉取 Teensing 真实数据 ===
+      # 对外 /tess/* 接口鉴权密钥（留空=不鉴权；生产必填，Teensing 请求头带 X-API-Key）
+      TESS_API_KEY: "${TESS_API_KEY}"
+      # 数据接入实现：mock（默认零配置）| teensing（生产拉真实异常数据）
+      TESS_DATA_CONNECTOR: "${TESS_DATA_CONNECTOR:-mock}"
+      # Teensing 异常数据 API 根地址（TESS_DATA_CONNECTOR=teensing 时必填，需含 /api/v1 前缀）
+      TESS_DATA_API_BASE_URL: "${TESS_DATA_API_BASE_URL}"
+      # Teensing 数据 API 兜底 Token（多数场景留空，由调用方经 X-Teensing-Token 透传）
+      TESS_DATA_API_KEY: "${TESS_DATA_API_KEY}"
     volumes:
       - tess-data:/data
-    depends_on:
-      db:
-        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       # 调 /healthz（不依赖 LLM，纯进程探针）
@@ -42,8 +54,11 @@ services:
       start_period: 10s
 
   # P7 预警存储后端：PostgreSQL（与未来数据分析等模块共用同一实例）
+  # 默认不启动（生产用宿主原生 PG，由 TESS_DATABASE_URL 指向）。
+  # 本地想用自带 PG：  docker compose --profile db up --build -d
   db:
     image: postgres:16-alpine
+    profiles: ["db"]
     container_name: tess-db
     environment:
       POSTGRES_USER: tess
