@@ -169,7 +169,11 @@ class TeensingDataConnector:
     # ----- 传输层 -----
 
     def _headers(self, token: Optional[str] = None) -> dict:
-        headers = {"Accept": "application/json"}
+        # 必须带浏览器级 UA：Cloudflare Bot 防护会把 Python-urllib 默认 UA 拦成 403
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; TessDiagnosis/1.0)",
+        }
         # 优先用调用方透传的运营 token；缺省再用环境变量兜底 token
         auth = token or self.api_key
         if auth:
