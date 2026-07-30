@@ -122,3 +122,40 @@ class AlertStore:
             )
             r = cur.fetchone()
             return r[0] if r else None
+
+    def latest_batch(self, source: Optional[str] = None, limit: int = 50) -> dict:
+        """返回最近一次诊断批次（run_time）的结果；可选按来源过滤。
+
+        供 Teensing 轮询拉取：拿到的就是「上一轮整批结果」，不会跨批次错乱。
+        无数据时 run_time=None、items=[]。
+        """
+        run_time = self.latest_run()
+        if not run_time:
+            return {"run_time": None, "count": 0, "alerts": []}
+        with self._conn() as c:
+            if source:
+                cur = c.execute(
+                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis "
+                    "FROM alerts WHERE run_time = ? AND source = ? ORDER BY id DESC LIMIT ?",
+                    (run_time, source, limit),
+                )
+            else:
+                cur = c.execute(
+                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis "
+                    "FROM alerts WHERE run_time = ? ORDER BY id DESC LIMIT ?",
+                    (run_time, limit),
+                )
+            out = []
+            for row in cur.fetchall():
+                out.append(
+                    {
+                        "id": row[0],
+                        "run_time": row[1],
+                        "event_id": row[2],
+                        "status": row[3],
+                        "confidence": row[4],
+                        "source": row[5],
+                        "diagnosis": json.loads(row[6]) if row[6] else None,
+                    }
+                )
+            return {"run_time": run_time, "count": len(out), "alerts": out}

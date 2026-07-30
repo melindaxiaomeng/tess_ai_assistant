@@ -104,3 +104,48 @@ def test_feedback_endpoint_rejects_bad_vote(fb_client):
         },
     )
     assert resp.status_code == 422
+
+
+@pytest.fixture
+def kpi_alert_client(monkeypatch):
+    """用临时预警库替换单例，避免污染其它测试。"""
+    import tempfile
+
+    from tess_backend.alerts_store import AlertStore
+
+    monkeypatch.setattr(
+        app_module, "_get_llm_client", lambda: MockLLMClient(_mock_response(0.92))
+    )
+    monkeypatch.setattr(app_module, "ALERTS", AlertStore(tempfile.mktemp(suffix=".db")))
+    from fastapi.testclient import TestClient
+
+    return TestClient(app_module.app)
+
+
+def test_realtime_kpi_alerts_endpoint(kpi_alert_client):
+    """Teensing 拉取接口：只返回最近一批 realtime-kpi 来源的预警。"""
+    app_module.ALERTS.save_batch([
+        {"event_id": "REALTIME-GAP-09-17", "diagnosis": {"status": "DIAGNOSED", "confidence": 0.9, "summary": "掉零"}, "meta": {"source": "realtime-kpi"}},
+        {"event_id": "A1", "diagnosis": {"status": "DIAGNOSED", "confidence": 0.8}, "meta": {"source": "anomaly-warning"}},
+    ])
+    resp = kpi_alert_client.get("/tess/realtime-kpi/alerts")
+    assert resp.status_code == 200
+    body = resp.json()
+    # 契约字段齐备
+    assert "as_of" in body and body["as_of"]
+    assert "generated_at" in body and body["generated_at"]
+    assert body["count"] == 1  # 仅 realtime-kpi
+    item = body["items"][0]
+    assert item["event_id"] == "REALTIME-GAP-09-17"
+    assert item["source"] == "realtime-kpi"
+    assert item["diagnosis"]["status"] == "DIAGNOSED"
+
+
+def test_realtime_kpi_alerts_endpoint_empty(kpi_alert_client):
+    """无数据时返回安全默认结构。"""
+    resp = kpi_alert_client.get("/tess/realtime-kpi/alerts")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["as_of"] is None
+    assert body["count"] == 0
+    assert body["items"] == []

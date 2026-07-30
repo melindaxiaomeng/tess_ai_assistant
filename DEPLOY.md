@@ -319,5 +319,53 @@ curl -X POST http://localhost:8080/tess/diagnose-from-source \
 
 # 查看某运营的问答审计
 curl "http://localhost:8080/tess/query-log?operator_id=alice" \
-  -H "X-API-Key: <若生产已开启>" 
+  -H "X-API-Key: <若生产已开启>"
+
+---
+
+## 12. P7 主动预警 + Teensing 拉取接口
+
+Tess 在进程内每小时（间隔可配 `TESS_SCHEDULE_INTERVAL`）自动：拉异常/实时 KPI → 诊断 → 落预警库。
+**Teensing 后端无需前端点击，定时轮询下方接口即可拿到 Tess 算出的异常结果。**
+
+### 12.1 启用调度
+```bash
+TESS_SCHEDULE_ENABLED=true
+TESS_SCHEDULE_INTERVAL=3600      # 秒，默认 1 小时
+TESS_SCHEDULE_LIMIT=20
+TESS_SYSTEM_TOKEN=<共享服务 token>   # 定时任务拉 Teensing 数据时用的 Bearer，留空回退 TESS_DATA_API_KEY
+TESS_REALTIME_DROP_THRESHOLD=0.3    # 实时 KPI 同比跌幅阈值，超此判异常
+```
+
+### 12.2 Teensing 拉取接口（二选一）
+- **通用**：`GET /tess/alerts?source=realtime-kpi` —— 最近 N 条（跨批次混合）。
+- **Teensing 专用（推荐）**：`GET /tess/realtime-kpi/alerts` —— 只返回**最近一轮整批** realtime-kpi 诊断，结构更干净：
+  ```json
+  {
+    "as_of": "2026-07-30 13:00:00",     // 批次时间，Teensing 据此去重：相同 as_of 即同一批
+    "generated_at": "2026-07-30 13:05:12",
+    "count": 1,
+    "items": [
+      { "id": 42, "run_time": "...", "event_id": "REALTIME-GAP-09-17",
+        "status": "DIAGNOSED", "confidence": 0.91, "source": "realtime-kpi",
+        "diagnosis": { "...": "Gatekeeper 归一化诊断" } }
+    ]
+  }
+  ```
+
+### 12.3 鉴权
+- 生产设 `TESS_API_KEY=<强随机值>` 后，所有 `/tess/*`（含上面拉取接口）强制要求 `X-API-Key` 请求头，否则 401。
+- Teensing 后端轮询时带上 `X-API-Key: <同一值>` 即可（共享密钥，不按人过滤）。
+- 手动触发一次诊断（验证用，不必等整点）：`POST /tess/cron/run` `{"limit":20}`。
+
+### 12.4 调用示例（curl）
+```bash
+# Teensing 专用拉取接口
+curl "http://<tess-host>:8080/tess/realtime-kpi/alerts?limit=50" \
+  -H "X-API-Key: <TESS_API_KEY>"
+
+# 手动触发一轮（立即产生最新批次，便于联调）
+curl -X POST "http://<tess-host>:8080/tess/cron/run" \
+  -H "Content-Type: application/json" -d '{"limit": 20}'
+``` 
 

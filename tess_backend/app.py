@@ -11,6 +11,7 @@
 import asyncio
 import hmac
 import os
+import time
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -317,6 +318,33 @@ def get_alerts(limit: int = 50, source: str = None) -> dict:
     """
     rows = ALERTS.recent(limit=limit, source=source or None)
     return {"count": len(rows), "alerts": rows}
+
+
+@app.get("/tess/realtime-kpi/alerts")
+def get_realtime_kpi_alerts(limit: int = 50) -> dict:
+    """Teensing 专用拉取接口：返回最近一轮对 realtime-kpi 的诊断结果批次。
+
+    与通用 /tess/alerts 的区别：只针对 realtime-kpi 来源，且返回「最近一次整批」
+    （按 run_time 聚批），Teensing 轮询拿到的就是上一轮全部结果，不会跨批次错乱。
+
+    返回形状：
+    {
+      "as_of": "<批次时间 run_time>",        # Teensing 据此去重：相同 as_of 即同批
+      "generated_at": "<响应生成时间>",
+      "count": N,
+      "items": [ { id, run_time, event_id, status, confidence, source, diagnosis }, ... ]
+    }
+
+    鉴权：受全局 X-API-Key 守卫（生产设 TESS_API_KEY 后，Teensing 请求头带
+    X-API-Key: <共享密钥> 即可）。共享 token 模式：全局可读，不按人过滤。
+    """
+    batch = ALERTS.latest_batch(source="realtime-kpi", limit=limit)
+    return {
+        "as_of": batch["run_time"],
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "count": batch["count"],
+        "items": batch["alerts"],
+    }
 
 
 @app.post("/tess/cron/run")

@@ -40,3 +40,39 @@ def test_recent_limit(tmp_path):
     )
     assert len(store.recent(limit=3)) == 3
     assert len(store.recent(limit=100)) == 5
+
+
+def test_latest_batch_filters_by_source(tmp_path):
+    """latest_batch 只返回最近一批，且按 source 过滤。
+
+    注意：save_batch 默认用 time.strftime 作 run_time，同秒内两次调用会撞成同一批；
+    故此处显式传入不同 run_time 以真正验证「最近一批」语义。
+    """
+    store = AlertStore(str(tmp_path / "alerts.db"))
+    # 第一批(12:00)：realtime-kpi x2
+    store.save_batch(
+        [
+            {"event_id": "R1", "diagnosis": {"status": "DIAGNOSED"}, "meta": {"source": "realtime-kpi"}},
+            {"event_id": "R2", "diagnosis": {"status": "INCONCLUSIVE"}, "meta": {"source": "realtime-kpi"}},
+        ],
+        run_time="2026-07-30 12:00:00",
+    )
+    # 第二批(13:00)：anomaly-warning x1（更新批次）
+    store.save_batch(
+        [{"event_id": "A1", "diagnosis": {"status": "DIAGNOSED"}, "meta": {"source": "anomaly-warning"}}],
+        run_time="2026-07-30 13:00:00",
+    )
+    # 仅 realtime-kpi：最近一批(13:00)里没有 realtime-kpi → 空
+    batch = store.latest_batch(source="realtime-kpi")
+    assert batch["run_time"] == "2026-07-30 13:00:00"
+    assert batch["count"] == 0
+
+    # 全量最近一批：应只含 A1
+    all_batch = store.latest_batch()
+    assert all_batch["run_time"] == "2026-07-30 13:00:00"
+    assert all_batch["count"] == 1
+    assert all_batch["alerts"][0]["event_id"] == "A1"
+
+    # 空库返回安全默认值
+    empty = AlertStore(str(tmp_path / "empty.db"))
+    assert empty.latest_batch() == {"run_time": None, "count": 0, "alerts": []}
