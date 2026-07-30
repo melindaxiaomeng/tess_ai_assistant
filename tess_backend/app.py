@@ -337,21 +337,24 @@ def _filter_by_min_severity(items: list, min_severity: str) -> list:
 
 
 @app.get("/tess/alerts")
-def get_alerts(limit: int = 50, source: str = None, min_severity: str = None) -> dict:
+def get_alerts(limit: int = 50, source: str = None, min_severity: str = None,
+               include_acked: bool = True) -> dict:
     """P7 定时预警拉取接口：Teensing / SaaS 后端可轮询此接口获取每小时诊断结果。
 
-    返回最近 limit 条预警（含 run_time / event_id / status / confidence / source / diagnosis）。
+    返回最近 limit 条预警（含 run_time / event_id / status / confidence / source / diagnosis / ack*）。
     source 过滤：?source=realtime-kpi 只看实时 KPI 异常；?source=anomaly-warning 只看异常预警。
     min_severity 过滤：?min_severity=MEDIUM 只看 >= MEDIUM 的告警（LOW/MEDIUM/HIGH）。
+    include_acked：默认 True（含已确认项）；置 false 则只返回「运营尚未确认」的告警。
     受全局 X-API-Key 守卫（若生产已开启）。共享 token 模式：全局可读，不按人过滤。
     """
-    rows = ALERTS.recent(limit=limit, source=source or None)
+    rows = ALERTS.recent(limit=limit, source=source or None, include_acked=include_acked)
     rows = _filter_by_min_severity(rows, min_severity)
     return {"count": len(rows), "alerts": rows}
 
 
 @app.get("/tess/realtime-kpi/alerts")
-def get_realtime_kpi_alerts(limit: int = 50, min_severity: str = None) -> dict:
+def get_realtime_kpi_alerts(limit: int = 50, min_severity: str = None,
+                            since_as_of: str = None, include_acked: bool = False) -> dict:
     """Teensing 专用拉取接口：返回最近一轮对 realtime-kpi 的诊断结果批次。
 
     与通用 /tess/alerts 的区别：只针对 realtime-kpi 来源，且返回「最近一次整批」
@@ -363,22 +366,76 @@ def get_realtime_kpi_alerts(limit: int = 50, min_severity: str = None) -> dict:
       "generated_at": "<响应生成时间>",
       "count": N,
       "items": [ { id, run_time, event_id, status, confidence, source, diagnosis,
-                   anomaly_metadata: { severity, current_value, benchmark_value, ... } }, ... ]
+                   anomaly_metadata: { severity, current_value, benchmark_value, ... },
+                   acked_at, resolution, acked_by, ack_note }, ... ]
     }
+
+    增量游标：?since_as_of=2026-07-30 13:00:00 只返回比该批次更新的所有告警
+    （可能跨多批），Teensing 用上次的 as_of 传入即可只拿新增，省流量且不重复。
+    默认不传 since_as_of 时，行为等同「返回最近一批整批」。
 
     min_severity 过滤：?min_severity=MEDIUM 只返回 >= MEDIUM 的告警，
     可避免大量 LOW（微跌）刷屏。
 
+    include_acked：默认 False（只返回运营尚未确认的告警，已处理项不再刷屏）；
+    传 ?include_acked=true 可连已确认项一起取回（如做历史/审计视图）。
+
     鉴权：受全局 X-API-Key 守卫（生产设 TESS_API_KEY 后，Teensing 请求头带
     X-API-Key: <共享密钥> 即可）。共享 token 模式：全局可读，不按人过滤。
     """
-    batch = ALERTS.latest_batch(source="realtime-kpi", limit=limit)
-    items = _filter_by_min_severity(batch["alerts"], min_severity)
+    if since_as_of:
+        items = ALERTS.query_since(since_as_of, source="realtime-kpi", limit=limit,
+                                   include_acked=include_acked)
+        as_of = items[-1]["run_time"] if items else None
+    else:
+        batch = ALERTS.latest_batch(source="realtime-kpi", limit=limit, include_acked=include_acked)
+        items = batch["alerts"]
+        as_of = batch["run_time"]
+    items = _filter_by_min_severity(items, min_severity)
     return {
-        "as_of": batch["run_time"],
+        "as_of": as_of,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "count": len(items),
         "items": items,
+    }
+
+
+@app.post("/tess/alerts/{alert_id}/ack")
+def ack_alert(alert_id: int, payload: dict = None) -> dict:
+    """运营确认/处理回写：Teensing 在运营查看 / 解决 / 确认正常波动后调用，标记该告警已处理。
+
+    body: {
+      "resolution": "acknowledged" | "resolved" | "false_positive",
+      "acked_by":   "alice",          # 可选，处理人（运营身份）
+      "note":       "已重启采集链路"   # 可选，备注
+    }
+
+    resolution 含义：
+      - acknowledged  : 已查看/知晓（运营已读）
+      - resolved      : 已解决（运营已处理线上问题）
+      - false_positive: 误报 / 正常流量波动（运营确认无异常）
+
+    标记后，默认拉取（include_acked=false）不再返回该告警，避免已处理项刷屏；
+    拉取时传 include_acked=true 仍可查回（用于历史/审计）。
+
+    鉴权：受全局 X-API-Key 守卫保护（生产设 TESS_API_KEY 后必须带 X-API-Key）。
+    """
+    payload = payload or {}
+    resolution = payload.get("resolution")
+    if resolution not in ("acknowledged", "resolved", "false_positive"):
+        raise HTTPException(
+            status_code=422,
+            detail="resolution 必须是 acknowledged | resolved | false_positive 之一",
+        )
+    ok = ALERTS.ack(alert_id, resolution, payload.get("acked_by"), payload.get("note"))
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"未找到告警 {alert_id}")
+    return {
+        "ok": True,
+        "id": alert_id,
+        "resolution": resolution,
+        "acked_by": payload.get("acked_by"),
+        "acked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 

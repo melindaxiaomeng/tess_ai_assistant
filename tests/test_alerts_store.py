@@ -106,3 +106,53 @@ def test_anomaly_metadata_roundtrip(tmp_path):
     ], run_time="2026-07-30 14:00:00")
     old_rows = store.recent(source="anomaly-warning")
     assert old_rows[0]["anomaly_metadata"] is None
+
+
+def test_ack_marks_alert(tmp_path):
+    """运营确认回写：ack 后带 resolution/acked_by/ack_note/acked_at，且默认拉取过滤掉已确认项。"""
+    store = AlertStore(str(tmp_path / "ack.db"))
+    store.save_batch([
+        {"event_id": "R1", "diagnosis": {"status": "DIAGNOSED"}, "meta": {"source": "realtime-kpi"},
+         "anomaly_metadata": {"severity": "HIGH"}},
+    ], run_time="2026-07-30 13:00:00")
+    aid = store.recent(source="realtime-kpi")[0]["id"]
+    assert store.ack(aid, "resolved", acked_by="alice", note="已重启采集链路") is True
+
+    # include_acked=True 仍能查到，且 ack 字段齐全
+    acked = store.recent(source="realtime-kpi", include_acked=True)
+    assert acked[0]["resolution"] == "resolved"
+    assert acked[0]["acked_by"] == "alice"
+    assert acked[0]["ack_note"] == "已重启采集链路"
+    assert acked[0]["acked_at"] is not None
+
+    # include_acked=False（默认）：已确认项被过滤
+    assert store.recent(source="realtime-kpi", include_acked=False) == []
+
+
+def test_ack_invalid_resolution(tmp_path):
+    store = AlertStore(str(tmp_path / "ack2.db"))
+    store.save_batch([{"event_id": "R1", "diagnosis": {"status": "DIAGNOSED"}, "meta": {"source": "realtime-kpi"}}],
+                     run_time="2026-07-30 13:00:00")
+    aid = store.recent()[0]["id"]
+    with pytest.raises(ValueError):
+        store.ack(aid, "bogus")
+
+
+def test_ack_unknown_id(tmp_path):
+    store = AlertStore(str(tmp_path / "ack3.db"))
+    assert store.ack(999999, "resolved") is False
+
+
+def test_query_since_incremental(tmp_path):
+    """增量游标：只返回比 since_run_time 更新的所有批次。"""
+    store = AlertStore(str(tmp_path / "since.db"))
+    store.save_batch([{"event_id": "B1", "diagnosis": {"status": "DIAGNOSED"}, "meta": {"source": "realtime-kpi"}}],
+                     run_time="2026-07-30 12:00:00")
+    store.save_batch([{"event_id": "B2", "diagnosis": {"status": "DIAGNOSED"}, "meta": {"source": "realtime-kpi"}}],
+                     run_time="2026-07-30 13:00:00")
+    # 比 12:00 新：应只包含 13:00 批次的 B2
+    newer = store.query_since("2026-07-30 12:00:00", source="realtime-kpi")
+    assert len(newer) == 1
+    assert newer[0]["event_id"] == "B2"
+    # 无更新：空列表
+    assert store.query_since("2026-07-30 13:00:00", source="realtime-kpi") == []

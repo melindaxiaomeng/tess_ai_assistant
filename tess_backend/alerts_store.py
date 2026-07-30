@@ -4,6 +4,9 @@
 - 定时调度器（scheduler）每小时拉异常→诊断→把结果批量写入此库；
 - Teensing / SaaS 后端通过 GET /tess/alerts 轮询拉取最新预警，无需前端点击触发；
 - 共享服务 token 拉全量、不按人过滤（按用户选择），故预警为全局可读列表；
+- 运营在 Teensing 侧确认/处理后，调 POST /tess/alerts/{id}/ack 回写状态，
+  Tess 落库后默认拉取（include_acked=false）不再返回该告警，避免已处理项刷屏；
+- 增量游标（since_as_of）：Teensing 带上次拿到的 as_of，只返回更新的批次，省流量；
 - 默认用标准库 sqlite3，零额外依赖；路径可由 TESS_ALERTS_DB 覆盖。
 """
 
@@ -17,9 +20,20 @@ from typing import Optional
 
 DEFAULT_PATH = os.getenv("TESS_ALERTS_DB", "tess_alerts.db")
 
+# 运营确认/处理状态枚举：
+# - acknowledged  : 已查看/知晓（运营已读该告警）
+# - resolved      : 已解决（运营已处理线上问题）
+# - false_positive: 误报 / 正常流量波动（运营确认无异常）
+ACK_RESOLUTIONS = ("acknowledged", "resolved", "false_positive")
+
+_SELECT_COLS = (
+    "id, run_time, event_id, status, confidence, source, diagnosis, "
+    "anomaly_metadata, acked_at, resolution, acked_by, ack_note"
+)
+
 
 class AlertStore:
-    """预警库：保存每小时诊断批次，支持按时间倒序检索。"""
+    """预警库：保存每小时诊断批次，支持按时间检索、运营确认回写、增量游标。"""
 
     def __init__(self, path: str = DEFAULT_PATH):
         self.path = path
@@ -48,6 +62,12 @@ class AlertStore:
                 c.execute("ALTER TABLE alerts ADD COLUMN anomaly_metadata TEXT")
             except sqlite3.OperationalError:
                 pass  # 列已存在
+            # 运营确认/处理状态（Teensing 回写，用于去重与"已处理"标记）
+            for col in ("acked_at TEXT", "resolution TEXT", "acked_by TEXT", "ack_note TEXT"):
+                try:
+                    c.execute(f"ALTER TABLE alerts ADD COLUMN {col}")
+                except sqlite3.OperationalError:
+                    pass  # 列已存在
 
     @staticmethod
     def _normalize_result(r: dict) -> dict:
@@ -69,6 +89,24 @@ class AlertStore:
             "diagnosis": diag,
             "source": source,
             "anomaly_metadata": anomaly_metadata,
+        }
+
+    @staticmethod
+    def _row_to_dict(row) -> dict:
+        return {
+            "id": row[0],
+            "run_time": row[1],
+            "event_id": row[2],
+            "status": row[3],
+            "confidence": row[4],
+            "source": row[5],
+            "diagnosis": json.loads(row[6]) if row[6] else None,
+            "anomaly_metadata": json.loads(row[7]) if row[7] else None,
+            # 运营确认/处理状态
+            "acked_at": row[8],
+            "resolution": row[9],
+            "acked_by": row[10],
+            "ack_note": row[11],
         }
 
     def save_batch(self, results: list, run_time: Optional[str] = None) -> int:
@@ -100,36 +138,26 @@ class AlertStore:
             )
         return len(rows)
 
-    def recent(self, limit: int = 50, source: Optional[str] = None) -> list:
-        """按时间倒序返回最近 limit 条预警；source 非空时按来源过滤。"""
+    def recent(self, limit: int = 50, source: Optional[str] = None, include_acked: bool = True) -> list:
+        """按时间倒序返回最近 limit 条预警；source 非空时按来源过滤。
+
+        include_acked=False 时仅返回「未确认」项（默认 True=含已确认，向后兼容）。
+        """
         with self._conn() as c:
+            sql = f"SELECT {_SELECT_COLS} FROM alerts"
+            params: list = []
             if source:
-                cur = c.execute(
-                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis, anomaly_metadata "
-                    "FROM alerts WHERE source = ? ORDER BY id DESC LIMIT ?",
-                    (source, limit),
-                )
+                sql += " WHERE source = ?"
+                params.append(source)
+                if not include_acked:
+                    sql += " AND acked_at IS NULL"
             else:
-                cur = c.execute(
-                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis, anomaly_metadata "
-                    "FROM alerts ORDER BY id DESC LIMIT ?",
-                    (limit,),
-                )
-            out = []
-            for row in cur.fetchall():
-                out.append(
-                    {
-                        "id": row[0],
-                        "run_time": row[1],
-                        "event_id": row[2],
-                        "status": row[3],
-                        "confidence": row[4],
-                        "source": row[5],
-                        "diagnosis": json.loads(row[6]) if row[6] else None,
-                        "anomaly_metadata": json.loads(row[7]) if row[7] else None,
-                    }
-                )
-            return out
+                if not include_acked:
+                    sql += " WHERE acked_at IS NULL"
+            sql += " ORDER BY id DESC LIMIT ?"
+            params.append(limit)
+            cur = c.execute(sql, params)
+            return [self._row_to_dict(r) for r in cur.fetchall()]
 
     def latest_run(self) -> Optional[str]:
         """返回最近一次批次的 run_time；无数据返回 None。"""
@@ -140,7 +168,7 @@ class AlertStore:
             r = cur.fetchone()
             return r[0] if r else None
 
-    def latest_batch(self, source: Optional[str] = None, limit: int = 50) -> dict:
+    def latest_batch(self, source: Optional[str] = None, limit: int = 50, include_acked: bool = True) -> dict:
         """返回最近一次诊断批次（run_time）的结果；可选按来源过滤。
 
         供 Teensing 轮询拉取：拿到的就是「上一轮整批结果」，不会跨批次错乱。
@@ -150,30 +178,51 @@ class AlertStore:
         if not run_time:
             return {"run_time": None, "count": 0, "alerts": []}
         with self._conn() as c:
+            sql = f"SELECT {_SELECT_COLS} FROM alerts WHERE run_time = ?"
+            params: list = [run_time]
             if source:
-                cur = c.execute(
-                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis, anomaly_metadata "
-                    "FROM alerts WHERE run_time = ? AND source = ? ORDER BY id DESC LIMIT ?",
-                    (run_time, source, limit),
-                )
-            else:
-                cur = c.execute(
-                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis, anomaly_metadata "
-                    "FROM alerts WHERE run_time = ? ORDER BY id DESC LIMIT ?",
-                    (run_time, limit),
-                )
-            out = []
-            for row in cur.fetchall():
-                out.append(
-                    {
-                        "id": row[0],
-                        "run_time": row[1],
-                        "event_id": row[2],
-                        "status": row[3],
-                        "confidence": row[4],
-                        "source": row[5],
-                        "diagnosis": json.loads(row[6]) if row[6] else None,
-                        "anomaly_metadata": json.loads(row[7]) if row[7] else None,
-                    }
-                )
+                sql += " AND source = ?"
+                params.append(source)
+            if not include_acked:
+                sql += " AND acked_at IS NULL"
+            sql += " ORDER BY id DESC LIMIT ?"
+            params.append(limit)
+            cur = c.execute(sql, params)
+            out = [self._row_to_dict(r) for r in cur.fetchall()]
             return {"run_time": run_time, "count": len(out), "alerts": out}
+
+    def query_since(self, since_run_time: str, source: Optional[str] = None,
+                    limit: int = 200, include_acked: bool = True) -> list:
+        """增量游标：返回 run_time 严格大于 since_run_time 的所有告警（可能跨多批）。
+
+        Teensing 传上次拉取拿到的 as_of，即只拿到「更新批次」中的新增告警，
+        不用每次重传整批历史，也无需客户端再比对去重。
+        """
+        with self._conn() as c:
+            sql = f"SELECT {_SELECT_COLS} FROM alerts WHERE run_time > ?"
+            params: list = [since_run_time]
+            if source:
+                sql += " AND source = ?"
+                params.append(source)
+            if not include_acked:
+                sql += " AND acked_at IS NULL"
+            sql += " ORDER BY run_time ASC, id ASC LIMIT ?"
+            params.append(limit)
+            cur = c.execute(sql, params)
+            return [self._row_to_dict(r) for r in cur.fetchall()]
+
+    def ack(self, alert_id: int, resolution: str, acked_by: Optional[str] = None,
+            note: Optional[str] = None) -> bool:
+        """标记某条告警已被运营确认/处理。成功返回 True，id 不存在返回 False。
+
+        resolution 必须是 ACK_RESOLUTIONS 之一（acknowledged/resolved/false_positive）。
+        """
+        if resolution not in ACK_RESOLUTIONS:
+            raise ValueError(f"resolution 必须是 {ACK_RESOLUTIONS}")
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE alerts SET acked_at=?, resolution=?, acked_by=?, ack_note=? WHERE id=?",
+                (now, resolution, acked_by, note, alert_id),
+            )
+            return cur.rowcount > 0

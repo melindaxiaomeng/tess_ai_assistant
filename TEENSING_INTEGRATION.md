@@ -30,7 +30,7 @@ TESS_SCHEDULE_LIMIT=20
 TESS_SYSTEM_TOKEN=<共享服务 token>  # Tess 拉 Teensing 数据时用的 Bearer；留空回退 TESS_DATA_API_KEY
 TESS_DATA_CONNECTOR=teensing        # 接真实数据（非 mock）
 TESS_DATA_API_BASE_URL=https://<saas-host>/api/v1
-TESS_REALTIME_DROP_THRESHOLD=0.3    # 实时 KPI 同比跌幅阈值
+TESS_REALTIME_DROP_THRESHOLD=0.0    # 实时 KPI 同比最低跌幅门槛（0.0=任何下跌都报；调高可忽略微跌）
 TESS_API_KEY=<强随机值>             # 开启拉取接口鉴权（Teensing 需带 X-API-Key）
 ```
 
@@ -80,7 +80,11 @@ TESS_API_KEY=<强随机值>             # 开启拉取接口鉴权（Teensing �
         "benchmark_value": 12345.6,       // 昨日同期基准收益
         "severity": "HIGH",
         "calculated_loss": 12345.6        // 估算损失（= 昨日基准合计）
-      }
+      },
+      "acked_at": null,                  // 运营确认时间；null=尚未确认（默认拉取会出现）
+      "resolution": null,                // 运营处理结论：acknowledged / resolved / false_positive
+      "acked_by": null,                  // 处理人（运营身份）
+      "ack_note": null                   // 处理备注
     }
   ]
 }
@@ -137,6 +141,34 @@ def handle_alert(item):
         return  # 只处理已确诊/疑似，INCONCLUSIVE 转人工不自动告警
     print(f"[告警] {item['event_id']} | {diag.get('summary')} "
           f"| 主因={diag.get('primary_contributor_id')} | 置信度={diag.get('confidence')}")
+    # TODO: 这里把告警推给运营。运营在 Teensing 侧「查看/解决/确认正常波动」后，
+    #       调 ack_alert(item["id"], "resolved" | "acknowledged" | "false_positive") 回写 Tess，
+    #       之后该告警默认不再出现在拉取结果里（见下方 ack_alert）。
+
+def ack_alert(alert_id: int, resolution: str, acked_by: str = None, note: str = None):
+    """运营确认/处理回写：标记某告警已处理，Tess 落库后默认拉取不再返回它。
+
+    resolution 三选一：
+      "acknowledged"  - 运营已查看/知晓
+      "resolved"      - 运营已解决线上问题
+      "false_positive"- 运营确认是正常流量波动/误报
+    """
+    payload = {"resolution": resolution}
+    if acked_by: payload["acked_by"] = acked_by
+    if note: payload["note"] = note
+    try:
+        r = requests.post(
+            f"{POLL_URL.rsplit('/', 1)[0]}/tess/alerts/{alert_id}/ack",
+            json=payload, headers={"X-API-Key": TESS_API_KEY}, timeout=10,
+        )
+        if r.status_code == 200:
+            print(f"[ack] 告警 {alert_id} 已标记 {resolution}")
+        elif r.status_code == 404:
+            print(f"[ack] 告警 {alert_id} 不存在（可能已过期）")
+        else:
+            print(f"[ack] 异常状态码 {r.status_code}")
+    except requests.RequestException as e:
+        print(f"[ack] 回写失败（网络）: {e}")  # 失败不影响主流程，下轮可重试
 
 # 放到 cron / 定时循环里，每小时一次即可（Tess 也是每小时产一批）
 if __name__ == "__main__":
@@ -208,6 +240,15 @@ curl "https://<tess-host>:8080/tess/realtime-kpi/alerts?limit=50" \
 | `calculated_loss` | 估算损失（≈昨日基准合计） | 展示影响面 |
 | `trigger_time` / `event_id` | 时段 / 异常标识 | 定位 |
 
+运营确认字段（Teensing 回写后由 Tess 原样返回，详见第 4 节）：
+
+| 字段 | 含义 | Teensing 用法 |
+|------|------|---------------|
+| `acked_at` | 运营确认时间（ISO，null=未确认） | 判断是否已处理 |
+| `resolution` | `acknowledged` / `resolved` / `false_positive` | 区分"已读/已解决/误报正常波动" |
+| `acked_by` | 处理人（运营身份） | 审计/追责 |
+| `ack_note` | 处理备注 | 展示处理说明 |
+
 > ⚠️ 注：上面两段（`diagnosis` 与 `anomaly_metadata`）一起构成告警完整信息。第 7 节列的"透传原始数值"增强**已完成**，现已默认返回，无需额外开启。
 
 
@@ -223,12 +264,22 @@ curl "https://<tess-host>:8080/tess/realtime-kpi/alerts?limit=50" \
 
 ---
 
-## 7. 可选增强（按需让 Tess 加）
+## 7. 增强能力清单
 
-1. **按 severity 过滤（已实现）**：接口支持 `?min_severity=MEDIUM`（或 `HIGH`），只拉 >= 指定级别的告警，可避免大量 `LOW` 微跌刷屏。例：`GET /tess/realtime-kpi/alerts?min_severity=MEDIUM`。
-2. **增量游标**：接口加 `?since_as_of=...`，只拉比某批次更新的结果，省流量（尚未实现，需要可提）。
+### 已实现（开箱即用）
+1. **按 severity 过滤**：`?min_severity=MEDIUM`（或 `HIGH`）只拉 >= 指定级别的告警，避免 `LOW` 微跌刷屏。例：`GET /tess/realtime-kpi/alerts?min_severity=MEDIUM`。
+2. **增量游标（since_as_of）**：`?since_as_of=2026-07-30 13:00:00` 只返回比该批次更新的告警（可能跨多批）。Teensing 用上次拿到的 `as_of` 传入即可只拿新增，省流量且无需客户端再比对去重。例：`GET /tess/realtime-kpi/alerts?since_as_of=2026-07-30 13:00:00`。
+3. **运营确认回写**：`POST /tess/alerts/{id}/ack`（body `{"resolution":"acknowledged|resolved|false_positive","acked_by":"alice","note":"..."}`）标记告警已被运营处理。标记后**默认拉取（`include_acked=false`）不再返回该告警**，避免已处理项刷屏；做历史/审计视图时传 `?include_acked=true` 仍可查回。Teensing 客户端示例见第 4 节 `ack_alert()`。
 
-> 注：「透传原始数值」已完成（见第 3/5 节 `anomaly_metadata`），不再列为待办。
+### 如何判断"运营是否已知晓/处理"？
+- Tess **不知道**运营在 Teensing 侧做了什么，需由 Teensing 在处理动作（查看/解决/确认正常波动）后**反向调用 ack 接口回写**。
+- 回写后该告警 `acked_at` 非空、`resolution` 记录处理结论；Tess 默认拉取自动过滤掉，等于"已闭环"。
+- 三种 resolution 语义：`acknowledged`=已读知晓、`resolved`=已解决、`false_positive`=误报/正常流量波动（运营确认无异常）。
+
+> 注：「透传原始数值」也已实现（见第 3/5 节 `anomaly_metadata`），现已默认返回，无需额外开启。
+
+### 可选增强（如需再加）
+- 批量确认接口（一次 ack 多条）；确认状态变更事件推送（webhook）；回写失败重试策略等。
 
 ---
 

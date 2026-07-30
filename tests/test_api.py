@@ -186,3 +186,64 @@ def test_realtime_kpi_alerts_min_severity(kpi_alert_client):
     high = kpi_alert_client.get("/tess/realtime-kpi/alerts?min_severity=HIGH").json()
     assert high["count"] == 1
     assert high["items"][0]["event_id"] == "H"
+
+
+def test_alert_ack_endpoint_filters_default_pull(kpi_alert_client):
+    """运营确认回写：标记后默认拉取（include_acked=false）不再返回该告警。"""
+    app_module.ALERTS.save_batch([
+        {"event_id": "R1", "diagnosis": {"status": "DIAGNOSED"}, "meta": {"source": "realtime-kpi"},
+         "anomaly_metadata": {"severity": "HIGH"}},
+    ])
+    aid = app_module.ALERTS.recent(source="realtime-kpi")[0]["id"]
+
+    # 默认拉取包含该告警
+    before = kpi_alert_client.get("/tess/realtime-kpi/alerts").json()
+    assert before["count"] == 1
+
+    # 运营确认「正常波动」
+    resp = kpi_alert_client.post(
+        f"/tess/alerts/{aid}/ack",
+        json={"resolution": "false_positive", "acked_by": "alice", "note": "正常流量波动"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "ok": True, "id": aid, "resolution": "false_positive",
+        "acked_by": "alice", "acked_at": resp.json()["acked_at"],
+    }
+
+    # 默认拉取（include_acked=false）：已确认项被过滤
+    after = kpi_alert_client.get("/tess/realtime-kpi/alerts").json()
+    assert after["count"] == 0
+
+    # 显式 include_acked=true：仍可查回，且带 resolution
+    with_ack = kpi_alert_client.get("/tess/realtime-kpi/alerts?include_acked=true").json()
+    assert with_ack["count"] == 1
+    assert with_ack["items"][0]["resolution"] == "false_positive"
+    assert with_ack["items"][0]["acked_by"] == "alice"
+
+
+def test_alert_ack_invalid_resolution(kpi_alert_client):
+    app_module.ALERTS.save_batch([{"event_id": "R1", "diagnosis": {"status": "DIAGNOSED"},
+                                   "meta": {"source": "realtime-kpi"}}])
+    aid = app_module.ALERTS.recent()[0]["id"]
+    resp = kpi_alert_client.post(f"/tess/alerts/{aid}/ack", json={"resolution": "bogus"})
+    assert resp.status_code == 422
+
+
+def test_alert_ack_unknown_id(kpi_alert_client):
+    resp = kpi_alert_client.post("/tess/alerts/999999/ack", json={"resolution": "resolved"})
+    assert resp.status_code == 404
+
+
+def test_realtime_kpi_alerts_since_as_of(kpi_alert_client):
+    """增量游标 since_as_of：只返回比该批次更新的告警。"""
+    app_module.ALERTS.save_batch([{"event_id": "B1", "diagnosis": {"status": "DIAGNOSED"},
+                                   "meta": {"source": "realtime-kpi"}}],
+                                 run_time="2026-07-30 12:00:00")
+    app_module.ALERTS.save_batch([{"event_id": "B2", "diagnosis": {"status": "DIAGNOSED"},
+                                   "meta": {"source": "realtime-kpi"}}],
+                                 run_time="2026-07-30 13:00:00")
+    resp = kpi_alert_client.get("/tess/realtime-kpi/alerts?since_as_of=2026-07-30 12:00:00").json()
+    assert resp["count"] == 1
+    assert resp["items"][0]["event_id"] == "B2"
+    assert resp["as_of"] == "2026-07-30 13:00:00"

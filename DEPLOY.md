@@ -355,6 +355,12 @@ TESS_REALTIME_DROP_THRESHOLD=0.3    # 实时 KPI 同比跌幅阈值，超此判�
   }
   ```
 
+新增字段（运营确认回写后填充）：`acked_at` / `resolution`（`acknowledged`|`resolved`|`false_positive`）/ `acked_by` / `ack_note`；默认拉取（`include_acked=false`）自动过滤已确认项，传 `?include_acked=true` 可查回。
+
+**增量游标**：加 `?since_as_of=2026-07-30 13:00:00` 只返回比该批次更新的告警（可能跨多批，省流量）；不传则取最近整批。
+
+**运营确认回写**：`POST /tess/alerts/{id}/ack`，body `{"resolution":"resolved","acked_by":"alice","note":"已恢复"}`，标记后该告警默认不再出现在拉取结果中（已闭环）。详见 `TEENSING_INTEGRATION.md` 第 4 / 7 节。
+
 > 实时 KPI 异常口径：任何「今日<昨日」的下跌都判异常，严重度按跌幅分档
 > `drop<=30% LOW` / `30%<drop<50% MEDIUM` / `drop>=50% HIGH`（`TESS_REALTIME_DROP_THRESHOLD`
 > 默认 0.0 = 任何下跌都报，可调高以忽略微跌）。详见 `TEENSING_INTEGRATION.md` 第 8 节。
@@ -373,5 +379,14 @@ curl "http://<tess-host>:8080/tess/realtime-kpi/alerts?limit=50" \
 # 手动触发一轮（立即产生最新批次，便于联调）
 curl -X POST "http://<tess-host>:8080/tess/cron/run" \
   -H "Content-Type: application/json" -d '{"limit": 20}'
+
+# 增量拉取：只返回比 13:00 批次更新的告警（省流量）
+curl "http://<tess-host>:8080/tess/realtime-kpi/alerts?since_as_of=2026-07-30%2013:00:00" \
+  -H "X-API-Key: <TESS_API_KEY>"
+
+# 运营确认回写：标记某告警已处理（resolved / acknowledged / false_positive）
+curl -X POST "http://<tess-host>:8080/tess/alerts/42/ack" \
+  -H "Content-Type: application/json" -H "X-API-Key: <TESS_API_KEY>" \
+  -d '{"resolution":"resolved","acked_by":"alice","note":"已恢复采集链路"}'
 ``` 
 
