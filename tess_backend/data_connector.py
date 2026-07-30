@@ -221,33 +221,49 @@ class TeensingDataConnector:
         二者按实体名(name)归并，构造可供 normalize_to_context 使用的原始事件。
         """
         warn = self._unwrap(
-            self._http_get("/overview/ranking/anomaly-warning", token=token)
+            self._http_get(
+                "/overview/ranking/anomaly-warning",
+                params={"page_size": limit},
+                token=token,
+            )
         )
         fluc = self._unwrap(
             self._http_get("/overview/ranking/fluctuation", token=token)
         )
-        # 量化指标按实体名归并（fluctuation 含数值）
+
+        # 涨跌榜按 campaign_id（回退 campaign_name）建索引，并标记方向
+        # 真实结构：data.rising[]/data.falling[]，含 revenue_change（环比变化）
         fluc_map: dict = {}
         if isinstance(fluc, dict):
             for grp in ("rising", "falling"):
                 for it in fluc.get(grp) or []:
-                    if isinstance(it, dict) and it.get("name"):
-                        fluc_map[it["name"]] = it
-        raws: list[dict] = []
-        if isinstance(warn, dict):
-            for grp in ("rising", "falling"):
-                for it in warn.get(grp) or []:
                     if not isinstance(it, dict):
                         continue
-                    name = it.get("name") or it.get("entity") or it.get("entity_name")
+                    cid = it.get("campaign_id") or it.get("campaign_name") or it.get("name")
+                    if cid is None:
+                        continue
                     merged = dict(it)
-                    if name and name in fluc_map:
-                        # fluctuation 的量化字段补齐到预警项上
-                        for k, v in fluc_map[name].items():
-                            merged.setdefault(k, v)
                     merged["_direction"] = grp
-                    raws.append(merged)
-        # 若 anomaly-warning 为空，则直接用 fluctuation 列表
+                    fluc_map[cid] = merged
+
+        # 异常预警项：真实结构为 data.items[]（无显式环比变化），用涨跌榜补齐
+        raws: list[dict] = []
+        if isinstance(warn, dict):
+            for it in warn.get("items") or []:
+                if not isinstance(it, dict):
+                    continue
+                cid = it.get("campaign_id") or it.get("campaign_name") or it.get("name")
+                merged = dict(it)
+                if cid is not None and cid in fluc_map:
+                    # fluctuation 的环比变化/方向补齐到预警项上
+                    for k, v in fluc_map[cid].items():
+                        merged.setdefault(k, v)
+                    merged["_direction"] = fluc_map[cid].get("_direction", "unknown")
+                else:
+                    merged["_direction"] = merged.get("_direction", "unknown")
+                raws.append(merged)
+
+        # 若 anomaly-warning 为空，则直接用 fluctuation 列表（含完整环比信号）
         if not raws and isinstance(fluc, dict):
             for grp in ("rising", "falling"):
                 for it in fluc.get(grp) or []:
@@ -255,19 +271,24 @@ class TeensingDataConnector:
                         merged = dict(it)
                         merged["_direction"] = grp
                         raws.append(merged)
+
         return raws[:limit]
 
     def fetch_anomaly_event(
         self, event_id: str, token: Optional[str] = None
     ) -> Optional[dict]:
-        """按实体名（event_id）在 fluctuation 中查找单条（best-effort）。"""
+        """按 campaign_id（event_id）在 fluctuation 中查找单条（best-effort）。"""
         fluc = self._unwrap(
             self._http_get("/overview/ranking/fluctuation", token=token)
         )
         if isinstance(fluc, dict):
+            target = str(event_id)
             for grp in ("rising", "falling"):
                 for it in fluc.get(grp) or []:
-                    if isinstance(it, dict) and it.get("name") == event_id:
+                    if not isinstance(it, dict):
+                        continue
+                    cid = str(it.get("campaign_id") or it.get("campaign_name") or "")
+                    if cid == target:
                         merged = dict(it)
                         merged["_direction"] = grp
                         return merged
@@ -319,40 +340,59 @@ def normalize_to_context(raw: dict) -> dict:
             "associated_signals": raw.get("associated_signals", []),
         }
 
-    # (b) Teensing fluctuation/anomaly 形状
-    name = (
-        raw.get("name")
+    # (b) Teensing fluctuation/anomaly-warning 真实形状（已对齐 saas.melo.support 接口）
+    #     实体标识：campaign_id（稳定）优先，回退 campaign_name / advertiser_name
+    #     环比变化：fluctuation 用 revenue_change；anomaly-warning 无则 None
+    entity_id = raw.get("campaign_id") or raw.get("advertiser_id") or raw.get("publisher_id")
+    entity_name = (
+        raw.get("campaign_name")
+        or raw.get("advertiser_name")
+        or raw.get("name")
         or raw.get("entity")
-        or raw.get("entity_name")
         or "UNKNOWN"
     )
-    direction = raw.get("_direction", "falling")
-    change = raw.get("change")  # 主指标日环比变化（数值，可为 % 或绝对值）
-    profit = raw.get("profit")
+    direction = raw.get("_direction", "unknown")
+    change = raw.get("revenue_change")
+    if change is None and raw.get("change") is not None:
+        change = raw.get("change")
     revenue = raw.get("revenue")
+    profit = raw.get("profit")
+    cvr = raw.get("cvr")
     margin = raw.get("margin")
+    clicks = raw.get("clicks")
+    conversions = raw.get("conversions")
 
-    # TODO(接入): 按 Teensing 实际字段语义校准。以下为保守默认：
-    #   target_metric 取 profit（最具业务意义的亏损指标），缺则 revenue
-    #   current_value 取当前 profit/revenue；benchmark 以 change 反推基线
-    target_metric = "Profit" if profit is not None else ("Revenue" if revenue is not None else "Metric")
-    current_value = profit if profit is not None else revenue
+    # target_metric 与 current_value：优先用「带环比变化」的 Revenue（最直观）；
+    # 否则用 Profit（最能反映亏损）；再否则退化到 Revenue / Metric
+    if change is not None and revenue is not None:
+        target_metric = "Revenue"
+        current_value = revenue
+    elif profit is not None:
+        target_metric = "Profit"
+        current_value = profit
+    elif revenue is not None:
+        target_metric = "Revenue"
+        current_value = revenue
+    else:
+        target_metric = "Metric"
+        current_value = None
 
     benchmark_value = None
     if isinstance(change, (int, float)) and isinstance(current_value, (int, float)):
-        benchmark_value = current_value - change
+        benchmark_value = round(current_value - change, 4)
 
-    # severity 由变化幅度推导（可经 TESS 阈值配置进一步细化）
+    # severity：有环比变化按幅度（下跌>=50% 或 <= -10 判 HIGH）；无变化但有负毛利则 MEDIUM
     severity = "LOW"
     if isinstance(change, (int, float)):
-        if change <= -10:
-            severity = "HIGH"
-        elif change < 0:
-            severity = "MEDIUM"
+        if change < 0 or direction == "falling":
+            drop_ratio = (-change / current_value) if current_value else 0.0
+            severity = "HIGH" if (drop_ratio >= 0.5 or change <= -10) else "MEDIUM"
         elif change >= 10:
             severity = "HIGH"
         elif change > 0:
             severity = "MEDIUM"
+    elif isinstance(margin, (int, float)) and margin < 0:
+        severity = "MEDIUM"
 
     loss = {
         "delta": change,
@@ -361,9 +401,11 @@ def normalize_to_context(raw: dict) -> dict:
         "current_value": current_value,
         "benchmark_value": benchmark_value,
         "margin": margin,
+        "cvr": cvr,
     }
+    event_id = str(entity_id) if entity_id not in (None, "") else str(entity_name)
     meta = {
-        "event_id": name,
+        "event_id": event_id,
         "trigger_time": raw.get("trigger_time"),
         "target_metric": target_metric,
         "current_value": current_value,
@@ -373,12 +415,20 @@ def normalize_to_context(raw: dict) -> dict:
     }
     top_contributors = [
         {
-            "dimension_type": "Entity",
-            "dimension_value": name,
+            "dimension_type": "Campaign",
+            "dimension_value": entity_name,
             "impact_share": "100%",
             "metric_change": (
-                f"{target_metric} {change:+g}" if isinstance(change, (int, float)) else None
+                f"{target_metric} 环比 {change:+g}" if isinstance(change, (int, float)) else None
             ),
+            "advertiser_name": raw.get("advertiser_name"),
+            "publisher_name": raw.get("publisher_name"),
+            "revenue": revenue,
+            "profit": profit,
+            "cvr": cvr,
+            "margin": margin,
+            "clicks": clicks,
+            "conversions": conversions,
         }
     ]
     return {
