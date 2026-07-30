@@ -76,3 +76,33 @@ def test_latest_batch_filters_by_source(tmp_path):
     # 空库返回安全默认值
     empty = AlertStore(str(tmp_path / "empty.db"))
     assert empty.latest_batch() == {"run_time": None, "count": 0, "alerts": []}
+
+
+def test_anomaly_metadata_roundtrip(tmp_path):
+    """原始 anomaly_metadata（current/benchmark/severity）应随预警一并落库与返回。"""
+    store = AlertStore(str(tmp_path / "am.db"))
+    meta = {
+        "event_id": "REALTIME-GAP-09-17",
+        "current_value": 0.0,
+        "benchmark_value": 1234.5,
+        "severity": "HIGH",
+    }
+    store.save_batch([
+        {
+            "event_id": "REALTIME-GAP-09-17",
+            "diagnosis": {"status": "DIAGNOSED", "confidence": 0.9, "summary": "掉零"},
+            "meta": {"source": "realtime-kpi"},
+            "anomaly_metadata": meta,
+        }
+    ], run_time="2026-07-30 13:00:00")
+    rows = store.recent(source="realtime-kpi")
+    assert rows[0]["anomaly_metadata"] == meta
+    batch = store.latest_batch(source="realtime-kpi")
+    assert batch["alerts"][0]["anomaly_metadata"]["severity"] == "HIGH"
+
+    # 兼容：无 anomaly_metadata 的旧形状也能存（字段为 None）
+    store.save_batch([
+        {"event_id": "OLD", "diagnosis": {"status": "INCONCLUSIVE"}, "meta": {"source": "anomaly-warning"}},
+    ], run_time="2026-07-30 14:00:00")
+    old_rows = store.recent(source="anomaly-warning")
+    assert old_rows[0]["anomaly_metadata"] is None

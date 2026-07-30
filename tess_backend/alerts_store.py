@@ -43,19 +43,33 @@ class AlertStore:
                 )
                 """
             )
+            # 存量库迁移：补充 anomaly_metadata 列（原始异常数值，供 Teensing 展示）
+            try:
+                c.execute("ALTER TABLE alerts ADD COLUMN anomaly_metadata TEXT")
+            except sqlite3.OperationalError:
+                pass  # 列已存在
 
     @staticmethod
     def _normalize_result(r: dict) -> dict:
-        """兼容 {event_id, diagnosis, meta} 与 {event_id, diagnosis} 两种结果形状。"""
+        """兼容 {event_id, diagnosis, meta, anomaly_metadata} 与旧形状。"""
         if not isinstance(r, dict):
-            return {"event_id": None, "diagnosis": {}, "source": None}
+            return {"event_id": None, "diagnosis": {}, "source": None, "anomaly_metadata": None}
         diag = r.get("diagnosis") or {}
         event_id = r.get("event_id")
         if not event_id and isinstance(diag, dict):
             event_id = (diag.get("anomaly_metadata") or {}).get("event_id")
         meta = r.get("meta") or {}
         source = meta.get("source")
-        return {"event_id": event_id, "diagnosis": diag, "source": source}
+        anomaly_metadata = r.get("anomaly_metadata")
+        if not anomaly_metadata and isinstance(diag, dict):
+            # 兜底：诊断对象里若仍带了 anomaly_metadata 也一并保留
+            anomaly_metadata = diag.get("anomaly_metadata")
+        return {
+            "event_id": event_id,
+            "diagnosis": diag,
+            "source": source,
+            "anomaly_metadata": anomaly_metadata,
+        }
 
     def save_batch(self, results: list, run_time: Optional[str] = None) -> int:
         """把一轮诊断的结果列表批量写入预警库。返回写入条数。"""
@@ -64,6 +78,7 @@ class AlertStore:
         for r in results or []:
             n = self._normalize_result(r)
             diag = n["diagnosis"]
+            ameta = n["anomaly_metadata"]
             rows.append(
                 (
                     run_time,
@@ -72,14 +87,15 @@ class AlertStore:
                     diag.get("confidence") if isinstance(diag, dict) else None,
                     n["source"],
                     json.dumps(diag, ensure_ascii=False),
+                    json.dumps(ameta, ensure_ascii=False) if ameta else None,
                 )
             )
         if not rows:
             return 0
         with self._conn() as c:
             c.executemany(
-                "INSERT INTO alerts (run_time, event_id, status, confidence, source, diagnosis) "
-                "VALUES (?,?,?,?,?,?)",
+                "INSERT INTO alerts (run_time, event_id, status, confidence, source, diagnosis, anomaly_metadata) "
+                "VALUES (?,?,?,?,?,?,?)",
                 rows,
             )
         return len(rows)
@@ -89,13 +105,13 @@ class AlertStore:
         with self._conn() as c:
             if source:
                 cur = c.execute(
-                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis "
+                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis, anomaly_metadata "
                     "FROM alerts WHERE source = ? ORDER BY id DESC LIMIT ?",
                     (source, limit),
                 )
             else:
                 cur = c.execute(
-                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis "
+                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis, anomaly_metadata "
                     "FROM alerts ORDER BY id DESC LIMIT ?",
                     (limit,),
                 )
@@ -110,6 +126,7 @@ class AlertStore:
                         "confidence": row[4],
                         "source": row[5],
                         "diagnosis": json.loads(row[6]) if row[6] else None,
+                        "anomaly_metadata": json.loads(row[7]) if row[7] else None,
                     }
                 )
             return out
@@ -135,13 +152,13 @@ class AlertStore:
         with self._conn() as c:
             if source:
                 cur = c.execute(
-                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis "
+                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis, anomaly_metadata "
                     "FROM alerts WHERE run_time = ? AND source = ? ORDER BY id DESC LIMIT ?",
                     (run_time, source, limit),
                 )
             else:
                 cur = c.execute(
-                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis "
+                    "SELECT id, run_time, event_id, status, confidence, source, diagnosis, anomaly_metadata "
                     "FROM alerts WHERE run_time = ? ORDER BY id DESC LIMIT ?",
                     (run_time, limit),
                 )
@@ -156,6 +173,7 @@ class AlertStore:
                         "confidence": row[4],
                         "source": row[5],
                         "diagnosis": json.loads(row[6]) if row[6] else None,
+                        "anomaly_metadata": json.loads(row[7]) if row[7] else None,
                     }
                 )
             return {"run_time": run_time, "count": len(out), "alerts": out}

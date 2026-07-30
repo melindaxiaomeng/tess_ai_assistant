@@ -348,7 +348,9 @@ TESS_REALTIME_DROP_THRESHOLD=0.3    # 实时 KPI 同比跌幅阈值，超此判�
     "items": [
       { "id": 42, "run_time": "...", "event_id": "REALTIME-GAP-09-17",
         "status": "DIAGNOSED", "confidence": 0.91, "source": "realtime-kpi",
-        "diagnosis": { "...": "Gatekeeper 归一化诊断" } }
+        "diagnosis": { "...": "Gatekeeper 归一化诊断" },
+        "anomaly_metadata": { "current_value": 0.0, "benchmark_value": 12345.6,
+          "severity": "HIGH", "calculated_loss": 12345.6 } }
     ]
   }
   ```

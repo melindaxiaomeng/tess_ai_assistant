@@ -71,6 +71,15 @@ TESS_API_KEY=<强随机值>             # 开启拉取接口鉴权（Teensing �
           "primary_factor": "实时采集链路中断或接口滞后",
           "causal_chain": ["采集掉零", "同比缺失", "收益异常"]
         }
+      },
+      "anomaly_metadata": {               // 原始异常数值（Tess 透传，供直接展示）
+        "event_id": "REALTIME-GAP-09-17",
+        "trigger_time": "hour 09-17",
+        "target_metric": "Revenue",
+        "current_value": 0.0,             // 今日（异常时段）收益
+        "benchmark_value": 12345.6,       // 昨日同期基准收益
+        "severity": "HIGH",
+        "calculated_loss": 12345.6        // 估算损失（= 昨日基准合计）
       }
     }
   ]
@@ -78,6 +87,9 @@ TESS_API_KEY=<强随机值>             # 开启拉取接口鉴权（Teensing �
 ```
 
 无数据时：`{ "as_of": null, "count": 0, "items": [] }` —— 正常，按"无异常"处理即可。
+
+> `anomaly_metadata` 与 `diagnosis` 是**两套独立信息**：`diagnosis` 是 LLM 的文字归因结论，`anomaly_metadata` 是 Tess 检测出的**原始数值事实**（今日值 / 昨日基准 / 严重度 / 估算损失）。展示告警卡片时建议两者都用地上——数值用 `anomaly_metadata`，结论文字用 `diagnosis.summary`。
+
 
 ---
 
@@ -186,7 +198,18 @@ curl "https://<tess-host>:8080/tess/realtime-kpi/alerts?limit=50" \
 | `diagnosis.root_cause_analysis.primary_factor` | 主因文字 | 详情展开 |
 | `diagnosis.root_cause_analysis.causal_chain` | 因果链数组 | 详情时间线 |
 
-> 注：以上为 Gatekeeper 归一化后的**稳定契约字段**。原始 `current_value/benchmark_value/severity`（实时 KPI 掉零/暴跌的具体数值）目前不在诊断输出里，需要的话可让 Tess 把原始 `anomaly_metadata` 一并透传（可选增强，见第 7 节）。
+`anomaly_metadata`（Tess 透传的原始数值，建议直接展示）：
+
+| 字段 | 含义 | Teensing 用法 |
+|------|------|---------------|
+| `current_value` | 异常时段今日值（如收益） | 展示"今日" |
+| `benchmark_value` | 昨日同期基准值 | 展示"昨日基准"、算跌幅 |
+| `severity` | `HIGH` / `MEDIUM` | 告警级别配色 |
+| `calculated_loss` | 估算损失（≈昨日基准合计） | 展示影响面 |
+| `trigger_time` / `event_id` | 时段 / 异常标识 | 定位 |
+
+> ⚠️ 注：上面两段（`diagnosis` 与 `anomaly_metadata`）一起构成告警完整信息。第 7 节列的"透传原始数值"增强**已完成**，现已默认返回，无需额外开启。
+
 
 ---
 
@@ -202,8 +225,44 @@ curl "https://<tess-host>:8080/tess/realtime-kpi/alerts?limit=50" \
 
 ## 7. 可选增强（按需让 Tess 加）
 
-1. **透传原始数值**：让 Tess 在每条 alert 里附带 `anomaly_metadata`（current/benchmark/severity），Teensing 可直接展示"昨日基准 ¥X，今日 ¥0"。
-2. **按 severity 过滤**：接口加 `?min_severity=HIGH`，只拉高危。
-3. **增量游标**：接口加 `?since_as_of=...`，只拉比某批次更新的结果，省流量。
+1. **按 severity 过滤**：接口加 `?min_severity=HIGH`，只拉高危。
+2. **增量游标**：接口加 `?since_as_of=...`，只拉比某批次更新的结果，省流量。
 
-需要哪一项，让 Tess 侧补一个参数即可。
+> 注：「透传原始数值」已完成（见第 3/5 节 `anomaly_metadata`），不再列为待办。
+
+---
+
+## 8. 附录：Tess 如何判定「异常」（Teensing 同学了解即可）
+
+数据来源：Tess 每小时拉 `GET /overview/realtime-kpi`，返回**逐小时** `today_*` / `yesterday_*` 同比
+（hour 00–23，字段如 `today_revenue` / `yesterday_revenue`）。
+
+判定分三步，**核心是先锚定"数据更新到哪小时"，再只判已完整过去的时段，避免误报**：
+
+### 8.1 锚定更新小时（as_of_hour）
+- 数据每小时滚动更新：接口在某时刻返回的是"截至当前已更新的小时快照"，**尾部 hour 的 `today=0` 通常只是"还没产生/接口滞后"，不是真掉零**。
+- Tess 默认从数据自身推断 `as_of_hour` = 最后一个 `today_revenue > 0` 的小时。
+- 例：快照里 00–08 有值、09–23 为 0 → `as_of_hour = 08`，09–23 视为"未来/未就绪"，**不参与掉零判定**。
+
+### 8.2 延迟容忍窗口（grace_hours，默认 1）
+- 即便"已发生"的小时，刚过去的 15–30 分钟内 `today` 也可能还是 0（接口滞后）。
+- `grace_hours` 内（当前小时及前 1 小时）的 `today=0` 视为"数据未就绪"，**不报**。
+- 仅对 `h <= as_of_hour - grace_hours` 的"已完整过去"小时做判定。
+
+### 8.3 两类异常规则
+1. **数据掉零（数据中断）**：`yesterday_revenue > 0` 且 `today_revenue <= 0` → `HIGH`。
+   - **连续掉零小时聚合成一条告警** `REALTIME-GAP-{起}-{止}`（如 `REALTIME-GAP-09-17`），不逐小时刷屏。
+2. **同比暴跌**：`today_revenue > 0` 且 `(1 - today/yesterday) >= TESS_REALTIME_DROP_THRESHOLD`（默认 0.3，即同比跌 30%）→ `MEDIUM`；跌 ≥ 50% 为 `HIGH`。
+   - 单小时一条 `REALTIME-DROP-{小时}`。
+
+### 8.4 判定后
+- 每条命中的 Context 送入 LLM 诊断（Gatekeeper 归一化），结论进 `diagnosis`；原始数值进 `anomaly_metadata`；两者一起落预警库，供 Teensing 拉取。
+- **若所有 `today_revenue` 全为 0**（无法锚定）→ 直接跳过、不报，避免整表空时误报。
+
+### 8.5 可调参数
+| 参数 | 默认 | 作用 |
+|------|------|------|
+| `TESS_REALTIME_DROP_THRESHOLD` | 0.3 | 同比暴跌触发阈值 |
+| `TESS_REALTIME_GRACE_HOURS` | 1 | 延迟容忍窗口（小时） |
+| `TESS_SCHEDULE_INTERVAL` | 3600 | 检测频率（秒） |
+

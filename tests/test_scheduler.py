@@ -59,6 +59,13 @@ def test_run_scheduled_diagnosis_stores_alerts(monkeypatch, tmp_path):
     assert "anomaly-warning" in stored_sources
     assert "realtime-kpi" in stored_sources
 
+    # 原始 anomaly_metadata 应随预警一并透传落库（供 Teensing 展示 current/benchmark/severity）
+    assert any(r["anomaly_metadata"] for r in rows), "预警应携带原始 anomaly_metadata"
+    sample = next(r for r in rows if r["anomaly_metadata"])
+    assert "current_value" in sample["anomaly_metadata"]
+    assert "benchmark_value" in sample["anomaly_metadata"]
+    assert "severity" in sample["anomaly_metadata"]
+
 
 def test_get_alerts_filter_by_source(client):
     app_module.run_scheduled_diagnosis(limit=3)

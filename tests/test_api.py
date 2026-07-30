@@ -123,9 +123,19 @@ def kpi_alert_client(monkeypatch):
 
 
 def test_realtime_kpi_alerts_endpoint(kpi_alert_client):
-    """Teensing 拉取接口：只返回最近一批 realtime-kpi 来源的预警。"""
+    """Teensing 拉取接口：只返回最近一批 realtime-kpi 来源的预警，且透传原始 anomaly_metadata。"""
     app_module.ALERTS.save_batch([
-        {"event_id": "REALTIME-GAP-09-17", "diagnosis": {"status": "DIAGNOSED", "confidence": 0.9, "summary": "掉零"}, "meta": {"source": "realtime-kpi"}},
+        {
+            "event_id": "REALTIME-GAP-09-17",
+            "diagnosis": {"status": "DIAGNOSED", "confidence": 0.9, "summary": "掉零"},
+            "meta": {"source": "realtime-kpi"},
+            "anomaly_metadata": {
+                "event_id": "REALTIME-GAP-09-17",
+                "current_value": 0.0,
+                "benchmark_value": 1234.5,
+                "severity": "HIGH",
+            },
+        },
         {"event_id": "A1", "diagnosis": {"status": "DIAGNOSED", "confidence": 0.8}, "meta": {"source": "anomaly-warning"}},
     ])
     resp = kpi_alert_client.get("/tess/realtime-kpi/alerts")
@@ -139,6 +149,10 @@ def test_realtime_kpi_alerts_endpoint(kpi_alert_client):
     assert item["event_id"] == "REALTIME-GAP-09-17"
     assert item["source"] == "realtime-kpi"
     assert item["diagnosis"]["status"] == "DIAGNOSED"
+    # 原始数值透传：Teensing 可直接展示「昨日基准 / 今日 / 严重度」
+    assert item["anomaly_metadata"]["current_value"] == 0.0
+    assert item["anomaly_metadata"]["benchmark_value"] == 1234.5
+    assert item["anomaly_metadata"]["severity"] == "HIGH"
 
 
 def test_realtime_kpi_alerts_endpoint_empty(kpi_alert_client):

@@ -142,7 +142,12 @@ def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None) -> list:
             event_id, diag.get("status", "UNKNOWN"), diag.get("confidence", 0.0)
         )
         results.append(
-            {"event_id": event_id, "diagnosis": diag, "meta": {"source": "anomaly-warning"}}
+            {
+                "event_id": event_id,
+                "diagnosis": diag,
+                "meta": {"source": "anomaly-warning"},
+                "anomaly_metadata": ctx.get("anomaly_metadata"),
+            }
         )
 
     # (2) 实时 KPI 小时级曲线：每小时也拉一遍，看是否数据异常
@@ -156,7 +161,12 @@ def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None) -> list:
                 event_id, diag.get("status", "UNKNOWN"), diag.get("confidence", 0.0)
             )
             results.append(
-                {"event_id": event_id, "diagnosis": diag, "meta": {"source": "realtime-kpi"}}
+                {
+                    "event_id": event_id,
+                    "diagnosis": diag,
+                    "meta": {"source": "realtime-kpi"},
+                    "anomaly_metadata": ctx.get("anomaly_metadata"),
+                }
             )
     except Exception as e:  # realtime 拉取/解析失败不应拖垮整批预警
         logger.warning("realtime-kpi 拉取或分析失败，本轮跳过实时异常检测: %s", e)
