@@ -16,6 +16,8 @@ from tess_backend.data_connector import (
     extract_realtime_anomalies,
     _severity_for_drop,
     _safe_benchmark,
+    should_diagnose,
+    is_sudden_cliff,
 )
 from tess_backend import app as app_module
 from tess_backend.tess_agent import MockLLMClient
@@ -306,8 +308,9 @@ def test_fetch_campaign_time_series_excludes_partial_today(monkeypatch):
     assert ts["data_points_count"] == 1
 
 
-def test_low_revenue_campaigns_skipped(monkeypatch):
-    """anomaly-warning 中 Rev < TESS_MIN_REVENUE_USD 的低价值 campaign 不进诊断。"""
+def test_low_revenue_not_filtered_at_fetch_layer(monkeypatch):
+    """营收门槛降噪已上移到 app.run_scheduled_diagnosis（需 history_baseline 判定断崖），
+    fetch_recent_anomalies 不再硬过滤，低营收项仍会返回给编排层。"""
     monkeypatch.setenv("TESS_MIN_REVENUE_USD", "20")
 
     def fake_get(self, path, params=None, token=None):
@@ -323,7 +326,7 @@ def test_low_revenue_campaigns_skipped(monkeypatch):
                             "revenue": 500.0,
                             "profit": 120.0,
                         },
-                        {  # Rev 15 < 20 -> 跳过
+                        {  # Rev 15 < 20 -> 仍返回，由 app 层判定是否跳过
                             "campaign_id": 222,
                             "campaign_name": "Tiny_B",
                             "revenue": 15.0,
@@ -339,9 +342,47 @@ def test_low_revenue_campaigns_skipped(monkeypatch):
     monkeypatch.setattr(TeensingDataConnector, "_http_get", fake_get)
     c = TeensingDataConnector(base_url="https://saas.example.com/api/v1")
     raws = c.fetch_recent_anomalies(limit=10, token="OPERATOR_JWT_xyz")
-    assert len(raws) == 1
-    assert raws[0]["campaign_id"] == 111
-    assert all((r.get("revenue") or 0) >= 20 for r in raws)
+    assert len(raws) == 2  # 不再在 fetch 层剔除
+    assert {r["campaign_id"] for r in raws} == {111, 222}
+
+
+def _hb(revs):
+    """构造 history_baseline（time_series），revenue 列表按日期升序。"""
+    return {
+        "granularity": "day",
+        "time_series": [
+            {"timestamp": f"2026-08-0{i}", "revenue": v} for i, v in enumerate(revs, 1)
+        ],
+    }
+
+
+def test_should_diagnose_revenue_gate_and_cliff_exemption(monkeypatch):
+    """should_diagnose：高营收进诊断；低营收无断崖跳过；低营收有断崖豁免。"""
+    monkeypatch.setenv("TESS_MIN_REVENUE_USD", "20")
+    monkeypatch.setenv("TESS_CLIFF_DROP_THRESHOLD", "0.5")
+
+    # 高营收 -> 诊断
+    assert should_diagnose({"revenue": 500.0}) is True
+    # 低营收 + 无历史 -> 跳过
+    assert should_diagnose({"revenue": 15.0}, None) is False
+    # 低营收 + 轻微下滑（峰 100 -> 80，跌 20% < 50%）-> 跳过
+    assert should_diagnose({"revenue": 15.0}, _hb([100, 90, 80])) is False
+    # 低营收 + 断崖（峰 100 -> 10，跌 90% >= 50%）-> 豁免诊断
+    assert should_diagnose({"revenue": 15.0}, _hb([100, 50, 10])) is True
+    # 缺失 revenue 字段（如非 campaign 结构的样例事件）-> 不跳过，照常诊断
+    assert should_diagnose({"event_id": "ERR-x"}, _hb([100, 10])) is True
+
+
+def test_is_sudden_cliff_edge_cases():
+    """is_sudden_cliff 边界：缺失/不足/零峰值时返回 False。"""
+    assert is_sudden_cliff(None) is False
+    assert is_sudden_cliff({"time_series": []}) is False
+    assert is_sudden_cliff({"time_series": [{"revenue": 5.0}]}) is False  # 仅 1 点
+    assert is_sudden_cliff({"time_series": [{"revenue": 0.0}, {"revenue": 0.0}]}) is False  # 峰为 0
+    # 50% 阈值边界：恰好 50% 命中
+    assert is_sudden_cliff(_hb([100, 50]), threshold=0.5) is True
+    # 49% 不命中
+    assert is_sudden_cliff(_hb([100, 51]), threshold=0.5) is False
 
 
 def test_teensing_requires_token_via_app(client, monkeypatch):

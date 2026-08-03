@@ -30,6 +30,10 @@ logger = logging.getLogger("tess_backend.data_connector")
 # 可通过环境变量 TESS_MIN_REVENUE_USD 调整，默认 20 美元。
 MIN_REVENUE_USD = float(os.getenv("TESS_MIN_REVENUE_USD", "20"))
 
+# 小投放猝死豁免：营收低于门槛的 campaign，若其历史序列「峰值→最近完成日」跌幅
+# >= 该阈值，仍送诊断（避免漏掉小投放突然崩盘）。可通过 TESS_CLIFF_DROP_THRESHOLD 调整，默认 0.5（50%）。
+CLIFF_DROP_THRESHOLD = float(os.getenv("TESS_CLIFF_DROP_THRESHOLD", "0.5"))
+
 # 开发/测试用样例原始事件（结构接近 Teensing 预期返回，已可直接归一化为 Context）
 _SAMPLE_RAW = {
     "event_id": "ERR-20260728-0912",
@@ -288,9 +292,8 @@ class TeensingDataConnector:
             for it in warn.get("items") or []:
                 if not isinstance(it, dict):
                     continue
-                # 低营收 campaign 跳过诊断（降噪）：Rev < 门槛不查
-                if _num(it.get("revenue")) < MIN_REVENUE_USD:
-                    continue
+                # 营收门槛降噪 + 小投放猝死豁免的判定已上移到 app.run_scheduled_diagnosis
+                # （需先拉 history_baseline 才能判断断崖，故不在 fetch 层硬跳过）。
                 cid = it.get("campaign_id") or it.get("campaign_name") or it.get("name")
                 merged = dict(it)
                 if cid is not None and cid in fluc_map:
@@ -666,6 +669,55 @@ def _drop_ratio(today, yest):
     if yest > 0 and today <= 0:
         return 1.0
     return None
+
+
+def is_sudden_cliff(history_baseline, threshold=CLIFF_DROP_THRESHOLD):
+    """历史序列是否呈断崖式暴跌（小投放猝死判定）。
+
+    计算「峰值营收 → 最近完成日营收」的跌幅；跌幅 >= threshold 视为猝死，
+    即使该 campaign 营收低于门槛也应进诊断。
+    series 末点即最近完成日（fetch_campaign_time_series 已剔除今天部分日，
+    且按日期升序 append），故取 revs[-1]；序列按收入升序排列时此假设依然成立。
+    - 历史缺失 / 序列不足 2 点 / 峰值为 0 → 视为无断崖。
+    """
+    if not isinstance(history_baseline, dict):
+        return False
+    series = history_baseline.get("time_series") or []
+    if not isinstance(series, list) or len(series) < 2:
+        return False
+    revs = []
+    for p in series:
+        if isinstance(p, dict):
+            r = _num(p.get("revenue"))
+            revs.append(r)
+    if len(revs) < 2:
+        return False
+    peak = max(revs)
+    latest = revs[-1]
+    if peak <= 0:
+        return False
+    return (peak - latest) / peak >= threshold
+
+
+def should_diagnose(raw, history_baseline=None,
+                    min_revenue=MIN_REVENUE_USD,
+                    cliff_threshold=CLIFF_DROP_THRESHOLD):
+    """营收门槛降噪 + 小投放猝死豁免的判定开关。
+
+    返回 True 表示应送 LLM 诊断；False 表示降噪跳过。
+    - 明确带有 revenue 字段且 >= 门槛：诊断。
+    - revenue < 门槛 但历史曲线呈断崖式暴跌（is_sudden_cliff）：仍诊断（豁免）。
+    - revenue < 门槛 且无断崖：跳过（降噪）。
+    - 未带 revenue 字段（如非 campaign 结构的样例事件）：不跳过，照常诊断。
+    """
+    if not isinstance(raw, dict):
+        return True
+    if "revenue" not in raw:
+        return True
+    rev = _num(raw.get("revenue"))
+    if rev >= min_revenue:
+        return True
+    return is_sudden_cliff(history_baseline, cliff_threshold)
 
 
 # 参与同比下降检测的指标体系（名称 / 今日键 / 昨日键，均为 Teensing 真实字段）

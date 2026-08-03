@@ -33,6 +33,8 @@ from .data_connector import (
     normalize_to_context,
     extract_realtime_anomalies,
     TeensingDataConnector,
+    should_diagnose,
+    _num,
 )
 from .gaid_vault import VAULT, RedactFilter
 from .audit_log import QueryLogStore
@@ -137,15 +139,25 @@ def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None) -> list:
         # 拉取该 campaign 的历史时间序列，作为诊断的「时间锚点」注入上下文
         cid = raw.get("campaign_id")
         fetcher = getattr(connector, "fetch_campaign_time_series", None)
+        history_baseline = None
         if cid is not None and callable(fetcher):
             try:
                 # 透传 publisher_id，使历史曲线只含「报警的 (campaign,publisher) 对」，而非整 campaign 混合值
-                raw["history_baseline"] = fetcher(
+                history_baseline = fetcher(
                     str(cid), token=token,
                     publisher_id=raw.get("publisher_id"),
                 )
             except Exception as e:
-                logger.warning("拉取 campaign %s 历史趋势失败，跳过: %s", cid, e)
+                logger.warning("拉取 campaign %s 历史趋势失败: %s", cid, e)
+        # 营收门槛降噪 + 小投放猝死豁免：低营收且无断崖式下跌则跳过，不进诊断
+        if not should_diagnose(raw, history_baseline):
+            logger.info(
+                "campaign %s 营收 %.2f 低于门槛且无断崖式下跌，跳过诊断",
+                cid, _num(raw.get("revenue")),
+            )
+            continue
+        if history_baseline is not None:
+            raw["history_baseline"] = history_baseline
         ctx = normalize_to_context(raw)
         VAULT.ingest(ctx)
         event_id = (ctx.get("anomaly_metadata") or {}).get("event_id", "UNKNOWN")
