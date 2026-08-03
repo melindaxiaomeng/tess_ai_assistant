@@ -3,7 +3,7 @@
 import json
 
 from tess_backend.contracts import STATUS_DIAGNOSED, STATUS_DIAGNOSED_SUSPECT, STATUS_INCONCLUSIVE
-from tess_backend.tess_agent import MockLLMClient, TessAgent
+from tess_backend.tess_agent import MockLLMClient, TessAgent, SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +92,83 @@ def test_mid_confidence_becomes_suspect():
     agent = TessAgent(MockLLMClient(_valid_response(0.70)))
     out = agent.diagnose(_base_input())
     assert out["status"] == STATUS_DIAGNOSED_SUSPECT
+
+
+def test_system_prompt_steers_suspect_hypotheses():
+    # 红线固化：Prompt 必须引导模型在「有量化异常」时输出 SUSPECT 假设档，
+    # 而非一律 INCONCLUSIVE（修复 anomaly-warning 全 INCONCLUSIVE 的根因）。
+    assert "DIAGNOSED_SUSPECT" in SYSTEM_PROMPT
+    assert "假设归因指引" in SYSTEM_PROMPT
+    assert "假设，待核实" in SYSTEM_PROMPT
+    # 同时保留原红线：真正无信号时仍必须 INCONCLUSIVE
+    assert "INCONCLUSIVE" in SYSTEM_PROMPT
+
+
+def _anomaly_warning_input_negative_margin():
+    """模拟 anomaly-warning 单点快照（毛利转负、severity=MEDIUM）。"""
+    return {
+        "anomaly_metadata": {
+            "event_id": "6590339",
+            "target_metric": "Profit",
+            "current_value": -0.34,
+            "benchmark_value": None,
+            "severity": "MEDIUM",
+            "calculated_loss": {
+                "delta": None,
+                "direction": "unknown",
+                "metric": "Profit",
+                "current_value": -0.34,
+                "benchmark_value": None,
+                "margin": -3.45,
+                "cvr": 0.0,
+            },
+        },
+        "top_contributors": [
+            {
+                "dimension_type": "Campaign",
+                "dimension_value": "Sudoku_CPI_AF_ru",
+                "impact_share": "100%",
+                "metric_change": None,
+                "margin": -3.45,
+            }
+        ],
+        "associated_signals": [],
+    }
+
+
+def _suspect_hypothesis_response(contributor_id="Sudoku_CPI_AF_ru"):
+    return {
+        "status": "DIAGNOSED_SUSPECT",
+        "confidence": 0.65,
+        "summary": "疑似出价过高导致亏损投放（假设，待核实）",
+        "primary_contributor_id": contributor_id,
+        "root_cause_analysis": {
+            "primary_factor": "疑似成本失控 / 出价过高（假设）",
+            "causal_chain": [
+                "margin 为负 (-3.45%)",
+                "profit 为负 (-0.34)",
+                "需核实：核对投放后台成本曲线与 ROI",
+            ],
+        },
+    }
+
+
+def test_suspect_hypothesis_passes_full_pipeline():
+    # 端到端：单点异常快照 + LLM 返回 SUSPECT 假设 -> 经 Gatekeeper 仍为 DIAGNOSED_SUSPECT，
+    # 且因果链被保留（不被当 INCONCLUSIVE 清空）。
+    agent = TessAgent(MockLLMClient(_suspect_hypothesis_response()))
+    out = agent.diagnose(_anomaly_warning_input_negative_margin())
+    assert out["status"] == STATUS_DIAGNOSED_SUSPECT
+    assert out["confidence"] == 0.65
+    assert out["primary_contributor_id"] == "Sudoku_CPI_AF_ru"
+    assert len(out["root_cause_analysis"]["causal_chain"]) == 3
+
+
+def test_suspect_hypothesis_rejected_on_hallucinated_id():
+    # 假设档若指向不存在的维度，Gatekeeper 仍应降级为 INCONCLUSIVE（幻觉 ID 拦截不变）。
+    agent = TessAgent(MockLLMClient(_suspect_hypothesis_response("ghost_campaign")))
+    out = agent.diagnose(_anomaly_warning_input_negative_margin())
+    assert out["status"] == STATUS_INCONCLUSIVE
 
 
 def test_llm_says_inconclusive_is_respected():
