@@ -874,14 +874,14 @@ def extract_realtime_anomalies(
        - drop <= 30%        -> LOW
        - 30% < drop < 50%  -> MEDIUM
        - drop >= 50%        -> HIGH
-       drop_threshold（可配 TESS_REALTIME_DROP_THRESHOLD，默认 0.0）作为「最低跌幅门槛」：
+       drop_threshold（可配 TESS_REALTIME_DROP_THRESHOLD，默认 0.3）作为「最低跌幅门槛」：
        仅当 drop > drop_threshold 才上报，默认 0.0 表示任何下跌都报；调高可忽略微跌噪声。
 
     若所有 today_revenue 均为 0（无法锚定 as_of_hour），返回空——不误报。
     """
     if drop_threshold is None:
         try:
-            drop_threshold = float(os.getenv("TESS_REALTIME_DROP_THRESHOLD", "0.0"))
+            drop_threshold = float(os.getenv("TESS_REALTIME_DROP_THRESHOLD", "0.3"))
         except (ValueError, TypeError):
             drop_threshold = 0.0
     if grace_hours is None:

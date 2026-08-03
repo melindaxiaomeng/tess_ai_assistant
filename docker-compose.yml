@@ -27,7 +27,7 @@ services:
       TESS_SCHEDULE_LIMIT: "${TESS_SCHEDULE_LIMIT:-20}"
       TESS_SYSTEM_TOKEN: "${TESS_SYSTEM_TOKEN:-}"
       # 实时 KPI 异常判定阈值（默认 0.0 = 任何「今日<昨日」的下跌都判异常；分档见附录）
-      TESS_REALTIME_DROP_THRESHOLD: "${TESS_REALTIME_DROP_THRESHOLD:-0.0}"
+      TESS_REALTIME_DROP_THRESHOLD: "${TESS_REALTIME_DROP_THRESHOLD:-0.3}"
       # P7 预警存储：由 TESS_DATABASE_URL 决定后端。
       #   - 留空            → 代码回退 SQLite（纯本地零依赖开发）
       #   - ...@host.docker.internal:5432/tess → 生产用宿主原生 PG（容器经网关连，推荐）

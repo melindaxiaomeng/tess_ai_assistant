@@ -427,10 +427,14 @@ def test_mock_connector_realtime_kpi_has_anomaly():
 
 
 def test_extract_realtime_anomalies_banding():
-    """样例：hour 12 同比 -50% 判 HIGH；其余微跌(7%~11%)判 LOW。任何下跌都算异常。"""
+    """样例：hour 12 同比 -50% 判 HIGH；其余微跌(7%~11%)判 LOW。任何下跌都算异常。
+
+    注意：默认 drop_threshold 已改为 0.3（跌幅超 30% 才报），本测试专门验证「宽松模式
+    （drop_threshold=0.0=任何下跌都报）下的分档」，故显式传 0.0。
+    """
     c = MockDataConnector()
     kpi = c.fetch_realtime_kpi()
-    ctxs = extract_realtime_anomalies(kpi)
+    ctxs = extract_realtime_anomalies(kpi, drop_threshold=0.0)
     assert len(ctxs) >= 1
     ids = [x["anomaly_metadata"]["event_id"] for x in ctxs]
     assert any(i.startswith("REALTIME-DROP-") for i in ids)
@@ -454,11 +458,14 @@ def test_severity_bands_for_drops():
 
 
 def test_any_drop_flagged_as_low():
-    """任何下跌都报：1% 微跌 -> LOW 异常（grace_hours=0 解除延迟窗口约束）。"""
+    """任何下跌都报（宽松模式 drop_threshold=0.0）：1% 微跌 -> LOW 异常。
+
+    默认 drop_threshold 已改为 0.3（跌幅超 30% 才报），故此处显式传 0.0 验证「任何下跌都报」逻辑。
+    """
     raw = {"code": 0, "data": {"items": [
         {"hour": "10", "today_revenue": 990.0, "yesterday_revenue": 1000.0},
     ]}}
-    ctxs = extract_realtime_anomalies(raw, grace_hours=0)
+    ctxs = extract_realtime_anomalies(raw, grace_hours=0, drop_threshold=0.0)
     assert len(ctxs) == 1
     meta = ctxs[0]["anomaly_metadata"]
     assert meta["event_id"] == "REALTIME-DROP-10"

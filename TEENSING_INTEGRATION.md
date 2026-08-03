@@ -30,7 +30,7 @@ TESS_SCHEDULE_LIMIT=20
 TESS_SYSTEM_TOKEN=<共享服务 token>  # Tess 拉 Teensing 数据时用的 Bearer；留空回退 TESS_DATA_API_KEY
 TESS_DATA_CONNECTOR=teensing        # 接真实数据（非 mock）
 TESS_DATA_API_BASE_URL=https://<saas-host>/api/v1
-TESS_REALTIME_DROP_THRESHOLD=0.0    # 实时 KPI 同比最低跌幅门槛（0.0=任何下跌都报；调高可忽略微跌）
+TESS_REALTIME_DROP_THRESHOLD=0.3    # 实时 KPI 同比最低跌幅门槛（0.3=跌幅超 30% 才报；0.0=任何下跌都报）
 TESS_API_KEY=<强随机值>             # 开启拉取接口鉴权（Teensing 需带 X-API-Key）
 ```
 
@@ -310,7 +310,7 @@ curl "https://<tess-host>:8080/tess/realtime-kpi/alerts?limit=50" \
    - `30% < drop < 50%` → **MEDIUM**
    - `drop >= 50%` → **HIGH**
    - 单小时一条 `REALTIME-DROP-{小时}`。
-   - `TESS_REALTIME_DROP_THRESHOLD`（默认 `0.0`）作为「最低跌幅门槛」：`drop > 阈值` 才上报，默认 `0.0` 表示任何下跌都报；调高（如 `0.05`）可忽略 <5% 的微跌噪声。
+   - `TESS_REALTIME_DROP_THRESHOLD`（默认 `0.3`）作为「最低跌幅门槛」：`drop > 阈值` 才上报，默认 `0.3` 表示跌幅超 30% 才报；设为 `0.0` 则任何下跌都报（噪音大）。
 
 > 说明：之前"跌满 30% 才报"的口径已改为"任何下跌都报"，严重度只是分档（LOW/MEDIUM/HIGH），不再作为是否上报的门槛。
 
@@ -321,7 +321,7 @@ curl "https://<tess-host>:8080/tess/realtime-kpi/alerts?limit=50" \
 ### 8.5 可调参数
 | 参数 | 默认 | 作用 |
 |------|------|------|
-| `TESS_REALTIME_DROP_THRESHOLD` | `0.0` | 最低跌幅门槛（默认 0.0 = 任何下跌都报；调高可忽略微跌） |
+| `TESS_REALTIME_DROP_THRESHOLD` | `0.3` | 最低跌幅门槛（默认 0.3 = 跌幅超 30% 才报；0.0 = 任何下跌都报） |
 | `TESS_REALTIME_GRACE_HOURS` | 1 | 延迟容忍窗口（小时） |
 | `TESS_SCHEDULE_INTERVAL` | 3600 | 检测频率（秒） |
 
