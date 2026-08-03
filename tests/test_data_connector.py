@@ -236,8 +236,10 @@ def test_fetch_campaign_time_series_teensing(monkeypatch):
     """TeensingDataConnector 调 /report 并正确派生 CVR / Margin。"""
     def fake_get(self, path, params=None, token=None):
         assert path == "/report"
-        assert params.get("campaign_id") == "7030636"
+        assert params.get("campaign_ids") == "7030636"
         assert params.get("dimensions") == "date,campaign"
+        assert params.get("date_start") and params.get("date_end")
+        assert params.get("page") == 1
         return {
             "code": 0,
             "data": {

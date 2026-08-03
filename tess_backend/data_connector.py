@@ -371,19 +371,21 @@ class TeensingDataConnector:
                 days = int(os.getenv("TESS_TS_DAYS", str(days)))
                 start_dt = now - timedelta(days=days)
                 dimensions = ["date", "campaign"]
-            start_date = start_dt.strftime("%Y-%m-%d")
-            end_date = now.strftime("%Y-%m-%d")
+            date_start = start_dt.strftime("%Y-%m-%d")
+            date_end = now.strftime("%Y-%m-%d")
 
-            # 注意：dimensions 以逗号拼接传参（"date,hour,campaign"）；若 Teensing 后端
-            # 要求重复键 "dimensions=date&dimensions=hour&dimensions=campaign"，请在此改为对应拼接方式。
+            # /report 真实参数字段名（与 anomaly-warning 等接口不同）：
+            #   campaign_ids（复数，单 campaign 也用此名）/ date_start / date_end / page
+            # dimensions 以逗号拼接传参（"date,hour,campaign"）；若后端要求重复键，请改对应拼接方式。
             params = {
                 "dimensions": ",".join(dimensions),
-                "campaign_id": str(campaign_id),
-                "start_date": start_date,
-                "end_date": end_date,
+                "campaign_ids": str(campaign_id),
+                "date_start": date_start,
+                "date_end": date_end,
+                "page": 1,
+                "page_size": 100,
                 "sort_by": "date",
                 "sort_order": "asc",
-                "page_size": 100,
             }
             resp = self._unwrap(
                 self._http_get("/report", params=params, token=token)
@@ -419,7 +421,7 @@ class TeensingDataConnector:
             return {
                 "campaign_id": str(campaign_id),
                 "granularity": granularity,
-                "range": f"{start_date} to {end_date}",
+                "range": f"{date_start} to {date_end}",
                 "data_points_count": len(series),
                 "time_series": series,
             }
