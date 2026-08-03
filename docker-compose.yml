@@ -33,6 +33,9 @@ services:
       #   - ...@host.docker.internal:5432/tess → 生产用宿主原生 PG（容器经网关连，推荐）
       #   - ...@db:5432/tess → 本仓库自带 db 服务（需 `docker compose --profile db up -d`）
       TESS_DATABASE_URL: "${TESS_DATABASE_URL}"
+      # 开发/演示造数开关：仅 TESS_DEV_SEED=1 时 POST /tess/dev/seed-demo 可用；
+      # 生产默认 0（关闭），避免演示数据误入生产库或被 API Key 刷库。
+      TESS_DEV_SEED: "${TESS_DEV_SEED:-0}"
       # === Teensing 闭环：对外 API 鉴权 + 拉取 Teensing 真实数据 ===
       # 对外 /tess/* 接口鉴权密钥（留空=不鉴权；生产必填，Teensing 请求头带 X-API-Key）
       TESS_API_KEY: "${TESS_API_KEY}"

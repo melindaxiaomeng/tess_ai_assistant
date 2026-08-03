@@ -16,6 +16,7 @@ import time
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from .orchestrator import run_diagnosis
 from .tess_agent import HttpLLMClient, LLMClient
@@ -461,6 +462,34 @@ def ack_alert(alert_id: int, payload: dict = None) -> dict:
         "acked_by": payload.get("acked_by"),
         "acked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+@app.post("/tess/dev/seed-demo")
+def dev_seed_demo(payload: dict = None) -> dict:
+    """开发/演示专用：向预警库灌入一批演示数据，便于前端联调无需等待真实异常。
+
+    ⚠️ 安全开关：仅当环境变量 TESS_DEV_SEED=1/true 时启用；生产默认关闭（返回 403），
+       避免误把演示数据写进生产库或被人用 API Key 刷库。
+    鉴权：仍受全局 X-API-Key 守卫（生产设了 TESS_API_KEY 就必须带）。
+
+    body: { "clear": false }   默认追加；clear=true 时先清空 alerts 表再灌（演示刷新）。
+    返回：{ ok, written, run_time }
+    """
+    if os.getenv("TESS_DEV_SEED", "0").lower() not in ("1", "true", "yes", "on"):
+        raise HTTPException(
+            status_code=403, detail="dev seed disabled (set TESS_DEV_SEED=1 to enable)"
+        )
+    payload = payload or {}
+    from .dev_seed import build_demo_results
+    results = build_demo_results()
+    if payload.get("clear"):
+        with ALERTS.Session() as s:
+            s.execute(text("DELETE FROM alerts"))
+            s.commit()
+        print("🧹 dev seed: 已清空 alerts 表")
+    run_time = time.strftime("%Y-%m-%d %H:%M:%S")
+    written = ALERTS.save_batch(results, run_time=run_time)
+    return {"ok": True, "written": written, "run_time": run_time}
 
 
 @app.post("/tess/cron/run")
