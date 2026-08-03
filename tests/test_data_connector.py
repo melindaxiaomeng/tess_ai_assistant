@@ -197,6 +197,69 @@ def test_teensing_token_is_forwarded(monkeypatch):
     assert meta["benchmark_value"] == 515.0  # 500 - (-15)
 
 
+def test_normalize_to_context_carries_history_baseline():
+    """normalize_to_context 必须把 raw.history_baseline 透传到返回值，使其进入 LLM Prompt。"""
+    raw = {
+        "campaign_id": "7030636",
+        "campaign_name": "com.cp.sto.op.id1000026152_PH",
+        "revenue": 10.0,
+        "profit": -8.0,
+        "cvr": 0.0005,
+        "margin": -80.0,
+        "history_baseline": {
+            "campaign_id": "7030636",
+            "granularity": "day",
+            "time_series": [
+                {"timestamp": "2026-08-02", "revenue": 120.0, "margin_percent": -12.5},
+                {"timestamp": "2026-08-03", "revenue": 10.0, "margin_percent": -80.0},
+            ],
+        },
+    }
+    ctx = normalize_to_context(raw)
+    assert "history_baseline" in ctx
+    assert ctx["history_baseline"]["campaign_id"] == "7030636"
+    assert ctx["history_baseline"]["time_series"][-1]["margin_percent"] == -80.0
+
+
+def test_fetch_campaign_time_series_mock():
+    """MockDataConnector 返回带断崖下跌的 7 天样例序列。"""
+    c = MockDataConnector()
+    ts = c.fetch_campaign_time_series("7030636")
+    assert ts["campaign_id"] == "7030636"
+    assert ts["granularity"] == "day"
+    assert ts["data_points_count"] == 7
+    assert len(ts["time_series"]) == 7
+    assert ts["time_series"][-1]["margin_percent"] == -80.0
+
+
+def test_fetch_campaign_time_series_teensing(monkeypatch):
+    """TeensingDataConnector 调 /report 并正确派生 CVR / Margin。"""
+    def fake_get(self, path, params=None, token=None):
+        assert path == "/report"
+        assert params.get("campaign_id") == "7030636"
+        assert params.get("dimensions") == "date,campaign"
+        return {
+            "code": 0,
+            "data": {
+                "items": [
+                    {"date": "2026-08-01", "revenue": 100.0, "payout": 60.0, "clicks": 1000, "conversions": 20},
+                    {"date": "2026-08-02", "revenue": 50.0, "payout": 40.0, "clicks": 500, "conversions": 5},
+                ]
+            },
+        }
+
+    monkeypatch.setattr(TeensingDataConnector, "_http_get", fake_get)
+    c = TeensingDataConnector(base_url="https://saas.example.com/api/v1")
+    ts = c.fetch_campaign_time_series("7030636", token="JWT")
+    assert ts["granularity"] == "day"
+    assert len(ts["time_series"]) == 2
+    first = ts["time_series"][0]
+    assert first["profit"] == 40.0          # 100 - 60
+    assert first["cvr_percent"] == 2.0      # 20/1000*100
+    assert first["margin_percent"] == 40.0  # 40/100*100
+    assert ts["time_series"][1]["cvr_percent"] == 1.0  # 5/500*100
+
+
 def test_low_revenue_campaigns_skipped(monkeypatch):
     """anomaly-warning 中 Rev < TESS_MIN_REVENUE_USD 的低价值 campaign 不进诊断。"""
     monkeypatch.setenv("TESS_MIN_REVENUE_USD", "20")
@@ -339,6 +402,36 @@ def test_extract_realtime_anomalies_threshold():
     kpi = c.fetch_realtime_kpi()
     ctxs = extract_realtime_anomalies(kpi, drop_threshold=0.99)
     assert ctxs == []
+
+
+def test_realtime_clicks_drop_flagged_without_revenue_drop():
+    """补全数据源：Revenue 持平但 Clicks 同比 -40% 也应报警，头条取 Clicks。"""
+    raw = {"code": 0, "data": {"items": [
+        {"hour": "10", "today_revenue": 1000.0, "yesterday_revenue": 1000.0,
+         "today_clicks": 600.0, "yesterday_clicks": 1000.0,
+         "today_conversions": 50.0, "yesterday_conversions": 50.0},
+    ]}}
+    ctxs = extract_realtime_anomalies(raw, grace_hours=0)
+    assert len(ctxs) == 1
+    meta = ctxs[0]["anomaly_metadata"]
+    assert meta["event_id"] == "REALTIME-DROP-10"
+    assert meta["target_metric"] == "Clicks"
+    assert meta["severity"] == "MEDIUM"  # clicks 跌 40%
+    mb = ctxs[0]["metric_breakdown"]
+    assert {r["metric"] for r in mb} == {"Revenue", "Clicks", "Conversions", "CVR"}
+    clicks = next(r for r in mb if r["metric"] == "Clicks")
+    assert clicks["drop_ratio"] == 0.4
+
+
+def test_realtime_breakdown_has_four_metrics():
+    """每个 realtime DROP 上下文必须带 metric_breakdown（4 指标含派生 CVR）。"""
+    c = MockDataConnector()
+    ctxs = extract_realtime_anomalies(c.fetch_realtime_kpi())
+    assert ctxs, "样例应至少检测出一条 realtime 异常"
+    for ctx in ctxs:
+        mb = ctx.get("metric_breakdown")
+        assert mb, "realtime DROP 上下文必须带 metric_breakdown"
+        assert {r["metric"] for r in mb} == {"Revenue", "Clicks", "Conversions", "CVR"}
 
 
 def test_extract_realtime_trailing_zeros_not_gap():

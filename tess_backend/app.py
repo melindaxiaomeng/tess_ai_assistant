@@ -134,6 +134,14 @@ def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None) -> list:
     # (1) 异常预警 + 涨跌榜
     raw_events = connector.fetch_recent_anomalies(limit, token=token)
     for raw in raw_events:
+        # 拉取该 campaign 的历史时间序列，作为诊断的「时间锚点」注入上下文
+        cid = raw.get("campaign_id")
+        fetcher = getattr(connector, "fetch_campaign_time_series", None)
+        if cid is not None and callable(fetcher):
+            try:
+                raw["history_baseline"] = fetcher(str(cid), token=token)
+            except Exception as e:
+                logger.warning("拉取 campaign %s 历史趋势失败，跳过: %s", cid, e)
         ctx = normalize_to_context(raw)
         VAULT.ingest(ctx)
         event_id = (ctx.get("anomaly_metadata") or {}).get("event_id", "UNKNOWN")

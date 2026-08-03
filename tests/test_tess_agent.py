@@ -3,7 +3,7 @@
 import json
 
 from tess_backend.contracts import STATUS_DIAGNOSED, STATUS_DIAGNOSED_SUSPECT, STATUS_INCONCLUSIVE
-from tess_backend.tess_agent import MockLLMClient, TessAgent, SYSTEM_PROMPT
+from tess_backend.tess_agent import MockLLMClient, TessAgent, SYSTEM_PROMPT, _build_user_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +102,31 @@ def test_system_prompt_steers_suspect_hypotheses():
     assert "假设，待核实" in SYSTEM_PROMPT
     # 同时保留原红线：真正无信号时仍必须 INCONCLUSIVE
     assert "INCONCLUSIVE" in SYSTEM_PROMPT
+
+
+def test_prompt_includes_history_baseline():
+    """history_baseline 必须进入喂给 LLM 的 user prompt（json.dumps 整个 ctx）。"""
+    input_data = {
+        "anomaly_metadata": {"event_id": "7030636"},
+        "history_baseline": {
+            "campaign_id": "7030636",
+            "granularity": "day",
+            "time_series": [
+                {"timestamp": "2026-08-03", "revenue": 10.0, "margin_percent": -80.0},
+            ],
+        },
+    }
+    prompt = _build_user_prompt(input_data)
+    assert "history_baseline" in prompt
+    assert "2026-08-03" in prompt
+
+
+def test_system_prompt_guides_timeseries_analysis():
+    """System Prompt 必须包含时间序列曲线分析的判定法则。"""
+    assert "history_baseline" in SYSTEM_PROMPT
+    assert "断崖式下跌" in SYSTEM_PROMPT
+    assert "渐进式恶化" in SYSTEM_PROMPT
+    assert "从 [" in SYSTEM_PROMPT  # 判定指示里的「从 [具体陡降日期] 开始发生断崖式下跌」
 
 
 def _anomaly_warning_input_negative_margin():
