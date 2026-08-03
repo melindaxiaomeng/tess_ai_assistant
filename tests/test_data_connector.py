@@ -197,6 +197,44 @@ def test_teensing_token_is_forwarded(monkeypatch):
     assert meta["benchmark_value"] == 515.0  # 500 - (-15)
 
 
+def test_low_revenue_campaigns_skipped(monkeypatch):
+    """anomaly-warning 中 Rev < TESS_MIN_REVENUE_USD 的低价值 campaign 不进诊断。"""
+    monkeypatch.setenv("TESS_MIN_REVENUE_USD", "20")
+
+    def fake_get(self, path, params=None, token=None):
+        if path == "/overview/ranking/anomaly-warning":
+            return {
+                "code": 0,
+                "data": {
+                    "total": 2,
+                    "items": [
+                        {  # Rev 500 -> 保留
+                            "campaign_id": 111,
+                            "campaign_name": "Big_A",
+                            "revenue": 500.0,
+                            "profit": 120.0,
+                        },
+                        {  # Rev 15 < 20 -> 跳过
+                            "campaign_id": 222,
+                            "campaign_name": "Tiny_B",
+                            "revenue": 15.0,
+                            "profit": 3.0,
+                        },
+                    ],
+                },
+            }
+        if path == "/overview/ranking/fluctuation":
+            return {"code": 0, "data": {"rising": [], "falling": []}}
+        return {"code": 0, "data": {}}
+
+    monkeypatch.setattr(TeensingDataConnector, "_http_get", fake_get)
+    c = TeensingDataConnector(base_url="https://saas.example.com/api/v1")
+    raws = c.fetch_recent_anomalies(limit=10, token="OPERATOR_JWT_xyz")
+    assert len(raws) == 1
+    assert raws[0]["campaign_id"] == 111
+    assert all((r.get("revenue") or 0) >= 20 for r in raws)
+
+
 def test_teensing_requires_token_via_app(client, monkeypatch):
     """生产(teensing)模式下，/tess/diagnose-from-source 缺 X-Teensing-Token 应 400。"""
     monkeypatch.setattr(app_module, "_DATA_CONNECTOR", TeensingDataConnector(

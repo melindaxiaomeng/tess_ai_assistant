@@ -25,6 +25,10 @@ from typing import Optional, Protocol
 
 logger = logging.getLogger("tess_backend.data_connector")
 
+# campaign 级告警的最低营收门槛：低于该值的低价值 campaign 不送诊断（降噪）。
+# 可通过环境变量 TESS_MIN_REVENUE_USD 调整，默认 20 美元。
+MIN_REVENUE_USD = float(os.getenv("TESS_MIN_REVENUE_USD", "20"))
+
 # 开发/测试用样例原始事件（结构接近 Teensing 预期返回，已可直接归一化为 Context）
 _SAMPLE_RAW = {
     "event_id": "ERR-20260728-0912",
@@ -251,6 +255,9 @@ class TeensingDataConnector:
         if isinstance(warn, dict):
             for it in warn.get("items") or []:
                 if not isinstance(it, dict):
+                    continue
+                # 低营收 campaign 跳过诊断（降噪）：Rev < 门槛不查
+                if _num(it.get("revenue")) < MIN_REVENUE_USD:
                     continue
                 cid = it.get("campaign_id") or it.get("campaign_name") or it.get("name")
                 merged = dict(it)
