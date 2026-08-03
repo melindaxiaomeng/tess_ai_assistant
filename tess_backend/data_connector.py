@@ -128,6 +128,7 @@ class DataConnector(Protocol):
     def fetch_campaign_time_series(
         self, campaign_id: str, token: Optional[str] = None,
         days: int = 7, granularity: str = "day",
+        publisher_id: Optional[str] = None,
     ) -> dict:
         """拉取指定 Campaign 连续历史趋势（GET /report），为诊断提供时间锚点。"""
         ...
@@ -153,7 +154,8 @@ class MockDataConnector:
         return _SAMPLE_REALTIME_KPI
 
     def fetch_campaign_time_series(
-        self, campaign_id, token=None, days=7, granularity="day"
+        self, campaign_id, token=None, days=7, granularity="day",
+        publisher_id=None,
     ) -> dict:
         """测试用：返回一条带断崖式下跌的 7 天样例序列，验证 history_baseline 透传。"""
         series = [
@@ -167,6 +169,7 @@ class MockDataConnector:
         ]
         return {
             "campaign_id": str(campaign_id),
+            "publisher_id": publisher_id,
             "granularity": granularity,
             "range": "2026-07-28 to 2026-08-03",
             "data_points_count": len(series),
@@ -349,6 +352,7 @@ class TeensingDataConnector:
         token: Optional[str] = None,
         days: int = 7,
         granularity: str = "day",  # "day"（按天 7~30 天）或 "hour"（按小时 24~72 小时）
+        publisher_id: Optional[str] = None,  # 按 publisher 维度筛选，使曲线对得上「报警的 (campaign,publisher) 对」
     ) -> dict:
         """拉取指定 Campaign 的连续历史趋势，为 Tess 诊断提供「时间锚点」。
 
@@ -387,6 +391,10 @@ class TeensingDataConnector:
                 "sort_by": "date",
                 "sort_order": "asc",
             }
+            # publisher 维度筛选（复数 publisher_ids，镜像 campaign_ids）；
+            # 不传则不过滤（拉整个 campaign 的混合值）。实测单数 publisher_id 会被后端忽略。
+            if publisher_id:
+                params["publisher_ids"] = str(publisher_id)
             resp = self._unwrap(
                 self._http_get("/report", params=params, token=token)
             )
@@ -418,6 +426,11 @@ class TeensingDataConnector:
                     "clicks": clicks,
                     "conversions": conversions,
                 })
+            # 按天粒度时，「今天」是部分日（全天未跑完），拿它跟完整日比会误判断崖；
+            # 这里剔除今天点，今日是否正常交由 realtime-kpi 的小时同比单独判断。
+            if granularity == "day":
+                today_str = now.strftime("%Y-%m-%d")
+                series = [s for s in series if s.get("timestamp") != today_str]
             return {
                 "campaign_id": str(campaign_id),
                 "granularity": granularity,

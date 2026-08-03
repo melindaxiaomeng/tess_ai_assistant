@@ -6,6 +6,7 @@
 """
 
 import pytest
+from datetime import datetime, timedelta
 
 from tess_backend.data_connector import (
     MockDataConnector,
@@ -260,6 +261,49 @@ def test_fetch_campaign_time_series_teensing(monkeypatch):
     assert first["cvr_percent"] == 2.0      # 20/1000*100
     assert first["margin_percent"] == 40.0  # 40/100*100
     assert ts["time_series"][1]["cvr_percent"] == 1.0  # 5/500*100
+
+
+def test_fetch_campaign_time_series_publisher_ids_passed(monkeypatch):
+    """传入 publisher_id 时，/report 应带 publisher_ids（复数）参数；不传则不带。"""
+    captured = {}
+
+    def fake_get(self, path, params=None, token=None):
+        captured.clear()
+        captured.update(params or {})
+        return {"code": 0, "data": {"items": [
+            {"date": "2026-08-01", "revenue": 10.0, "clicks": 100, "conversions": 2},
+        ]}}
+
+    monkeypatch.setattr(TeensingDataConnector, "_http_get", fake_get)
+    c = TeensingDataConnector(base_url="https://saas.example.com/api/v1")
+
+    # 不传 publisher_id -> 不应带 publisher_ids
+    c.fetch_campaign_time_series("7028915", token="JWT")
+    assert "publisher_ids" not in captured
+
+    # 传入 publisher_id -> 应带 publisher_ids 且为字符串
+    c.fetch_campaign_time_series("7028915", token="JWT", publisher_id=1000571)
+    assert captured.get("publisher_ids") == "1000571"
+
+
+def test_fetch_campaign_time_series_excludes_partial_today(monkeypatch):
+    """按天粒度时，『今天』是部分日，应从序列中剔除，避免误判断崖。"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    def fake_get(self, path, params=None, token=None):
+        return {"code": 0, "data": {"items": [
+            {"date": today, "revenue": 1.0, "clicks": 10, "conversions": 0},
+            {"date": yesterday, "revenue": 50.0, "payout": 10.0, "clicks": 500, "conversions": 20},
+        ]}}
+
+    monkeypatch.setattr(TeensingDataConnector, "_http_get", fake_get)
+    c = TeensingDataConnector(base_url="https://saas.example.com/api/v1")
+    ts = c.fetch_campaign_time_series("7028915", token="JWT")
+    # 仅保留昨天（完整日），今天（部分日）被剔除
+    assert len(ts["time_series"]) == 1
+    assert ts["time_series"][0]["timestamp"] == yesterday
+    assert ts["data_points_count"] == 1
 
 
 def test_low_revenue_campaigns_skipped(monkeypatch):

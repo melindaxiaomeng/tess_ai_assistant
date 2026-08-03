@@ -139,7 +139,11 @@ def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None) -> list:
         fetcher = getattr(connector, "fetch_campaign_time_series", None)
         if cid is not None and callable(fetcher):
             try:
-                raw["history_baseline"] = fetcher(str(cid), token=token)
+                # 透传 publisher_id，使历史曲线只含「报警的 (campaign,publisher) 对」，而非整 campaign 混合值
+                raw["history_baseline"] = fetcher(
+                    str(cid), token=token,
+                    publisher_id=raw.get("publisher_id"),
+                )
             except Exception as e:
                 logger.warning("拉取 campaign %s 历史趋势失败，跳过: %s", cid, e)
         ctx = normalize_to_context(raw)
