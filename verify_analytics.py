@@ -13,6 +13,7 @@
        python verify_analytics.py --http https://your-host --api-key <key> --user-token <运营access_token>
 
 可选 --type 限定单个场景；--json 输出机器可读结果；--user-token 模拟线上 X-Teensing-Token 透传。
+可选 --ask "问题" 测试 /tess/ask 自然语言问答端点（同样支持 --http/--api-key/--user-token/--no-llm）。
 
 退出码：全部场景 0 errors 且（LLM 模式下）report 非空 => 0；否则 1。
 """
@@ -190,26 +191,103 @@ def run_http(base_url, api_key, types, user_token=None):
     return results
 
 
+def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None):
+    """验证 /tess/ask 自然语言问答端点。
+
+    - base_url+api_key 给定 -> HTTP 模式打线上端点（带可选 X-Teensing-Token）
+    - 否则 -> 模块直跑（需 .env 真实 LLM；--no-llm 时仅校验数据拉取）
+    """
+    if base_url and api_key:
+        import urllib.request
+
+        base = base_url.rstrip("/")
+        payload = json.dumps({"question": question}).encode("utf-8")
+        headers = {"Content-Type": "application/json", "X-API-Key": api_key}
+        if user_token:
+            headers["X-Teensing-Token"] = user_token
+        req = urllib.request.Request(f"{base}/tess/ask", data=payload, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                d = json.loads(resp.read().decode("utf-8"))
+            answer = d.get("answer", "")
+            errs = (d.get("context_summary") or {}).get("errors", [])
+            return [{
+                "analysis_type": "ask", "mode": "http", "http_status": resp.status,
+                "data_errors": errs, "answer_len": len(answer),
+                "answer_head": answer[:200], "ok": (not errs) and bool(answer.strip()),
+            }]
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")
+            return [{"analysis_type": "ask", "mode": "http", "http_status": e.code,
+                     "data_errors": [f"HTTP {e.code}: {body[:200]}"], "answer_len": 0,
+                     "answer_head": "", "ok": False}]
+        except Exception as e:  # noqa: BLE001
+            return [{"analysis_type": "ask", "mode": "http",
+                     "data_errors": [f"EXC: {type(e).__name__}: {e}"], "answer_len": 0,
+                     "answer_head": "", "ok": False}]
+
+    # 模块直跑
+    from tess_backend.data_connector import get_data_connector
+    from tess_backend.analytics import process_question
+
+    connector = get_data_connector()
+    token = user_token or (os.getenv("TESS_SYSTEM_TOKEN") or None)
+    if use_llm:
+        llm = SimpleLLMClient(
+            os.getenv("TESS_LLM_BASE_URL", "https://api.deepseek.com"),
+            os.getenv("TESS_LLM_API_KEY", ""),
+            os.getenv("TESS_LLM_MODEL", "deepseek-chat"),
+        )
+        try:
+            res = process_question(question, connector, llm, token=token,
+                                   operator_id="verify-script", token_mode="user" if user_token else "system")
+            answer = res.get("answer", "")
+            errs = res.get("context_summary", {}).get("errors", [])
+            return [{"analysis_type": "ask", "mode": "module+llm", "data_errors": errs,
+                     "answer_len": len(answer), "answer_head": answer[:200],
+                     "ok": (not errs) and bool(answer.strip())}]
+        except Exception as e:  # noqa: BLE001
+            return [{"analysis_type": "ask", "mode": "module+llm",
+                     "data_errors": [f"EXC: {type(e).__name__}: {e}"], "answer_len": 0,
+                     "answer_head": "", "ok": False}]
+    else:
+        # --no-llm：仅验证 fetch_qa_context 数据拉取
+        from tess_backend.analytics import fetch_qa_context
+        ctx2 = fetch_qa_context(connector, token=token, question=question)
+        errs = ctx2.get("errors", [])
+        return [{"analysis_type": "ask", "mode": "module+data-only",
+                 "data_errors": errs,
+                 "context_summary": {"daily_kpi": _len_or_val(ctx2.get("daily_kpi_yesterday")),
+                                    "ranking_top": len(ctx2.get("ranking_top", [])),
+                                    "anomaly_warning": len(ctx2.get("anomaly_warning", [])),
+                                    "quality_summary": _len_or_val(ctx2.get("quality_summary"))},
+                 "ok": not errs}]
+
+
 def main():
-    ap = argparse.ArgumentParser(description="验证 /tess/analytics 六类场景")
+    ap = argparse.ArgumentParser(description="验证 /tess/analytics 六类场景 与 /tess/ask 问答")
     ap.add_argument("--http", help="HTTP 模式：服务器 base url（如 https://host）")
     ap.add_argument("--api-key", help="HTTP 模式：X-API-Key")
     ap.add_argument("--user-token", help="透传终端用户 Teensing access_token（X-Teensing-Token）；用于按用户权限取数测试")
     ap.add_argument("--no-llm", action="store_true", help="模块模式：只校验数据，不调 LLM")
-    ap.add_argument("--type", choices=ALL_TYPES, help="只跑单一场景")
+    ap.add_argument("--type", choices=ALL_TYPES, help="只跑单一 analytics 场景")
+    ap.add_argument("--ask", help="测试 /tess/ask 自然语言问答：传入一个问题字符串")
     ap.add_argument("--json", action="store_true", help="输出 JSON 而非可读报告")
     args = ap.parse_args()
 
-    types = [args.type] if args.type else ALL_TYPES
-
-    if args.http:
-        if not args.api_key:
-            print("ERROR: --http 模式需要 --api-key", file=sys.stderr)
-            sys.exit(2)
-        results = run_http(args.http, args.api_key, types, user_token=args.user_token)
+    if args.ask:
+        results = run_ask(args.ask, use_llm=not args.no_llm,
+                          user_token=args.user_token, base_url=args.http, api_key=args.api_key)
     else:
-        load_dotenv()
-        results = run_module(types, use_llm=not args.no_llm, user_token=args.user_token)
+        types = [args.type] if args.type else ALL_TYPES
+        if args.http:
+            if not args.api_key:
+                print("ERROR: --http 模式需要 --api-key", file=sys.stderr)
+                sys.exit(2)
+            results = run_http(args.http, args.api_key, types, user_token=args.user_token)
+        else:
+            load_dotenv()
+            results = run_module(types, use_llm=not args.no_llm, user_token=args.user_token)
 
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))

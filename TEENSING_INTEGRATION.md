@@ -529,3 +529,31 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 - `account_overview` 的 active/inactive/missing_cap 仅来自首页 100 条**抽样**，文案已明确不可当作全局占比；全局规模以 `campaign_total` / `advertiser_total` 为准。
 - 主数据接口**不含营收时序**，放量/容量类指标从 `/report` 取数。
 
+### 10.6 自然语言问答端点 `POST /tess/ask`（Tess AI Assistant 对话接口）
+
+面向 Teensing 前端「问一句、答一段」的对话场景。**字段契约即对接方当前约定**：请求体发 `question`，返回体取 `answer`（兼容 `.answer` / `.result` / `.data` 任一同义字段）。
+
+```
+POST /tess/ask
+Content-Type: application/json
+X-API-Key: <TESS_API_KEY>            # 同 §10.1，网关注入
+X-Teensing-Token: <终端用户 access_token>   # 同 §10.1，按用户权限取数；缺省回退系统 token
+X-Operator-Id: <运营ID>             # 可选，审计
+
+{ "question": "昨天整体营收表现如何？有没有需要重点关注的异常？" }
+```
+
+返回：
+
+```json
+{
+  "answer": "📊 **昨日整体营收…**\n…Markdown 回答…",
+  "result": "<同 answer>",
+  "data":   "<同 answer>",
+  "context_summary": { "endpoint": "/tess/ask", "errors": [], "operator_id": "op-1", "token_mode": "user" }
+}
+```
+
+**实现说明**：`process_question()` 先用调用方 token 拉取一个紧凑「全局态势」上下文（`/overview/daily-kpi` + `/overview/ranking` + `/overview/ranking/anomaly-warning` + `/campaign-quality/publisher`，单源容错），连同 `question` 一起交给 LLM（`ASK_SYSTEM_PROMPT`，`json_mode=False` 返回 Markdown），并写审计（`AUDIT.log_query`）。`answer`/`result`/`data` 三者同值，对接方用哪一个都能取到回答。
+- 验证：`python verify_analytics.py --ask "你的问题"`（模块直跑，需真实 LLM）或 `--http <url> --api-key <key> --ask "你的问题"`（线上端点）。
+

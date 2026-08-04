@@ -32,6 +32,7 @@
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
+import json
 
 # ---------------------------------------------------------------------------
 # BI 分析系统提示词（观点先行 / 数据支撑 / 动作导向）
@@ -495,5 +496,90 @@ def process_data_analysis_query(
             "errors": ctx.get("errors", []),
             "operator_id": operator_id,
             "token_mode": token_mode,  # "user"=按调用方 token 权限取数; "system"=系统 token
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# 自然语言问答（Tess AI Assistant 对话接口 /tess/ask）
+# ---------------------------------------------------------------------------
+
+ASK_SYSTEM_PROMPT = """你叫 Tess，是 Teensing 平台的专属 AdTech 智能数据分析助手。\
+用户会用自然语言提问关于投放、营收、Campaign、渠道、异常诊断等业务问题。
+
+请根据【下方提供的 Teensing 业务数据上下文】用简体中文作答：
+- 观点先行：先给结论，再用数据支撑，最后给可执行建议；
+- 数据必须来自上下文，严禁编造上下文里没有的数字、Campaign 名或实体；
+- 若上下文不足以回答，明确说明「数据不足，暂无法确认」，不要臆测；
+- 用 Markdown 排版，关键结论可用 📊（复盘）/ 💡（洞察）/ 🚀（建议）标记。
+"""
+
+
+def fetch_qa_context(connector, token: Optional[str] = None, question: str = "") -> dict:
+    """拉取一个紧凑的「全局态势」上下文作为问答 grounding。
+
+    使用调用方透传的 token（按该用户权限取数），与 analytics 同源。
+    多个子源独立容错，单个失败只在该源的 errors 里体现。
+    """
+    today = datetime.now()
+    yesterday = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    daily_kpi, e1 = _safe_api_get(
+        connector, "/overview/daily-kpi", params={"date": yesterday}, token=token
+    )
+    ranking, e2 = _safe_api_get(connector, "/overview/ranking", token=token)
+    anomaly, e3 = _safe_api_get(connector, "/overview/ranking/anomaly-warning", token=token)
+    quality, e4 = _safe_api_get(connector, "/campaign-quality/publisher", token=token)
+    return {
+        "daily_kpi_yesterday": (daily_kpi or {}).get("items") if isinstance(daily_kpi, dict) else daily_kpi,
+        "ranking_top": (ranking if isinstance(ranking, list) else [])[:10],
+        "anomaly_warning": (anomaly if isinstance(anomaly, list) else [])[:10],
+        "quality_summary": quality,
+        "errors": [e for e in (e1, e2, e3, e4) if e],
+    }
+
+
+def _trim_for_prompt(ctx: dict, limit: int = 6000) -> str:
+    """把上下文序列化为适合塞进 LLM prompt 的紧凑 JSON 文本（截断保护）。"""
+    try:
+        text = json.dumps(ctx, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        text = str(ctx)
+    if len(text) > limit:
+        text = text[:limit] + "\n...（上下文过长已截断）"
+    return text
+
+
+def process_question(
+    question: str,
+    connector,
+    llm,
+    token: Optional[str] = None,
+    params: Optional[dict] = None,
+    operator_id: str = "anonymous",
+    token_mode: str = "system",
+) -> dict:
+    """端到端执行一次自然语言问答。
+
+    - connector / llm / token：与 analytics 同源（token 决定按谁的数据权限取数）
+    - 返回 answer（Markdown），并附 result / data 别名以兼容调用方 .answer/.result/.data 取值
+    """
+    ctx = fetch_qa_context(connector, token=token, question=question)
+    ctx_text = _trim_for_prompt(ctx)
+    user_prompt = (
+        "【Teensing 业务数据上下文】\n"
+        f"{ctx_text}\n\n"
+        f"【用户问题】\n{question}\n\n"
+        "请基于上方上下文作答；若上下文无法支撑，明确告知数据不足。"
+    )
+    answer = llm.complete(ASK_SYSTEM_PROMPT, user_prompt, json_mode=False)
+    return {
+        "answer": answer,
+        "result": answer,  # 兼容调用方 .answer/.result/.data 取值
+        "data": answer,
+        "context_summary": {
+            "endpoint": "/tess/ask",
+            "errors": ctx.get("errors", []),
+            "operator_id": operator_id,
+            "token_mode": token_mode,
         },
     }

@@ -38,7 +38,7 @@ from .data_connector import (
     should_diagnose,
     _num,
 )
-from .analytics import process_data_analysis_query
+from .analytics import process_data_analysis_query, process_question
 from .gaid_vault import VAULT, RedactFilter
 from .audit_log import QueryLogStore
 from .alerts_store import AlertStore
@@ -340,6 +340,69 @@ def post_analytics(payload: dict, request: Request) -> dict:
         raise HTTPException(
             status_code=502, detail=f"数据分析执行失败：{type(e).__name__}: {e}"
         )
+    return result
+
+
+@app.post("/tess/ask")
+def post_ask(payload: dict, request: Request) -> dict:
+    """Tess AI Assistant 自然语言问答接口。
+
+    请求体：
+      {
+        "question": "自然语言问题（如：昨天营收为什么跌了？哪些 Campaign 最赚钱？）",
+        "history": []   # 预留多轮上下文，当前版本未启用
+      }
+    请求头（鉴权与按权限取数，同 /tess/analytics）：
+      - X-API-Key        : Tess<->Teensing 共享密钥（网关注入，生产设了 TESS_API_KEY 后必带）
+      - X-Teensing-Token : 终端用户 SaaS access_token，原样透传给 Teensing 按其权限取数；
+                           缺省回退 TESS_SYSTEM_TOKEN（系统级、无按人过滤，仅内部/定时任务）；
+                           生产 Teensing 连接器下两者皆无 -> 400
+      - X-Operator-Id    : 可选，审计归因
+    返回：
+      {
+        "answer": "Markdown 回答",
+        "result": "<同 answer>",     # 兼容调用方 .answer/.result/.data 取值
+        "data":   "<同 answer>",
+        "context_summary": { "errors", "operator_id", "token_mode" }
+      }
+    """
+    question = (payload or {}).get("question")
+    if not question or not str(question).strip():
+        raise HTTPException(status_code=400, detail="缺少 question 字段或为空")
+    try:
+        connector = get_data_connector()
+    except (RuntimeError, ValueError) as e:
+        raise HTTPException(status_code=503, detail=f"Tess 未配置 Teensing 数据源：{e}")
+    llm = _get_llm_client()
+    operator = _operator_id(request) if request else "anonymous"
+    user_token = _teensing_token(request) if request else ""
+    system_token = os.getenv("TESS_SYSTEM_TOKEN") or None
+    effective_token = user_token or system_token
+    token_mode = "user" if user_token else "system"
+    if isinstance(connector, TeensingDataConnector) and not effective_token:
+        raise HTTPException(
+            status_code=400,
+            detail="生产数据接入需在前端请求头携带 X-Teensing-Token（运营 SaaS access_token）",
+        )
+    try:
+        result = process_question(
+            question, connector, llm,
+            token=effective_token, operator_id=operator, token_mode=token_mode,
+        )
+    except Exception as e:  # 数据 API / LLM 异常都不应泄露堆栈
+        raise HTTPException(
+            status_code=502, detail=f"问答执行失败：{type(e).__name__}: {e}"
+        )
+    # P6 审计：记录「谁问了什么 -> Tess 答了什么」
+    AUDIT.log_query(
+        operator_id=operator,
+        endpoint="/tess/ask",
+        question=question,
+        answer=result.get("answer", ""),
+        status="answered",
+        confidence=1.0,
+        meta={"token_mode": token_mode},
+    )
     return result
 
 
