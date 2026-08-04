@@ -20,11 +20,6 @@ export default function App() {
   const [logs, setLogs] = useState<string[]>([]);
   const [tamper, setTamper] = useState(false); // 模拟 LLM 注入伪造字段
 
-  // 数据分析（主动式 BI）状态
-  const [analysisReport, setAnalysisReport] = useState<string>("");
-  const [analysisLoading, setAnalysisLoading] = useState(false);
-  const [analysisType, setAnalysisType] = useState<string>("");
-
   const appendLog = (m: string) =>
     setLogs((l) => [...l, `[${new Date().toLocaleTimeString()}] ${m}`]);
 
@@ -109,44 +104,6 @@ export default function App() {
     setLlmOutput(MOCK_OUTPUT as TessOutput);
     setInputData(SAMPLE_INPUT as TessInput);
     appendLog("离线演示：使用内置样例渲染（无需后端）");
-  }
-
-  // 主动式 BI：一键触发数据分析（六类场景）
-  const ANALYTICS_TYPES = [
-    { key: "daily_summary", label: "📊 昨日大盘复盘" },
-    { key: "scaling_opportunity", label: "🚀 扩量潜力挖掘" },
-    { key: "finance_check", label: "💰 本月对账差异" },
-    { key: "account_overview", label: "🏢 账户全景概览" },
-    { key: "publisher_deepdive", label: "🔍 渠道质量对比" },
-    { key: "scaling_capacity", label: "📈 放量容量评估" },
-  ];
-
-  async function runAnalytics(type: string) {
-    if (blockedByMixedContent()) return;
-    setAnalysisType(type);
-    setAnalysisLoading(true);
-    setAnalysisReport("");
-    appendLog(`POST /tess/analytics type=${type} …`);
-    try {
-      const base = backend.replace(/\/+$/, "");
-      const res = await fetch(`${base}/tess/analytics`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(apiKey ? { "X-API-Key": apiKey } : {}),
-        },
-        body: JSON.stringify({ analysis_type: type, params: { report_month: "2026-08" } }),
-      });
-      const d = await res.json();
-      if (!res.ok) throw new Error(`HTTP ${res.status}: ${d.detail || res.statusText}`);
-      setAnalysisReport(d.report || "（无返回内容）");
-      appendLog("分析返回字数=" + (d.report || "").length + " · errors=" + JSON.stringify(d.context_summary?.errors || []));
-    } catch (e: any) {
-      appendLog("分析失败：" + e.message + certHint());
-      setAnalysisReport("⚠️ 分析失败：" + e.message);
-    } finally {
-      setAnalysisLoading(false);
-    }
   }
 
   // 模拟 LLM 试图篡改：给 llmOutput 注入伪造的 severity / calculated_loss / 非法结论。
@@ -244,34 +201,6 @@ export default function App() {
                 载入样例
               </button>
             </div>
-          </div>
-
-          {/* 数据分析（主动式 BI 助手） */}
-          <div className="bg-white border border-gray-200 rounded-lg p-4">
-            <h3 className="text-sm font-semibold mb-2">数据分析 · 主动式 BI 助手</h3>
-            <div className="flex flex-wrap gap-2 mb-3">
-              {ANALYTICS_TYPES.map((t) => (
-                <button
-                  key={t.key}
-                  className="border border-indigo-600 text-indigo-600 rounded-full px-3 py-1.5 text-xs hover:bg-indigo-50 disabled:opacity-50"
-                  onClick={() => runAnalytics(t.key)}
-                  disabled={analysisLoading}
-                >
-                  {t.label}
-                </button>
-              ))}
-            </div>
-            {analysisLoading && (
-              <div className="text-xs text-gray-500">
-                分析中…（拉取 Teensing 业务接口 + LLM 生成简报）
-                {analysisType ? ` · ${analysisType}` : ""}
-              </div>
-            )}
-            {analysisReport && (
-              <pre className="text-xs whitespace-pre-wrap bg-slate-50 border border-gray-200 rounded-md p-3 max-h-80 overflow-auto">
-                {analysisReport}
-              </pre>
-            )}
           </div>
 
           {/* 渲染屏障演示开关 */}

@@ -502,7 +502,7 @@ X-API-Key: <TESS_API_KEY>
 
 ### 10.5 已实现的扩展场景（基于 §10.2 D 组主数据接口）
 
-下列 3 个场景已接入 `fetch_bi_analysis_context()`、`POST /tess/analytics` 与前端胶囊，将 BI 助手从「三大复盘」扩展到「账户 / 渠道 / 放量」全景。
+下列 3 个场景已接入 `fetch_bi_analysis_context()` 与 `POST /tess/analytics`（作为给 Teensing 系统调用的后端集成面，由 Teensing 自身 UI 触发，无独立前端），将 BI 助手从「三大复盘」扩展到「账户 / 渠道 / 放量」全景。
 
 | analysis_type | 业务问题 | 编排的真实接口 | 产出 |
 |---|---|---|---|
