@@ -350,7 +350,9 @@ def post_ask(payload: dict, request: Request) -> dict:
     请求体：
       {
         "question": "自然语言问题（如：昨天营收为什么跌了？哪些 Campaign 最赚钱？）",
-        "history": []   # 预留多轮上下文，当前版本未启用
+        "history": []        # 预留多轮上下文，当前版本未启用
+        "analysis_type": "scaling_capacity"   # 可选：显式深度下钻类型（前端胶囊透传）
+        "params": { "report_month": "2026-08" }  # 可选：随 analysis_type 透传（如财务对账月份）
       }
     请求头（鉴权与按权限取数，同 /tess/analytics）：
       - X-API-Key        : Tess<->Teensing 共享密钥（网关注入，生产设了 TESS_API_KEY 后必带）
@@ -358,17 +360,33 @@ def post_ask(payload: dict, request: Request) -> dict:
                            缺省回退 TESS_SYSTEM_TOKEN（系统级、无按人过滤，仅内部/定时任务）；
                            生产 Teensing 连接器下两者皆无 -> 400
       - X-Operator-Id    : 可选，审计归因
+    深度下钻说明：
+      - 不传 analysis_type 时，后端用关键词把问题映射到深度类型（命中即下钻），都不命中则退回浅层全局上下文；
+      - 传了非法 analysis_type -> 400。
     返回：
       {
         "answer": "Markdown 回答",
         "result": "<同 answer>",     # 兼容调用方 .answer/.result/.data 取值
         "data":   "<同 answer>",
-        "context_summary": { "errors", "operator_id", "token_mode" }
+        "context_summary": {
+          "errors", "operator_id", "token_mode",
+          "analysis_type",   # 仅深度下钻时存在：实际使用的分析类型
+          "route_source",    # 仅深度下钻时存在："explicit"(前端透传) | "inferred"(后端关键词)
+          "date_or_month"    # 仅深度下钻时存在：日期/月份/时间范围
+        }
       }
     """
     question = (payload or {}).get("question")
     if not question or not str(question).strip():
         raise HTTPException(status_code=400, detail="缺少 question 字段或为空")
+    # 可选：深度下钻 analysis_type（前端胶囊显式透传）
+    analysis_type = (payload or {}).get("analysis_type")
+    if analysis_type is not None and analysis_type not in SUPPORTED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的 analysis_type={analysis_type!r}（支持 {', '.join(SUPPORTED)}）",
+        )
+    params = (payload or {}).get("params") or None
     try:
         connector = get_data_connector()
     except (RuntimeError, ValueError) as e:
@@ -388,12 +406,14 @@ def post_ask(payload: dict, request: Request) -> dict:
         result = process_question(
             question, connector, llm,
             token=effective_token, operator_id=operator, token_mode=token_mode,
+            analysis_type=analysis_type, params=params,
         )
     except Exception as e:  # 数据 API / LLM 异常都不应泄露堆栈
         raise HTTPException(
             status_code=502, detail=f"问答执行失败：{type(e).__name__}: {e}"
         )
     # P6 审计：记录「谁问了什么 -> Tess 答了什么」
+    cs = result.get("context_summary", {})
     AUDIT.log_query(
         operator_id=operator,
         endpoint="/tess/ask",
@@ -401,7 +421,11 @@ def post_ask(payload: dict, request: Request) -> dict:
         answer=result.get("answer", ""),
         status="answered",
         confidence=1.0,
-        meta={"token_mode": token_mode},
+        meta={
+            "token_mode": token_mode,
+            "analysis_type": cs.get("analysis_type"),
+            "route_source": cs.get("route_source"),
+        },
     )
     return result
 

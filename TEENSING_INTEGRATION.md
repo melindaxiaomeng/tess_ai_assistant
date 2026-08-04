@@ -533,6 +533,11 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 
 面向 Teensing 前端「问一句、答一段」的对话场景。**字段契约即对接方当前约定**：请求体发 `question`，返回体取 `answer`（兼容 `.answer` / `.result` / `.data` 任一同义字段）。
 
+**深度下钻（可选）**：`/tess/ask` 不只能答浅层全局问题，还复用 `/tess/analytics` 同一套深度取数层（`fetch_bi_analysis_context`）。上下文选择优先级：
+1. **显式透传**：请求体带 `analysis_type`（前端胶囊直接透传，确定性最强）→ 走该类型深度上下文；
+2. **后端推断**：不带 `analysis_type` 时，用轻量关键词把问题映射到深度类型（如「放量空间」→ `scaling_capacity`、「对账」→ `finance_check`），命中即下钻；
+3. **浅层兜底**：都不命中 → 退回原「全局态势」上下文，保证仍能量身答。
+
 ```
 POST /tess/ask
 Content-Type: application/json
@@ -540,20 +545,33 @@ X-API-Key: <TESS_API_KEY>            # 同 §10.1，网关注入
 X-Teensing-Token: <终端用户 access_token>   # 同 §10.1，按用户权限取数；缺省回退系统 token
 X-Operator-Id: <运营ID>             # 可选，审计
 
+# 方式 A：纯自由提问（后端自动判断是否下钻）
 { "question": "昨天整体营收表现如何？有没有需要重点关注的异常？" }
+
+# 方式 B：前端胶囊显式下钻（analysis_type 与 /tess/analytics 同枚举）
+{ "question": "各 Campaign 还有多少放量空间？", "analysis_type": "scaling_capacity", "params": {} }
+# 财务对账可带月份：{ "question": "本月对账", "analysis_type": "finance_check", "params": { "report_month": "2026-08" } }
 ```
 
-返回：
+返回（深度下钻时 `context_summary` 额外回显 `analysis_type` / `route_source` / `date_or_month`）：
 
 ```json
 {
   "answer": "📊 **昨日整体营收…**\n…Markdown 回答…",
   "result": "<同 answer>",
   "data":   "<同 answer>",
-  "context_summary": { "endpoint": "/tess/ask", "errors": [], "operator_id": "op-1", "token_mode": "user" }
+  "context_summary": {
+    "endpoint": "/tess/ask",
+    "errors": [],
+    "operator_id": "op-1",
+    "token_mode": "user",
+    "analysis_type": "scaling_capacity",   // 仅深度下钻时存在
+    "route_source": "explicit",            // 仅深度下钻时存在：explicit(前端透传) | inferred(后端关键词)
+    "date_or_month": "2026-07-28 ~ 2026-08-04"  // 仅深度下钻时存在
+  }
 }
 ```
 
-**实现说明**：`process_question()` 先用调用方 token 拉取一个紧凑「全局态势」上下文（`/overview/daily-kpi` + `/overview/ranking` + `/overview/ranking/anomaly-warning` + `/campaign-quality/publisher`，单源容错），连同 `question` 一起交给 LLM（`ASK_SYSTEM_PROMPT`，`json_mode=False` 返回 Markdown），并写审计（`AUDIT.log_query`）。`answer`/`result`/`data` 三者同值，对接方用哪一个都能取到回答。
-- 验证：`python verify_analytics.py --ask "你的问题"`（模块直跑，需真实 LLM）或 `--http <url> --api-key <key> --ask "你的问题"`（线上端点）。
+**实现说明**：`process_question()` 先按上文优先级选定上下文——深度上下文走 `fetch_bi_analysis_context(analysis_type)`（与 `/tess/analytics` 完全同一套取数），浅层走 `fetch_qa_context()`（`/overview/daily-kpi` + `/overview/ranking` + `/overview/ranking/anomaly-warning` + `/campaign-quality/publisher`，单源容错）；两者均连同 `question` 交给 LLM（`ASK_SYSTEM_PROMPT`，`json_mode=False` 返回 Markdown），并写审计（`AUDIT.log_query`，meta 含 `analysis_type` / `route_source`）。`answer`/`result`/`data` 三者同值，对接方用哪一个都能取到回答。
+- 验证：`python verify_analytics.py --ask "你的问题"`（模块直跑，需真实 LLM）或 `--http <url> --api-key <key> --ask "你的问题"`（线上端点）；加 `--analysis-type scaling_capacity` 可强制走深度下钻验证。
 

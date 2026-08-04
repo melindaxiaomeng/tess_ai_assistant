@@ -515,6 +515,49 @@ ASK_SYSTEM_PROMPT = """你叫 Tess，是 Teensing 平台的专属 AdTech 智能�
 """
 
 
+# ---------------------------------------------------------------------------
+# /tess/ask 深度下钻：可选 analysis_type（显式透传 OR 后端关键词推断）+ 浅层兜底
+# ---------------------------------------------------------------------------
+
+# 与 /tess/analytics 共用同一套深度取数层（fetch_bi_analysis_context）
+ANALYSIS_TYPES = {
+    "daily_summary",
+    "scaling_opportunity",
+    "finance_check",
+    "account_overview",
+    "publisher_deepdive",
+    "scaling_capacity",
+}
+
+# 关键词路由表（优先级自上而下：先匹配更具体的类型）。
+# 英文关键词统一小写匹配；中文不区分大小写。
+_ANALYSIS_KEYWORDS: list = [
+    ("scaling_capacity", ["容量", "cap", "放量空间", "还能放", "预算上限", "放量容量", "容量评估"]),
+    ("finance_check", ["对账", "毛利", "结算", "营收核对", "对账差异", "月报", "财务", "month", "invoice"]),
+    ("publisher_deepdive", ["渠道", "publisher", "媒体质量", "扣量", "作弊", "渠道质量"]),
+    ("account_overview", ["账户全景", "整体大盘", "总览", "概览", "全景", "account overview"]),
+    ("daily_summary", ["复盘", "每日", "昨日", "昨天", "日报", "今日表现", "daily summary"]),
+    ("scaling_opportunity", ["放量", "扩量", "加预算", "增长机会", "潜力", "机会", "加大投放", "scale"]),
+]
+
+
+def infer_analysis_type(question: str) -> Optional[str]:
+    """用轻量关键词把自然语言问题映射到深度 analysis_type。
+
+    命中即返回对应类型；都不命中返回 None（调用方应退回浅层全局上下文）。
+    关键词路由不发起额外 LLM 调用，零成本、确定性、可预期。
+    后续可升级为 LLM 路由（更准但多一次推理开销）。
+    """
+    if not question:
+        return None
+    q = question.lower()
+    for atype, kws in _ANALYSIS_KEYWORDS:
+        for kw in kws:
+            if kw.lower() in q:
+                return atype
+    return None
+
+
 def fetch_qa_context(connector, token: Optional[str] = None, question: str = "") -> dict:
     """拉取一个紧凑的「全局态势」上下文作为问答 grounding。
 
@@ -557,29 +600,65 @@ def process_question(
     params: Optional[dict] = None,
     operator_id: str = "anonymous",
     token_mode: str = "system",
+    analysis_type: Optional[str] = None,
 ) -> dict:
-    """端到端执行一次自然语言问答。
+    """端到端执行一次自然语言问答，支持深度下钻。
+
+    上下文选择优先级：
+      ① 显式 analysis_type（前端胶囊透传）    -> 深度上下文 fetch_bi_analysis_context
+      ② 否则用关键词推断 analysis_type         -> 命中则同样走深度上下文
+      ③ 二者皆无/不合法                       -> 退回浅层全局上下文 fetch_qa_context（原行为）
 
     - connector / llm / token：与 analytics 同源（token 决定按谁的数据权限取数）
     - 返回 answer（Markdown），并附 result / data 别名以兼容调用方 .answer/.result/.data 取值
+    - context_summary 在走深度上下文时额外回显 analysis_type / route_source（explicit|inferred）/ date_or_month
     """
-    ctx = fetch_qa_context(connector, token=token, question=question)
-    ctx_text = _trim_for_prompt(ctx)
-    user_prompt = (
-        "【Teensing 业务数据上下文】\n"
-        f"{ctx_text}\n\n"
-        f"【用户问题】\n{question}\n\n"
-        "请基于上方上下文作答；若上下文无法支撑，明确告知数据不足。"
-    )
+    # —— 1. 决定用哪套上下文 ——
+    route_source = None
+    if analysis_type in ANALYSIS_TYPES:
+        route_source = "explicit"
+    else:
+        inferred = infer_analysis_type(question)
+        if inferred:
+            analysis_type = inferred
+            route_source = "inferred"
+
+    if route_source:  # ①② 走深度上下文（与 /tess/analytics 同一套取数）
+        ctx = fetch_bi_analysis_context(connector, analysis_type, token=token, params=params)
+        ctx_text = _trim_for_prompt(ctx, limit=9000)  # 深度上下文更大，放宽截断
+        user_prompt = (
+            f"【Teensing 业务数据上下文（深度下钻：{analysis_type}）】\n"
+            f"{ctx_text}\n\n"
+            f"【用户问题】\n{question}\n\n"
+            "请结合上方深度数据作答；若数据不足以回答，明确告知「数据不足，暂无法确认」，不要臆测。"
+        )
+        summary_extra = {
+            "analysis_type": analysis_type,
+            "route_source": route_source,
+            "date_or_month": ctx.get("date") or ctx.get("report_month") or ctx.get("time_range"),
+        }
+    else:  # ③ 浅层全局兜底（保持原行为）
+        ctx = fetch_qa_context(connector, token=token, question=question)
+        ctx_text = _trim_for_prompt(ctx, limit=6000)
+        user_prompt = (
+            "【Teensing 业务数据上下文】\n"
+            f"{ctx_text}\n\n"
+            f"【用户问题】\n{question}\n\n"
+            "请基于上方上下文作答；若上下文无法支撑，明确告知数据不足。"
+        )
+        summary_extra = {}
+
     answer = llm.complete(ASK_SYSTEM_PROMPT, user_prompt, json_mode=False)
+    context_summary = {
+        "endpoint": "/tess/ask",
+        "errors": ctx.get("errors", []),
+        "operator_id": operator_id,
+        "token_mode": token_mode,
+        **summary_extra,
+    }
     return {
         "answer": answer,
         "result": answer,  # 兼容调用方 .answer/.result/.data 取值
         "data": answer,
-        "context_summary": {
-            "endpoint": "/tess/ask",
-            "errors": ctx.get("errors", []),
-            "operator_id": operator_id,
-            "token_mode": token_mode,
-        },
+        "context_summary": context_summary,
     }

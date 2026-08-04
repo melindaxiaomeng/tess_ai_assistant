@@ -26,6 +26,22 @@ import urllib.request
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
+
+def _load_dotenv(path=os.path.join(PROJECT_ROOT, ".env")):
+    """极简 .env 加载：仅注入尚未存在的环境变量（不覆盖已有 shell 环境）。"""
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+
+_load_dotenv()
+
 ALL_TYPES = [
     "daily_summary",
     "scaling_opportunity",
@@ -191,7 +207,7 @@ def run_http(base_url, api_key, types, user_token=None):
     return results
 
 
-def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None):
+def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None, analysis_type=None):
     """验证 /tess/ask 自然语言问答端点。
 
     - base_url+api_key 给定 -> HTTP 模式打线上端点（带可选 X-Teensing-Token）
@@ -201,7 +217,10 @@ def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None):
         import urllib.request
 
         base = base_url.rstrip("/")
-        payload = json.dumps({"question": question}).encode("utf-8")
+        body = {"question": question}
+        if analysis_type:
+            body["analysis_type"] = analysis_type
+        payload = json.dumps(body).encode("utf-8")
         headers = {"Content-Type": "application/json", "X-API-Key": api_key}
         if user_token:
             headers["X-Teensing-Token"] = user_token
@@ -210,9 +229,11 @@ def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None):
             with urllib.request.urlopen(req, timeout=180) as resp:
                 d = json.loads(resp.read().decode("utf-8"))
             answer = d.get("answer", "")
-            errs = (d.get("context_summary") or {}).get("errors", [])
+            cs = d.get("context_summary") or {}
+            errs = cs.get("errors", [])
             return [{
-                "analysis_type": "ask", "mode": "http", "http_status": resp.status,
+                "analysis_type": f"ask:{cs.get('analysis_type', 'shallow')}", "mode": "http",
+                "http_status": resp.status, "route_source": cs.get("route_source"),
                 "data_errors": errs, "answer_len": len(answer),
                 "answer_head": answer[:200], "ok": (not errs) and bool(answer.strip()),
             }]
@@ -240,10 +261,13 @@ def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None):
         )
         try:
             res = process_question(question, connector, llm, token=token,
-                                   operator_id="verify-script", token_mode="user" if user_token else "system")
+                                   operator_id="verify-script", token_mode="user" if user_token else "system",
+                                   analysis_type=analysis_type)
             answer = res.get("answer", "")
-            errs = res.get("context_summary", {}).get("errors", [])
-            return [{"analysis_type": "ask", "mode": "module+llm", "data_errors": errs,
+            cs = res.get("context_summary", {})
+            errs = cs.get("errors", [])
+            return [{"analysis_type": f"ask:{cs.get('analysis_type', 'shallow')}", "mode": "module+llm",
+                     "route_source": cs.get("route_source"), "data_errors": errs,
                      "answer_len": len(answer), "answer_head": answer[:200],
                      "ok": (not errs) and bool(answer.strip())}]
         except Exception as e:  # noqa: BLE001
@@ -272,12 +296,15 @@ def main():
     ap.add_argument("--no-llm", action="store_true", help="模块模式：只校验数据，不调 LLM")
     ap.add_argument("--type", choices=ALL_TYPES, help="只跑单一 analytics 场景")
     ap.add_argument("--ask", help="测试 /tess/ask 自然语言问答：传入一个问题字符串")
+    ap.add_argument("--analysis-type", choices=ALL_TYPES,
+                    help="配合 --ask：显式指定深度下钻 analysis_type（前端胶囊透传）；不传则由后端关键词推断")
     ap.add_argument("--json", action="store_true", help="输出 JSON 而非可读报告")
     args = ap.parse_args()
 
     if args.ask:
         results = run_ask(args.ask, use_llm=not args.no_llm,
-                          user_token=args.user_token, base_url=args.http, api_key=args.api_key)
+                          user_token=args.user_token, base_url=args.http, api_key=args.api_key,
+                          analysis_type=args.analysis_type)
     else:
         types = [args.type] if args.type else ALL_TYPES
         if args.http:
