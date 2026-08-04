@@ -283,11 +283,19 @@ def post_analytics(payload: dict, request: Request) -> dict:
                          | "account_overview" | "publisher_deepdive" | "scaling_capacity",
         "params": { "report_month": "2026-08" }   # finance_check 可选
       }
+    请求头（鉴权与按权限取数）：
+      - X-API-Key        : Tess 与 Teensing 之间的共享密钥（网关注入，生产设了 TESS_API_KEY 后必带）
+      - X-Teensing-Token : 终端运营/用户的 SaaS access_token，**原样透传给 Teensing 作为取数凭据**；
+                            Teensing 按该用户 RBAC/数据权限返回数据，看不到其无权访问的内容。
+                            缺省时回退 TESS_SYSTEM_TOKEN（系统级，无按人过滤，仅限内部/定时任务）。
+      - X-Operator-Id    : 可选，运营身份，仅用于审计归因（回显到 context_summary.operator_id）
     返回：
       {
         "analysis_type": str,
         "report": "Markdown 简报（含 📊/💡/🚀 三段）",
-        "context_summary": { "analysis_type", "date_or_month", "errors" }
+        "context_summary": { "analysis_type", "date_or_month", "errors",
+                             "operator_id", "token_mode" }
+            # token_mode: "user"=按调用方 X-Teensing-Token 权限取数; "system"=系统 token
       }
     """
     analysis_type = (payload or {}).get("analysis_type")
@@ -304,10 +312,27 @@ def post_analytics(payload: dict, request: Request) -> dict:
     except (RuntimeError, ValueError) as e:
         raise HTTPException(status_code=503, detail=f"Tess 未配置 Teensing 数据源：{e}")
     llm = _get_llm_client()
-    token = os.getenv("TESS_SYSTEM_TOKEN") or None
+    # 按访问者权限拉数据（核心）：
+    #   优先用调用方经请求头 X-Teensing-Token 传入的「运营 SaaS access_token」，
+    #   缺失时回退到 TESS_SYSTEM_TOKEN（系统级，仅限内部/定时任务等无终端用户场景）。
+    #   token 原样透传给 Teensing，由 Teensing 按该用户的 RBAC/数据权限返回数据 ——
+    #   用户看不到其无权访问的 Campaign/广告主/营收。
+    operator = _operator_id(request) if request else "anonymous"
+    user_token = _teensing_token(request) if request else ""
+    system_token = os.getenv("TESS_SYSTEM_TOKEN") or None
+    effective_token = user_token or system_token
+    token_mode = "user" if user_token else "system"
+    # 生产（Teensing 真实连接器）下没有任何 token 则无法按权限取数 -> 400
+    if isinstance(connector, TeensingDataConnector) and not effective_token:
+        raise HTTPException(
+            status_code=400,
+            detail="生产数据接入需在前端请求头携带 X-Teensing-Token（运营 SaaS access_token）",
+        )
     try:
         result = process_data_analysis_query(
-            analysis_type, connector, llm, token=token, params=params
+            analysis_type, connector, llm,
+            token=effective_token, params=params,
+            operator_id=operator, token_mode=token_mode,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -471,12 +471,17 @@ def process_data_analysis_query(
     llm,
     token: Optional[str] = None,
     params: Optional[dict] = None,
+    operator_id: str = "anonymous",
+    token_mode: str = "system",
 ) -> dict:
     """端到端执行一次数据分析。
 
     - connector: TeensingDataConnector 实例（提供 api_get）
     - llm: 实现 complete(system, user, json_mode=False) -> str 的客户端
            注意：BI 简报用 json_mode=False 返回 Markdown 文本
+    - token: 上游 Teensing 取数用的 access_token（来自调用方 X-Teensing-Token，
+             缺失时回退 TESS_SYSTEM_TOKEN）；决定「按谁的数据权限」回数据。
+    - operator_id / token_mode: 审计字段，原样回显到 context_summary。
     """
     ctx = fetch_bi_analysis_context(connector, analysis_type, token=token, params=params)
     user_prompt = _build_user_prompt(analysis_type, ctx)
@@ -488,5 +493,7 @@ def process_data_analysis_query(
             "analysis_type": ctx.get("analysis_type"),
             "date_or_month": ctx.get("date") or ctx.get("report_month") or ctx.get("time_range"),
             "errors": ctx.get("errors", []),
+            "operator_id": operator_id,
+            "token_mode": token_mode,  # "user"=按调用方 token 权限取数; "system"=系统 token
         },
     }

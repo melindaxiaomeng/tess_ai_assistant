@@ -9,8 +9,10 @@
 
   2) HTTP 模式（部署后验证线上端点，需服务器地址 + API Key）：
        python verify_analytics.py --http https://your-host --api-key <X-API-Key>
+       # 按用户权限取数：透传终端用户 token
+       python verify_analytics.py --http https://your-host --api-key <key> --user-token <运营access_token>
 
-可选 --type 限定单个场景；--json 输出机器可读结果。
+可选 --type 限定单个场景；--json 输出机器可读结果；--user-token 模拟线上 X-Teensing-Token 透传。
 
 退出码：全部场景 0 errors 且（LLM 模式下）report 非空 => 0；否则 1。
 """
@@ -82,7 +84,7 @@ def load_dotenv(path=os.path.join(PROJECT_ROOT, ".env")):
             os.environ.setdefault(k.strip(), v.strip())
 
 
-def run_module(types, use_llm):
+def run_module(types, use_llm, user_token=None):
     from tess_backend.data_connector import get_data_connector
     from tess_backend.analytics import (
         fetch_bi_analysis_context,
@@ -90,7 +92,8 @@ def run_module(types, use_llm):
     )
 
     connector = get_data_connector()
-    token = os.getenv("TESS_SYSTEM_TOKEN") or None
+    # 默认用系统 token；传入 --user-token 则按该用户的权限取数（模拟线上透传）
+    token = user_token or (os.getenv("TESS_SYSTEM_TOKEN") or None)
 
     results = []
     for at in types:
@@ -141,17 +144,21 @@ def _len_or_val(v):
     return v
 
 
-def run_http(base_url, api_key, types):
+def run_http(base_url, api_key, types, user_token=None):
     import urllib.request
 
     base = base_url.rstrip("/")
     results = []
     for at in types:
         payload = json.dumps({"analysis_type": at}).encode("utf-8")
+        headers = {"Content-Type": "application/json", "X-API-Key": api_key}
+        # 按用户权限取数：透传终端用户的 Teensing access_token
+        if user_token:
+            headers["X-Teensing-Token"] = user_token
         req = urllib.request.Request(
             f"{base}/tess/analytics",
             data=payload,
-            headers={"Content-Type": "application/json", "X-API-Key": api_key},
+            headers=headers,
             method="POST",
         )
         try:
@@ -187,6 +194,7 @@ def main():
     ap = argparse.ArgumentParser(description="验证 /tess/analytics 六类场景")
     ap.add_argument("--http", help="HTTP 模式：服务器 base url（如 https://host）")
     ap.add_argument("--api-key", help="HTTP 模式：X-API-Key")
+    ap.add_argument("--user-token", help="透传终端用户 Teensing access_token（X-Teensing-Token）；用于按用户权限取数测试")
     ap.add_argument("--no-llm", action="store_true", help="模块模式：只校验数据，不调 LLM")
     ap.add_argument("--type", choices=ALL_TYPES, help="只跑单一场景")
     ap.add_argument("--json", action="store_true", help="输出 JSON 而非可读报告")
@@ -198,10 +206,10 @@ def main():
         if not args.api_key:
             print("ERROR: --http 模式需要 --api-key", file=sys.stderr)
             sys.exit(2)
-        results = run_http(args.http, args.api_key, types)
+        results = run_http(args.http, args.api_key, types, user_token=args.user_token)
     else:
         load_dotenv()
-        results = run_module(types, use_llm=not args.no_llm)
+        results = run_module(types, use_llm=not args.no_llm, user_token=args.user_token)
 
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))

@@ -421,13 +421,20 @@ Nginx 注入的 `<TESS_API_KEY>` 必须与 Tess 容器启动时的 `TESS_API_KEY
 ```
 POST /tess/analytics
 Content-Type: application/json
-X-API-Key: <TESS_API_KEY>
+X-API-Key: <TESS_API_KEY>            # Tess<->Teensing 共享密钥（网关注入）
+X-Teensing-Token: <终端用户 SaaS access_token>   # 可选：按「该用户」权限取数；缺省回退系统 token
+X-Operator-Id: <运营ID>             # 可选：仅审计归因
 
 {
-  "analysis_type": "daily_summary" | "scaling_opportunity" | "finance_check",
+  "analysis_type": "daily_summary" | "scaling_opportunity" | "finance_check"
+                | "account_overview" | "publisher_deepdive" | "scaling_capacity",
   "params": { "report_month": "2026-08" }   // 仅 finance_check 可选
 }
 ```
+
+**按用户权限取数（重要）**：`X-Teensing-Token` 是**终端运营/用户的 SaaS access_token**，Tess 原样透传给 Teensing 作为其取数凭据；Teensing 按该用户的 RBAC/数据权限返回数据 —— **用户看不到其无权访问的 Campaign / 广告主 / 营收**。缺失时回退到 Tess 的 `TESS_SYSTEM_TOKEN`（系统级、无按人过滤，仅限内部 / 定时任务等无终端用户场景）。生产（Teensing 真实连接器）下若两者皆无，接口返回 `400`。
+
+> ⚠️ **两个密钥切勿混淆**：`X-API-Key` 是 **Tess↔Teensing 的共享密钥**，由 Teensing 的 Nginx/网关层统一注入（前端永不接触）；`X-Teensing-Token` 是**每个登录用户自己的 access_token**，必须由 Teensing 前端从当前用户会话里取出后**逐请求带上**。**不要把 `X-Teensing-Token` 写进 Nginx 注入**——否则所有请求共用同一个 token，按用户隔离就失效了。
 
 返回：
 
@@ -435,11 +442,17 @@ X-API-Key: <TESS_API_KEY>
 {
   "analysis_type": "daily_summary",
   "report": "📊 **数据复盘 / 洞察摘要**\n- ...\n💡 **潜能点 / 风险点**\n- ...\n🚀 **推荐执行动作**\n1. ...",
-  "context_summary": { "analysis_type": "daily_summary", "date_or_month": "2026-08-03", "errors": [] }
+  "context_summary": {
+    "analysis_type": "daily_summary",
+    "date_or_month": "2026-08-03",
+    "errors": [],
+    "operator_id": "anonymous",     // 来自 X-Operator-Id，审计用
+    "token_mode": "user"            // "user"=按调用方 X-Teensing-Token 权限取数；"system"=系统 token
+  }
 }
 ```
 
-`report` 为 Markdown 简报（含 📊/💡/🚀 三段），前端可直接渲染；`errors` 列表非空表示部分数据源拉取失败（接口已做单源容错，不会整轮崩）。
+`report` 为 Markdown 简报（含 📊/💡/🚀 三段），前端可直接渲染；`errors` 列表非空表示部分数据源拉取失败（接口已做单源容错，不会整轮崩）；`token_mode` 让前端 / 审计方一眼看出本次结果是否按用户权限隔离。
 
 ### 10.2 真实可用 API 完整目录（已用生产 token 探测确认）
 
