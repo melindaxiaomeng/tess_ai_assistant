@@ -108,6 +108,32 @@ TESS_API_KEY=<强随机值>             # 开启拉取接口鉴权（Teensing �
 }
 ```
 
+### 3.1 顶层 `campaign_id` / `publisher_id`（定位字段，必读）
+
+为方便 Teensing **直接按 campaign 维度聚合/跳转/去重**，每条 `item` 顶层都新增了这两个定位字段（不再需要到 `anomaly_metadata` 或 `event_id` 里抠）：
+
+```json
+{
+  "id": 2635,
+  "event_id": "AW-CAMP-6844120",       // anomaly-warning 源：本就是 campaign_id 加前缀
+  "source": "anomaly-warning",
+  "campaign_id": "6844120",            // 顶层：本条告警归属的 campaign（纯数字字符串）
+  "publisher_id": "1000233",           // 顶层：publisher 维度；可能为空（见下表说明）
+  "diagnosis": { ... },
+  "anomaly_metadata": { ... }
+}
+```
+
+| 字段 | 含义 | 取值规则 | 何时为 null |
+|---|---|---|---|
+| `item.campaign_id` | 告警归属的 campaign | 优先取 `anomaly_metadata.campaign_id` → 否则取**纯数字的 `event_id`**（anomaly-warning 真实记录的 event_id 即 campaign_id）→ 否则 null | `realtime-kpi` 源（event_id 形如 `RT-HOUR-13`）、或异常无 campaign 维度时 |
+| `item.publisher_id` | 告警归属的 publisher（版位/媒体） | 取 `anomaly_metadata.publisher_id` | ① `realtime-kpi` 源；② anomaly-warning 的**历史记录**（旧代码落库时未存 publisher_id，故为空）；③ 之后的新记录会带真实值 |
+
+**使用要点（避免误用）：**
+- `diagnosis.primary_contributor_id` **不是** campaign_id —— 对大多数 anomaly-warning 它其实是「主因维度/版位名」（如 `recl-domino-ID(...)`、`ru.yandex.music_RU`），拿它当 campaign_id 会错。请一律用顶层 `campaign_id`。
+- `realtime-kpi` 源的告警没有单一 campaign 维度，两字段均为 `null`，按"大盘级"处理即可，不要拿 `RT-HOUR-13` 这类 event_id 当 campaign_id。
+- 这两条字段由**读侧自动抽取 + 写侧落库**共同保证（详见 §7「已实现」的最新条目）：历史的裸数字 event_id 记录部署后立即自动补出 `campaign_id`；`publisher_id` 仅演示数据与新记录带值，历史真实记录留空。
+
 无数据时：`{ "as_of": null, "count": 0, "items": [] }` —— 正常，按"无异常"处理即可。
 
 > `anomaly_metadata` 与 `diagnosis` 是**两套独立信息**：`diagnosis` 是 LLM 的文字归因结论，`anomaly_metadata` 是 Tess 检测出的**原始数值事实**（今日值 / 昨日基准 / 严重度 / 估算损失）。展示告警卡片时建议两者都用地上——数值用 `anomaly_metadata`，结论文字用 `diagnosis.summary`。
@@ -288,6 +314,7 @@ curl "https://<tess-host>:8080/tess/realtime-kpi/alerts?limit=50" \
 1. **按 severity 过滤**：`?min_severity=MEDIUM`（或 `HIGH`）只拉 >= 指定级别的告警，避免 `LOW` 微跌刷屏。例：`GET /tess/realtime-kpi/alerts?min_severity=MEDIUM`。
 2. **增量游标（since_as_of）**：`?since_as_of=2026-07-30 13:00:00` 只返回比该批次更新的告警（可能跨多批）。Teensing 用上次拿到的 `as_of` 传入即可只拿新增，省流量且无需客户端再比对去重。例：`GET /tess/realtime-kpi/alerts?since_as_of=2026-07-30 13:00:00`。
 3. **运营确认回写**：`POST /tess/alerts/{id}/ack`（body `{"resolution":"acknowledged|resolved|false_positive","acked_by":"alice","note":"..."}`）标记告警已被运营处理。标记后**默认拉取（`include_acked=false`）不再返回该告警**，避免已处理项刷屏；做历史/审计视图时传 `?include_acked=true` 仍可查回。Teensing 客户端示例见第 4 节 `ack_alert()`。
+4. **顶层定位字段 `campaign_id` / `publisher_id`**：每条 `item` 顶层直接带 `campaign_id`（anomaly-warning 源必填）与 `publisher_id`，Teensing 无需从 `event_id`/`anomaly_metadata` 里抠。字段契约与取值规则见 [§3.1](#31-顶层-campaign_id--publisher_id定位字段必读)。注意 `diagnosis.primary_contributor_id` **不是** campaign_id（它多半是版位/主因名），一律用顶层 `campaign_id`；`realtime-kpi` 源两字段均为 `null`。
 
 ### 如何判断"运营是否已知晓/处理"？
 - Tess **不知道**运营在 Teensing 侧做了什么，需由 Teensing 在处理动作（查看/解决/确认正常波动）后**反向调用 ack 接口回写**。
