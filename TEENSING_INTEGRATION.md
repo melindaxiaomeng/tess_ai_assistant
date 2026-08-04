@@ -441,16 +441,53 @@ X-API-Key: <TESS_API_KEY>
 
 `report` 为 Markdown 简报（含 📊/💡/🚀 三段），前端可直接渲染；`errors` 列表非空表示部分数据源拉取失败（接口已做单源容错，不会整轮崩）。
 
-### 10.2 三大分析场景与底层真实 API
+### 10.2 真实可用 API 完整目录（已用生产 token 探测确认）
 
-| analysis_type | 业务问题 | Tess 实际调用的 Teensing 接口（均已实测存在） |
-|---|---|---|
-| `daily_summary` | 今天/昨天大盘与绩效复盘 | `GET /overview/daily-kpi`、`GET /overview/ranking`、`GET /overview/ranking/fluctuation` |
-| `scaling_opportunity` | 哪些 Campaign 还有放量空间 | `GET /report`（dimensions=`campaign,publisher`，按 `profit` 降序）+ `GET /campaign-quality/publisher` |
-| `finance_check` | 本月对账/毛利趋势是否异常 | `GET /report/month`（带 `revenue` vs `calc_revenue` 对账字段） |
+> 下列端点均已用 `TESS_SYSTEM_TOKEN` 对 `TESS_DATA_API_BASE_URL` 实测存在并返回数据；BI 助手的数据加载器 `fetch_bi_analysis_context()` 即从其中按需编排。分四组：**A 大盘与绩效 / B 报表与聚合 / C 质量与扣量 / D 主数据目录（新发现，可扩展）**。
 
-> ⚠️ **`/external/archived-invoices`（设计稿原列）实测 404 不存在**；对账差异改用 `/report/month` 的 `revenue` 与 `calc_revenue` 差额代替，已覆盖"实结 vs 计算营收"核对需求。
-> 字段注意：`/report` 维度下转化率字段名为 `cr`（非 `cvr`）；`margin` 为百分比数值。
+#### A. 大盘与绩效（Overview & Performance）
+
+| 端点 | 返回形状 | 关键字段 | 已用于场景 |
+|---|---|---|---|
+| `GET /overview/daily-kpi` | `list[7]` | `date, clicks, conversions, revenue, payout, profit` | `daily_summary` |
+| `GET /overview/ranking` | `list[10]` | `rank, advertiser_id, advertiser_name, clicks, conversions, cvr, revenue, payout, margin, revenue_change, revenue_change_status` | `daily_summary` / 账户全景（规划） |
+| `GET /overview/ranking/fluctuation` | `{rising[], falling[]}` | `campaign_id, name, revenue_change, …` | `daily_summary` |
+| `GET /overview/ranking/anomaly-warning` | `{total, page, page_size, items[]}` | 被预警实体（campaign 级） | 异常复盘（规划） |
+| `GET /overview/realtime-kpi` | `{items[24 小时]}` | `hour, today_revenue, today_clicks, today_conversions, yesterday_*` | 实时大盘快照（规划） |
+
+#### B. 报表与聚合（Reports & Aggregation）
+
+| 端点 | 返回形状 | 关键字段 | 已用于场景 |
+|---|---|---|---|
+| `GET /report` | `{total, page, page_size, items[]}` | `dimensions=campaign,publisher` / `date,hour,campaign`；`revenue, payout, profit, margin, cr` | `scaling_opportunity` / 多维透视（规划） |
+| `GET /report/month` | `{total, page, page_size, items[], total_data{…}}` | `total_data: revenue, scrub_revenue, calc_revenue, payout, scrub_payout, calc_payout` | `finance_check` |
+
+#### C. 质量与扣量（Quality & Scrub）
+
+| 端点 | 返回形状 | 关键字段 | 已用于场景 |
+|---|---|---|---|
+| `GET /campaign-quality/publisher` | `{items[]}` | `publisher_id, publisher_name, publisher_status, total{…}, <date>:{conversions, postback_conversions, clicks, q1_*}` | `scaling_opportunity` / 渠道质量（规划） |
+
+#### D. 主数据目录（Master Data & Catalogs）—— 新发现，可扩展
+
+| 端点 | 返回形状 | 关键字段 | 可支撑的扩展场景 |
+|---|---|---|---|
+| `GET /campaigns` | `{total, page, page_size, items[]}` | `id, name, advertiser_id, package_name, country, cap, click_cap, payout_event, status, weget, kpi, …` | 账户全景 / 放量容量评估（已实现） |
+| `GET /publishers` | `{total, page, page_size, items[]}` | `id, name, margin, payment_terms, click_caps, conversion_caps, postback_url, …` | 渠道横向对比（已实现） |
+| `GET /advertisers` | `{total, page, page_size, items[]}` | `id, name, bd, am, margin, contract_valid_to, …` | 广告主结构复盘（已实现） |
+
+#### 已确认不可用（HTTP 404，勿依赖）
+
+`/external/invoices`、`/overview/summary|performance|kpi|quality|conversion|advertiser`、`/report/day|daily|campaign|publisher`、`/campaign-quality/campaign|advertiser`、`/campaign/list`、`/statistics/overview`、`/dashboard`、`/metrics`、`/kpi`。
+
+> 注：`/report/export` 存在但返回文件流（CSV / 带 UTF-8 BOM），非 JSON，不适合直接喂给 LLM 简报，故未列入。
+
+#### 字段与口径注意
+
+- `/report` 维度下**转化率字段名为 `cr`（非 `cvr`）**；`margin` 为百分比数值（如 `41.4` = 41.4%）。
+- `/overview/ranking` 返回的是**广告主（advertiser）维度**排名（含 `advertiser_id` / `advertiser_name`），并非 campaign 级；其 `revenue_change` 为环比金额。
+- `/campaign-quality/publisher` 的扣量/质量信号在 `total` 与按日期键的对象里（如 `q1_*` 疑似质量/扣量指标），具体口径待平台侧补充。
+- `/campaigns`、`/publishers`、`/advertisers` 为**主数据目录**，本身**不含营收时序**；产出带金额的洞察时需与 `/report`、`/overview/*` 联动。
 
 ### 10.3 代码位置
 - 数据拼装：`tess_backend/analytics.py` → `fetch_bi_analysis_context()`（按类型编排上述接口，单源容错）
@@ -461,4 +498,20 @@ X-API-Key: <TESS_API_KEY>
 ### 10.4 已知缺口
 - **`/report/month` 当前环境返回空**（所有月份 total=0），故 `finance_check` 会如实返回"本月暂无数据"，待 Teensing 侧补齐月度聚合后自动生效，代码无需改动。
 - 该能力依赖 `TESS_DATA_CONNECTOR=teensing` 的真实连接器（mock 模式不支持）。
+
+### 10.5 已实现的扩展场景（基于 §10.2 D 组主数据接口）
+
+下列 3 个场景已接入 `fetch_bi_analysis_context()`、`POST /tess/analytics` 与前端胶囊，将 BI 助手从「三大复盘」扩展到「账户 / 渠道 / 放量」全景。
+
+| analysis_type | 业务问题 | 编排的真实接口 | 产出 |
+|---|---|---|---|
+| `account_overview` | 账户下广告主 / Campaign 结构、健康度 | `/campaigns` + `/advertisers` + `/overview/ranking` | 全局 campaign/advertiser 总量、首页 100 条抽样的活跃/缺失 Cap 统计、Top 广告主营收贡献 |
+| `publisher_deepdive` | 各渠道（Publisher）质量与扣量横向对比 | `/publishers` + `/campaign-quality/publisher` | 各渠道 clicks/conversions、postback 回传缺口、q1/q2/reject 扣量率，自动标记异常渠道 |
+| `scaling_capacity` | 哪些 Campaign 还有放量容量且回报好 | `/report`（按 `profit` 降序）聚合 → 反查 `/campaigns?campaign_ids=...` 取 `cap` | 近 7 日按 Campaign 聚合的利润/Margin，`scaling_room`（盈利高 Margin 且 Cap 偏低）/ `over_cap_waste`（亏损仍挂 Cap）清单 |
+
+**实现要点（实测验证）：**
+- `/campaigns` 支持 `campaign_ids=逗号列表` 精确过滤（上限 `page_size=100`）；`scaling_capacity` 先聚合 `/report` 拿到相关 campaign_id，再分批（每批≤100）回查 cap，避免 3M 全量拉取与 422 报错。
+- `/campaign-quality/publisher` 的扣量/质量信号在 `total` 聚合对象里：`q1_rate` / `q2_rate` / `reject_rate` 为扣量率，`postback_conversions` 与 `conversions` 之差为回传缺口。
+- `account_overview` 的 active/inactive/missing_cap 仅来自首页 100 条**抽样**，文案已明确不可当作全局占比；全局规模以 `campaign_total` / `advertiser_total` 为准。
+- 主数据接口**不含营收时序**，放量/容量类指标从 `/report` 取数。
 

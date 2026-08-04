@@ -111,11 +111,14 @@ export default function App() {
     appendLog("离线演示：使用内置样例渲染（无需后端）");
   }
 
-  // 主动式 BI：一键触发数据分析（daily_summary / scaling_opportunity / finance_check）
+  // 主动式 BI：一键触发数据分析（六类场景）
   const ANALYTICS_TYPES = [
     { key: "daily_summary", label: "📊 昨日大盘复盘" },
     { key: "scaling_opportunity", label: "🚀 扩量潜力挖掘" },
     { key: "finance_check", label: "💰 本月对账差异" },
+    { key: "account_overview", label: "🏢 账户全景概览" },
+    { key: "publisher_deepdive", label: "🔍 渠道质量对比" },
+    { key: "scaling_capacity", label: "📈 放量容量评估" },
   ];
 
   async function runAnalytics(type: string) {

@@ -279,7 +279,8 @@ def post_analytics(payload: dict, request: Request) -> dict:
 
     请求体：
       {
-        "analysis_type": "daily_summary" | "scaling_opportunity" | "finance_check",
+        "analysis_type": "daily_summary" | "scaling_opportunity" | "finance_check"
+                         | "account_overview" | "publisher_deepdive" | "scaling_capacity",
         "params": { "report_month": "2026-08" }   # finance_check 可选
       }
     返回：
@@ -290,10 +291,12 @@ def post_analytics(payload: dict, request: Request) -> dict:
       }
     """
     analysis_type = (payload or {}).get("analysis_type")
-    if analysis_type not in ("daily_summary", "scaling_opportunity", "finance_check"):
+    SUPPORTED = ("daily_summary", "scaling_opportunity", "finance_check",
+                 "account_overview", "publisher_deepdive", "scaling_capacity")
+    if analysis_type not in SUPPORTED:
         raise HTTPException(
             status_code=400,
-            detail=f"不支持的 analysis_type={analysis_type!r}（支持 daily_summary/scaling_opportunity/finance_check）",
+            detail=f"不支持的 analysis_type={analysis_type!r}（支持 {', '.join(SUPPORTED)}）",
         )
     params = (payload or {}).get("params") or {}
     try:
