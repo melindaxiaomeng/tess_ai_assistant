@@ -471,6 +471,8 @@ def normalize_to_context(raw: dict) -> dict:
             "benchmark_value": meta_src.get("benchmark_value"),
             "severity": meta_src.get("severity"),
             "calculated_loss": meta_src.get("calculated_loss"),
+            "revenue": meta_src.get("revenue"),
+            "profit": meta_src.get("profit"),
         }
         history = raw.get("history_baseline")
         result = {
@@ -552,6 +554,8 @@ def normalize_to_context(raw: dict) -> dict:
         "benchmark_value": benchmark_value,
         "severity": severity,
         "calculated_loss": loss,
+        "revenue": revenue,
+        "profit": profit,
     }
     top_contributors = [
         {

@@ -362,25 +362,67 @@ def _filter_by_min_severity(items: list, min_severity: str) -> list:
     return out
 
 
+def _extract_revenue(meta: dict) -> float | None:
+    """从 anomaly_metadata 抽取用于 min_revenue 过滤的营收数值。
+
+    优先级：meta.revenue（直接营收字段）> target_metric=='Revenue' 时的 current_value。
+    既无营收字段、也非 Revenue 指标 → 返回 None（视为未知）。
+    """
+    if not isinstance(meta, dict):
+        return None
+    r = meta.get("revenue")
+    if isinstance(r, (int, float)):
+        return float(r)
+    if meta.get("target_metric") == "Revenue":
+        cv = meta.get("current_value")
+        if isinstance(cv, (int, float)):
+            return float(cv)
+    return None
+
+
+def _filter_by_min_revenue(items: list, min_revenue: float | None) -> list:
+    """按最低营收（USD）过滤；min_revenue 为空则不过滤。
+
+    契合 'Rev>20 才显示' 的语义：只有明确营收且达标（>= min_revenue）的告警才展示；
+    营收未知（无 revenue 字段且非 Revenue 指标）的记录在设定 min_revenue 时一律排除。
+    """
+    if min_revenue is None:
+        return items
+    try:
+        floor = float(min_revenue)
+    except (TypeError, ValueError):
+        return items
+    out = []
+    for it in items:
+        rev = _extract_revenue(it.get("anomaly_metadata") or {})
+        if rev is not None and rev >= floor:
+            out.append(it)
+    return out
+
+
 @app.get("/tess/alerts")
 def get_alerts(limit: int = 50, source: str = None, min_severity: str = None,
-               include_acked: bool = True) -> dict:
+               min_revenue: float = None, include_acked: bool = True) -> dict:
     """P7 定时预警拉取接口：Teensing / SaaS 后端可轮询此接口获取每小时诊断结果。
 
     返回最近 limit 条预警（含 run_time / event_id / status / confidence / source / diagnosis / ack*）。
     source 过滤：?source=realtime-kpi 只看实时 KPI 异常；?source=anomaly-warning 只看异常预警。
     min_severity 过滤：?min_severity=MEDIUM 只看 >= MEDIUM 的告警（LOW/MEDIUM/HIGH）。
+    min_revenue 过滤：?min_revenue=20 只看营收 >= 20 USD 的告警（贴合 'Rev>20 才显示'；
+        营收未知的记录在设定 min_revenue 时一律排除）。
     include_acked：默认 True（含已确认项）；置 false 则只返回「运营尚未确认」的告警。
     受全局 X-API-Key 守卫（若生产已开启）。共享 token 模式：全局可读，不按人过滤。
     """
     rows = ALERTS.recent(limit=limit, source=source or None, include_acked=include_acked)
     rows = _filter_by_min_severity(rows, min_severity)
+    rows = _filter_by_min_revenue(rows, min_revenue)
     return {"count": len(rows), "alerts": rows}
 
 
 @app.get("/tess/realtime-kpi/alerts")
 def get_realtime_kpi_alerts(limit: int = 50, min_severity: str = None,
-                            since_as_of: str = None, include_acked: bool = False) -> dict:
+                            min_revenue: float = None, since_as_of: str = None,
+                            include_acked: bool = False) -> dict:
     """Teensing 专用拉取接口：返回最近一轮对 realtime-kpi 的诊断结果批次。
 
     与通用 /tess/alerts 的区别：只针对 realtime-kpi 来源，且返回「最近一次整批」
@@ -402,6 +444,9 @@ def get_realtime_kpi_alerts(limit: int = 50, min_severity: str = None,
 
     min_severity 过滤：?min_severity=MEDIUM 只返回 >= MEDIUM 的告警，
     可避免大量 LOW（微跌）刷屏。
+
+    min_revenue 过滤：?min_revenue=20 只看营收 >= 20 USD 的告警
+    （营收未知的记录在设定 min_revenue 时一律排除）。
 
     include_acked：默认 False（只返回运营尚未确认的告警，已处理项不再刷屏）；
     传 ?include_acked=true 可连已确认项一起取回（如做历史/审计视图）。
@@ -433,6 +478,7 @@ def get_realtime_kpi_alerts(limit: int = 50, min_severity: str = None,
             as_of = demo_max
 
     items = _filter_by_min_severity(items, min_severity)
+    items = _filter_by_min_revenue(items, min_revenue)
     return {
         "as_of": as_of,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
