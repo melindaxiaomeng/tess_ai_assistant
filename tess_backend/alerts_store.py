@@ -204,6 +204,30 @@ class AlertStore:
             rows = s.execute(q).scalars().all()
         return [self._row_to_dict(a) for a in rows]
 
+    def get_by_event_ids(self, event_ids: list, source: Optional[str] = None,
+                         limit: int = 50, include_acked: bool = True) -> list:
+        """按 event_id 集合捞取记录，每 event_id 取最新一条（id 最大者）。
+
+        用途：演示/置顶记录可能落在较旧的批次，被 cron 新批次覆盖后
+        latest_batch 捞不到；用 event_id 直接定位可让其始终可见，不受批次覆盖影响。
+        """
+        if not event_ids:
+            return []
+        with self.Session() as s:
+            q = select(Alert).where(Alert.event_id.in_(event_ids))
+            if source:
+                q = q.where(Alert.source == source)
+            if not include_acked:
+                q = q.where(Alert.acked_at.is_(None))
+            q = q.order_by(Alert.id.desc()).limit(limit * 5)
+            rows = s.execute(q).scalars().all()
+        seen = {}
+        for a in rows:
+            d = self._row_to_dict(a)
+            if a.event_id not in seen:
+                seen[a.event_id] = d
+        return list(seen.values())[:limit]
+
     def ack(self, alert_id: int, resolution: str, acked_by: Optional[str] = None,
             note: Optional[str] = None) -> bool:
         """标记某条告警已被运营确认/处理。成功返回 True，id 不存在返回 False。

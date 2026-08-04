@@ -295,3 +295,8 @@ def build_demo_results() -> list:
             "anomaly_metadata": r["anomaly_metadata"],
         })
     return results
+
+
+# 全部演示 event_id（供 realtime-kpi 端点「置顶」合并，避免被 cron 新批次覆盖）。
+# 单一事实来源：由上面两份列表推导，新增演示记录时无需手动维护。
+DEMO_EVENT_IDS = [r["event_id"] for r in (ANOMALY_WARNINGS + REALTIME_KPI)]

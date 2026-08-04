@@ -40,6 +40,7 @@ from .data_connector import (
 from .gaid_vault import VAULT, RedactFilter
 from .audit_log import QueryLogStore
 from .alerts_store import AlertStore
+from .dev_seed import DEMO_EVENT_IDS
 
 app = FastAPI(title="Tess Diagnose API", version="2.3.0")
 
@@ -416,6 +417,21 @@ def get_realtime_kpi_alerts(limit: int = 50, min_severity: str = None,
         batch = ALERTS.latest_batch(source="realtime-kpi", limit=limit, include_acked=include_acked)
         items = batch["alerts"]
         as_of = batch["run_time"]
+
+    # 置顶演示记录：演示数据可能落在旧批次，被 cron 新批次覆盖后 latest_batch 捞不到。
+    # 用 event_id 直接定位合并，使其始终可见（不受批次覆盖影响，也无需临时开种子接口重种）。
+    demo_items = ALERTS.get_by_event_ids(DEMO_EVENT_IDS, source="realtime-kpi",
+                                         include_acked=include_acked)
+    if demo_items:
+        merged = {it["event_id"]: it for it in items}
+        for d in demo_items:
+            merged[d["event_id"]] = d  # 演示记录优先（覆盖同 id 的旧批次副本）
+        items = list(merged.values())
+        # as_of 取演示记录中最新的 run_time，保证前端游标语义合理
+        demo_max = max((d.get("run_time") or "") for d in demo_items)
+        if demo_max > (as_of or ""):
+            as_of = demo_max
+
     items = _filter_by_min_severity(items, min_severity)
     return {
         "as_of": as_of,
