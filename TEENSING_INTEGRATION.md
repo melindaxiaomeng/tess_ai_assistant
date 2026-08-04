@@ -494,6 +494,7 @@ X-API-Key: <TESS_API_KEY>
 - LLM 编排：`process_data_analysis_query()`（复用 `HttpLLMClient`，`json_mode=False` 返回 Markdown）
 - 路由：`app.py` → `POST /tess/analytics`
 - 提示词：同文件 `BI_SYSTEM_PROMPT`（观点先行 / 数据支撑 / 动作导向）
+- 验证脚本：`verify_analytics.py`（仓库根）—— 支持模块直跑（`--no-llm` 仅校验数据）、带真实 LLM 直跑、以及部署后 HTTP 模式（`--http <url> --api-key <key>`）三种方式验证六类场景。
 
 ### 10.4 已知缺口
 - **`/report/month` 当前环境返回空**（所有月份 total=0），故 `finance_check` 会如实返回"本月暂无数据"，待 Teensing 侧补齐月度聚合后自动生效，代码无需改动。
