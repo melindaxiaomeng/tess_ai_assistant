@@ -11,6 +11,7 @@
 import asyncio
 import hmac
 import os
+import re
 import time
 
 from fastapi import FastAPI, HTTPException, Request
@@ -400,6 +401,37 @@ def _filter_by_min_revenue(items: list, min_revenue: float | None) -> list:
     return out
 
 
+def _extract_campaign_publisher(item: dict) -> dict:
+    """给告警记录补上顶层 campaign_id / publisher_id，方便 Teensing 直接消费。
+
+    背景：真实 anomaly-warning 记录落库时只在 event_id 里藏了 campaign_id（纯数字，
+    即上游 campaign_id），anomaly_metadata 没显式存 campaign_id/publisher_id；而
+    diagnosis.primary_contributor_id 多为「发布商/版位名」而非 campaign，不能当 campaign_id。
+    这里统一抽出干净字段：
+      - campaign_id：anomaly_metadata.campaign_id → 纯数字 event_id（真实记录 event_id
+        即 campaign_id）→ 否则 None。realtime-kpi 类 event_id（RT-HOUR-13）不会误判。
+      - publisher_id：anomaly_metadata.publisher_id → 否则 None。
+    """
+    out = dict(item)
+    meta = out.get("anomaly_metadata") or {}
+    cid = meta.get("campaign_id")
+    if cid is None:
+        eid = str(out.get("event_id") or "")
+        if eid.isdigit():                      # 真实 anomaly-warning：event_id 即 campaign_id
+            cid = eid
+        elif eid.startswith("AW-CAMP-") or eid.startswith("CAMP-"):
+            m = re.search(r"(\d+)", eid)
+            cid = m.group(1) if m else None
+    pid = meta.get("publisher_id")
+    if cid is not None and str(cid).isdigit():
+        cid = int(cid)
+    if pid is not None and str(pid).isdigit():
+        pid = int(pid)
+    out["campaign_id"] = cid
+    out["publisher_id"] = pid
+    return out
+
+
 @app.get("/tess/alerts")
 def get_alerts(limit: int = 50, source: str = None, min_severity: str = None,
                min_revenue: float = None, include_acked: bool = True) -> dict:
@@ -416,6 +448,7 @@ def get_alerts(limit: int = 50, source: str = None, min_severity: str = None,
     rows = ALERTS.recent(limit=limit, source=source or None, include_acked=include_acked)
     rows = _filter_by_min_severity(rows, min_severity)
     rows = _filter_by_min_revenue(rows, min_revenue)
+    rows = [_extract_campaign_publisher(r) for r in rows]
     return {"count": len(rows), "alerts": rows}
 
 
@@ -479,6 +512,7 @@ def get_realtime_kpi_alerts(limit: int = 50, min_severity: str = None,
 
     items = _filter_by_min_severity(items, min_severity)
     items = _filter_by_min_revenue(items, min_revenue)
+    items = [_extract_campaign_publisher(it) for it in items]
     return {
         "as_of": as_of,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),

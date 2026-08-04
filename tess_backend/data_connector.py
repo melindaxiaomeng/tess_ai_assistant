@@ -473,6 +473,8 @@ def normalize_to_context(raw: dict) -> dict:
             "calculated_loss": meta_src.get("calculated_loss"),
             "revenue": meta_src.get("revenue"),
             "profit": meta_src.get("profit"),
+            "campaign_id": meta_src.get("campaign_id"),
+            "publisher_id": meta_src.get("publisher_id"),
         }
         history = raw.get("history_baseline")
         result = {
@@ -556,6 +558,10 @@ def normalize_to_context(raw: dict) -> dict:
         "calculated_loss": loss,
         "revenue": revenue,
         "profit": profit,
+        # 显式持久化实体标识，供 GET /tess/alerts 直接暴露 campaign_id / publisher_id，
+        # 不再只藏在 event_id 里（真实 anomaly-warning 的 event_id 即上游 campaign_id）。
+        "campaign_id": raw.get("campaign_id") or raw.get("advertiser_id"),
+        "publisher_id": raw.get("publisher_id") or raw.get("advertiser_id"),
     }
     top_contributors = [
         {
