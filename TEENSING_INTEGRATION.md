@@ -19,6 +19,23 @@ Tess 不主动推，Teensing **自己定时来拉**。本指南只讲 Teensing �
 
 ---
 
+## 0.1 Source 模型（重要：anomaly-warning 与 fluctuation 不是并列的两种告警）
+
+`GET /tess/alerts` 按 `source` 过滤，落库后**只有 2 种 source**，不要和「上游接口」混淆：
+
+| 落库 source | 实际包含的上游数据 | Tess 拉取的接口 |
+|---|---|---|
+| `anomaly-warning` | 被预警实体 **+** 涨跌榜（fluctuation）按 `campaign_id` 合并后的结果 | `GET /overview/ranking/anomaly-warning` **与** `GET /overview/ranking/fluctuation`（两接口一起拉、合并） |
+| `realtime-kpi` | 实时大盘小时级骤降 | `GET /overview/realtime-kpi` |
+
+关键澄清：
+
+- **fluctuation 不是独立的 source。** 在 `TeensingDataConnector.fetch_recent_anomalies()` 中，代码先拉 `anomaly-warning` 拿到被预警实体，再拉 `fluctuation` 拿到 rising/falling 榜（含 `revenue_change`），然后用 `setdefault` 把 fluctuation 的环比数据补到同名 campaign 上，合并成**一条**记录，统一打 `source="anomaly-warning"` 存库。若 `anomaly-warning` 接口返回空，代码会退化为直接用整张 `fluctuation` 榜当异常源——结果同样存为 `source="anomaly-warning"`。
+- 真正与 `anomaly-warning` **并列**的第二种 source 是 **`realtime-kpi`**（实时大盘维度，按小时曲线检测骤降），走 `GET /overview/realtime-kpi` → `extract_realtime_anomalies()` 独立分支。
+- 因此 Teensing 拉数据时：要 campaign 级异常用 `GET /tess/alerts?source=anomaly-warning`（里面已含 fluctuation 合并结果）；要实时大盘异常用 `GET /tess/realtime-kpi/alerts`。**不存在** `source=fluctuation` 这种端点，也无需为 fluctuation 单独拉取。
+
+---
+
 ## 1. Tess 侧前置（需 Tess 运维确认已开启）
 
 确保 Tess 服务 `docker-compose` 环境变量包含：

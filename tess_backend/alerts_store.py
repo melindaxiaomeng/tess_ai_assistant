@@ -19,7 +19,7 @@ import os
 import time
 from typing import Optional
 
-from sqlalchemy import Float, Integer, JSON, String, Text, select
+from sqlalchemy import Float, Integer, JSON, String, Text, func, select
 from sqlalchemy.orm import mapped_column
 
 from .db import Base, make_engine, make_session_factory, init_all
@@ -122,42 +122,85 @@ class AlertStore:
         }
 
     def save_batch(self, results: list, run_time: Optional[str] = None) -> int:
-        """把一轮诊断的结果列表批量写入预警库。返回写入条数。"""
+        """把一轮诊断的结果列表写入预警库。
+
+        幂等写入（核心去重，配合 recent() 读侧去重构成 A+B 双保险）：
+        同一 (event_id, source) 的记录若已存在，则**原地更新**最新一条
+        （run_time / status / confidence / diagnosis / anomaly_metadata），
+        不再追加新行。这样：
+          - 持续性异常（如计划暂停、预算耗尽）每小时重检也不会让表无限增长；
+          - 触发端短时间连发（如 2 分钟内 3 次 cron）会被折叠成一条「当前状态」。
+
+        event_id 为空或为占位符 "UNKNOWN" 时无法安全去重，退化为纯插入
+        （保持旧行为，避免把多个无 id 的异常误合并成一条）。
+
+        返回本轮**新增**的行数（已存在的按更新计，不计入）。
+        """
         run_time = run_time or time.strftime("%Y-%m-%d %H:%M:%S")
-        objs = []
-        for r in results or []:
-            n = self._normalize_result(r)
-            diag = n["diagnosis"]
-            objs.append(
-                Alert(
-                    run_time=run_time,
-                    event_id=n["event_id"],
-                    status=diag.get("status") if isinstance(diag, dict) else None,
-                    confidence=diag.get("confidence") if isinstance(diag, dict) else None,
-                    source=n["source"],
-                    diagnosis=diag,
-                    anomaly_metadata=n["anomaly_metadata"],
-                )
-            )
-        if not objs:
-            return 0
+        written = 0
         with self.Session() as s:
-            s.add_all(objs)
+            for r in results or []:
+                n = self._normalize_result(r)
+                diag = n["diagnosis"] if isinstance(n["diagnosis"], dict) else {}
+                event_id = n["event_id"]
+                source = n["source"]
+                # 已知 event_id → 原地更新最新一条，避免重复堆积
+                if event_id and event_id != "UNKNOWN":
+                    existing = s.execute(
+                        select(Alert)
+                        .where(Alert.event_id == event_id, Alert.source == source)
+                        .order_by(Alert.id.desc())
+                        .limit(1)
+                    ).scalars().first()
+                    if existing is not None:
+                        existing.run_time = run_time
+                        existing.status = diag.get("status")
+                        existing.confidence = diag.get("confidence")
+                        existing.diagnosis = diag
+                        existing.anomaly_metadata = n["anomaly_metadata"]
+                        continue
+                s.add(
+                    Alert(
+                        run_time=run_time,
+                        event_id=event_id,
+                        status=diag.get("status"),
+                        confidence=diag.get("confidence"),
+                        source=source,
+                        diagnosis=diag,
+                        anomaly_metadata=n["anomaly_metadata"],
+                    )
+                )
+                written += 1
             s.commit()
-        return len(objs)
+        return written
 
     def recent(self, limit: int = 50, source: Optional[str] = None, include_acked: bool = True) -> list:
         """按时间倒序返回最近 limit 条预警；source 非空时按来源过滤。
 
+        同一 event_id 仅保留**最新一条**（id 最大者），消除「同一次/跨批次重复写
+        入」带来的重复行（见 save_batch 的幂等写入）。这是异常告警列表的去重视图，
+        不影响底层存储。
+
         include_acked=False 时仅返回「未确认」项（默认 True=含已确认，向后兼容）。
         """
         with self.Session() as s:
-            q = select(Alert)
+            # 每个 (event_id, source) 取最新一行（id 最大），再总体取最近 limit 个。
+            # 注意按 (event_id, source) 联合去重：同一 event_id 若出现在不同 source
+            # （如演示/真实混用）也应各保留一条，不能跨 source 误合并。
+            subq = select(
+                Alert.event_id, Alert.source, func.max(Alert.id).label("max_id")
+            )
             if source:
-                q = q.where(Alert.source == source)
+                subq = subq.where(Alert.source == source)
             if not include_acked:
-                q = q.where(Alert.acked_at.is_(None))
-            q = q.order_by(Alert.id.desc()).limit(limit)
+                subq = subq.where(Alert.acked_at.is_(None))
+            subq = subq.group_by(Alert.event_id, Alert.source).subquery()
+            q = (
+                select(Alert)
+                .join(subq, Alert.id == subq.c.max_id)
+                .order_by(Alert.id.desc())
+                .limit(limit)
+            )
             rows = s.execute(q).scalars().all()
         return [self._row_to_dict(a) for a in rows]
 
