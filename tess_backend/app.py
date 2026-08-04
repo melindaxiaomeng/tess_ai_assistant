@@ -38,6 +38,7 @@ from .data_connector import (
     should_diagnose,
     _num,
 )
+from .analytics import process_data_analysis_query
 from .gaid_vault import VAULT, RedactFilter
 from .audit_log import QueryLogStore
 from .alerts_store import AlertStore
@@ -269,6 +270,48 @@ def diagnose(payload: dict, request: Request) -> dict:
         confidence=result.get("confidence"),
         meta={"event_id": event_id},
     )
+    return result
+
+
+@app.post("/tess/analytics")
+def post_analytics(payload: dict, request: Request) -> dict:
+    """主动式数据分析（Proactive BI）：按分析类型拉取 Teensing 业务数据，由 LLM 生成简报。
+
+    请求体：
+      {
+        "analysis_type": "daily_summary" | "scaling_opportunity" | "finance_check",
+        "params": { "report_month": "2026-08" }   # finance_check 可选
+      }
+    返回：
+      {
+        "analysis_type": str,
+        "report": "Markdown 简报（含 📊/💡/🚀 三段）",
+        "context_summary": { "analysis_type", "date_or_month", "errors" }
+      }
+    """
+    analysis_type = (payload or {}).get("analysis_type")
+    if analysis_type not in ("daily_summary", "scaling_opportunity", "finance_check"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的 analysis_type={analysis_type!r}（支持 daily_summary/scaling_opportunity/finance_check）",
+        )
+    params = (payload or {}).get("params") or {}
+    try:
+        connector = get_data_connector()
+    except (RuntimeError, ValueError) as e:
+        raise HTTPException(status_code=503, detail=f"Tess 未配置 Teensing 数据源：{e}")
+    llm = _get_llm_client()
+    token = os.getenv("TESS_SYSTEM_TOKEN") or None
+    try:
+        result = process_data_analysis_query(
+            analysis_type, connector, llm, token=token, params=params
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # 数据 API / LLM 异常都不应泄露堆栈
+        raise HTTPException(
+            status_code=502, detail=f"数据分析执行失败：{type(e).__name__}: {e}"
+        )
     return result
 
 

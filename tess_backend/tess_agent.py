@@ -11,7 +11,7 @@ import json
 import logging
 import re
 import time
-from typing import List, Protocol, runtime_checkable
+from typing import List, Optional, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -134,12 +134,13 @@ class HttpLLMClient:
         self.timeout = timeout
         self.json_mode = json_mode
 
-    def complete(self, system: str, user: str) -> str:
+    def complete(self, system: str, user: str, json_mode: Optional[bool] = None) -> str:
         if not self.api_key:
             raise RuntimeError("HttpLLMClient 缺少 API Key，无法调用真实 LLM")
         import urllib.request
         import urllib.error
 
+        use_json = self.json_mode if json_mode is None else json_mode
         body: dict = {
             "model": self.model,
             "messages": [
@@ -148,7 +149,7 @@ class HttpLLMClient:
             ],
             "temperature": 0.1,  # PRD §6.1：低温度保证格式确定性
         }
-        if self.json_mode:
+        if use_json:
             body["response_format"] = {"type": "json_object"}
 
         req = urllib.request.Request(

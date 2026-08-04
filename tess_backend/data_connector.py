@@ -221,10 +221,15 @@ class TeensingDataConnector:
         return headers
 
     @staticmethod
-    def _unwrap(resp: dict) -> dict:
-        """Teensing 统一返回 {code,message,data,meta}；拦截器解包 data，这里同样处理。"""
+    def _unwrap(resp: dict) -> object:
+        """Teensing 统一返回 {code,message,data,meta}；解包内部的 data。
+
+        data 可能是 dict（如 anomaly-warning 的 {items:...}）也可能是 list
+        （如 /overview/daily-kpi、/overview/ranking 的数组），两种情况都直接吐出 data，
+        避免把 {code,data} 外壳误当业务数据返回（否则调用方 isinstance(x, list) 判定失败）。
+        """
         if isinstance(resp, dict) and "data" in resp and "code" in resp:
-            return resp.get("data") if isinstance(resp.get("data"), dict) else resp
+            return resp["data"]
         return resp
 
     def _http_get(
@@ -248,6 +253,10 @@ class TeensingDataConnector:
             return json.loads(raw)
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Teensing 数据 API 返回非 JSON：{e}") from e
+
+    def api_get(self, path: str, params: Optional[dict] = None, token: Optional[str] = None):
+        """公开透传：供 analytics 等模块复用传输层（自动 unwrap Teensing {code,data} 外壳）。"""
+        return self._unwrap(self._http_get(path, params=params, token=token))
 
     # ----- DataConnector 接口实现 -----
 

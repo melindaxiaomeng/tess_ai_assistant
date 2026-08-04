@@ -410,3 +410,55 @@ location = /tess { return 301 /tess/; }
 ### 9.2 对应的 Tess 侧配置
 Nginx 注入的 `<TESS_API_KEY>` 必须与 Tess 容器启动时的 `TESS_API_KEY` 相同（见 `.env` 与 `docker-compose.yml` 的 `TESS_API_KEY: "${TESS_API_KEY}"`）。Tess 端设了该值后，所有 `/tess/*` 接口强制校验 `X-API-Key`，否则 401。
 
+---
+
+## 10. 数据分析（主动式 BI 助手）
+
+除了「被动告警排查」，Tess 还提供**主动式商业智能**能力：运营在输入框提问，Tess 主动拉取 Teensing 业务数据并由 LLM 生成结构化简报。
+
+### 10.1 端点
+
+```
+POST /tess/analytics
+Content-Type: application/json
+X-API-Key: <TESS_API_KEY>
+
+{
+  "analysis_type": "daily_summary" | "scaling_opportunity" | "finance_check",
+  "params": { "report_month": "2026-08" }   // 仅 finance_check 可选
+}
+```
+
+返回：
+
+```json
+{
+  "analysis_type": "daily_summary",
+  "report": "📊 **数据复盘 / 洞察摘要**\n- ...\n💡 **潜能点 / 风险点**\n- ...\n🚀 **推荐执行动作**\n1. ...",
+  "context_summary": { "analysis_type": "daily_summary", "date_or_month": "2026-08-03", "errors": [] }
+}
+```
+
+`report` 为 Markdown 简报（含 📊/💡/🚀 三段），前端可直接渲染；`errors` 列表非空表示部分数据源拉取失败（接口已做单源容错，不会整轮崩）。
+
+### 10.2 三大分析场景与底层真实 API
+
+| analysis_type | 业务问题 | Tess 实际调用的 Teensing 接口（均已实测存在） |
+|---|---|---|
+| `daily_summary` | 今天/昨天大盘与绩效复盘 | `GET /overview/daily-kpi`、`GET /overview/ranking`、`GET /overview/ranking/fluctuation` |
+| `scaling_opportunity` | 哪些 Campaign 还有放量空间 | `GET /report`（dimensions=`campaign,publisher`，按 `profit` 降序）+ `GET /campaign-quality/publisher` |
+| `finance_check` | 本月对账/毛利趋势是否异常 | `GET /report/month`（带 `revenue` vs `calc_revenue` 对账字段） |
+
+> ⚠️ **`/external/archived-invoices`（设计稿原列）实测 404 不存在**；对账差异改用 `/report/month` 的 `revenue` 与 `calc_revenue` 差额代替，已覆盖"实结 vs 计算营收"核对需求。
+> 字段注意：`/report` 维度下转化率字段名为 `cr`（非 `cvr`）；`margin` 为百分比数值。
+
+### 10.3 代码位置
+- 数据拼装：`tess_backend/analytics.py` → `fetch_bi_analysis_context()`（按类型编排上述接口，单源容错）
+- LLM 编排：`process_data_analysis_query()`（复用 `HttpLLMClient`，`json_mode=False` 返回 Markdown）
+- 路由：`app.py` → `POST /tess/analytics`
+- 提示词：同文件 `BI_SYSTEM_PROMPT`（观点先行 / 数据支撑 / 动作导向）
+
+### 10.4 已知缺口
+- **`/report/month` 当前环境返回空**（所有月份 total=0），故 `finance_check` 会如实返回"本月暂无数据"，待 Teensing 侧补齐月度聚合后自动生效，代码无需改动。
+- 该能力依赖 `TESS_DATA_CONNECTOR=teensing` 的真实连接器（mock 模式不支持）。
+
