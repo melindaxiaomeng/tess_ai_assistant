@@ -18,6 +18,7 @@
   GET /report                      -> 通用聚合报表（dimensions=campaign,publisher / date,hour,campaign；items 含 revenue,payout,profit,margin,cr）
   GET /campaign-quality/publisher  -> 各 publisher 质量/扣量 {items:[{publisher_id,publisher_name,total,<date>:{conversions,postback_conversions,clicks,q1_*}}]}
   GET /report/month                -> 月度报表 {items, total_data:{revenue,scrub_revenue,calc_revenue,payout,scrub_payout,calc_payout}}
+                                       ⚠ 真实参数名为 start_date/end_date（YYYYMM，无横杠），非 report_month；report_month 仅作调用方契约，内部会转成 YYYYMM 透传
   GET /campaigns                   -> Campaign 主数据目录 {total,items:[{id,name,advertiser_id,country,cap,click_cap,payout_event,status,kpi,...}]}
   GET /publishers                  -> Publisher(渠道) 目录 {total,items:[{id,name,margin,payment_terms,click_caps,postback_url,...}]}
   GET /advertisers                 -> Advertiser(广告主) 目录 {total,items:[{id,name,bd,am,margin,contract_valid_to,...}]}
@@ -174,10 +175,20 @@ def fetch_bi_analysis_context(
     # 场景 3：月度对账与财务扣量分析
     # ---------------------------------------------------------------
     elif analysis_type == "finance_check":
-        month = params.get("report_month") or today.strftime("%Y-%m")
+        # 调用方契约（前端/文档）：可传 report_month="2026-06"（YYYY-MM，单月），
+        # 或显式传 start_date/end_date（YYYYMM，支持自定义区间，如一个季度）。
+        # 注意：Teensing /report/month 真实参数名为 start_date/end_date，且接受 YYYYMM（无横杠）格式；
+        # 之前误传 report_month=2026-06 会被接口忽略 -> 返回全 0，现已修正。
+        if params.get("start_date") and params.get("end_date"):
+            sd, ed = str(params["start_date"]), str(params["end_date"])
+            month_label = f"{sd}~{ed}"
+        else:
+            month = params.get("report_month") or today.strftime("%Y-%m")  # "2026-06"
+            sd = ed = month.replace("-", "")  # "202606"
+            month_label = month
         month_res, err_month = _safe_api_get(
             connector, "/report/month",
-            params={"report_month": month, "page_size": 50},
+            params={"start_date": sd, "end_date": ed, "page_size": 50},
             token=token,
         )
         if not isinstance(month_res, dict):
@@ -193,7 +204,7 @@ def fetch_bi_analysis_context(
 
         return {
             "analysis_type": "finance_check",
-            "report_month": month,
+            "report_month": month_label,
             "total_summary": total_data,
             "discrepancy_items": reconcile_diffs[:10],
             "sample_items": items[:5],

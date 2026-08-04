@@ -510,7 +510,7 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 - 验证脚本：`verify_analytics.py`（仓库根）—— 支持模块直跑（`--no-llm` 仅校验数据）、带真实 LLM 直跑、以及部署后 HTTP 模式（`--http <url> --api-key <key>`）三种方式验证六类场景。
 
 ### 10.4 已知缺口
-- **`/report/month` 当前环境返回空**（所有月份 total=0），故 `finance_check` 会如实返回"本月暂无数据"，待 Teensing 侧补齐月度聚合后自动生效，代码无需改动。
+- **`/report/month` 参数名易错（已修正）**：Teensing 该接口真实参数名为 `start_date`/`end_date`，且接受 `YYYYMM`（无横杠）格式；早期代码误传 `report_month=2026-06`（带横杠）会被接口忽略 → 返回全 0 的"本月暂无数据"。现 `finance_check` 已改为内部把调用方契约 `report_month=2026-06` 转换成 `start_date=202606&end_date=202606` 透传，实测 6 月可返回真实数据（revenue≈717,744、calc_revenue≈714,462、payout≈403,454 等）。调用方仍按 `report_month` 传参即可，无需改前端。
 - 该能力依赖 `TESS_DATA_CONNECTOR=teensing` 的真实连接器（mock 模式不支持）。
 
 ### 10.5 已实现的扩展场景（基于 §10.2 D 组主数据接口）
