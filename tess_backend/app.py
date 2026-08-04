@@ -496,19 +496,9 @@ def get_realtime_kpi_alerts(limit: int = 50, min_severity: str = None,
         items = batch["alerts"]
         as_of = batch["run_time"]
 
-    # 置顶演示记录：演示数据可能落在旧批次，被 cron 新批次覆盖后 latest_batch 捞不到。
-    # 用 event_id 直接定位合并，使其始终可见（不受批次覆盖影响，也无需临时开种子接口重种）。
-    demo_items = ALERTS.get_by_event_ids(DEMO_EVENT_IDS, source="realtime-kpi",
-                                         include_acked=include_acked)
-    if demo_items:
-        merged = {it["event_id"]: it for it in items}
-        for d in demo_items:
-            merged[d["event_id"]] = d  # 演示记录优先（覆盖同 id 的旧批次副本）
-        items = list(merged.values())
-        # as_of 取演示记录中最新的 run_time，保证前端游标语义合理
-        demo_max = max((d.get("run_time") or "") for d in demo_items)
-        if demo_max > (as_of or ""):
-            as_of = demo_max
+    # 注：演示记录（RT-HOUR-*）原先会被「按 event_id 强制置顶合并」始终显示，
+    # 现已移除该逻辑 —— 本接口只返回真实 cron 批次结果，不再混入任何 demo。
+    # 若曾灌过 demo，可用 POST /tess/dev/clear-demo 物理清库。
 
     items = _filter_by_min_severity(items, min_severity)
     items = _filter_by_min_revenue(items, min_revenue)
@@ -586,6 +576,38 @@ def dev_seed_demo(payload: dict = None) -> dict:
     run_time = time.strftime("%Y-%m-%d %H:%M:%S")
     written = ALERTS.save_batch(results, run_time=run_time)
     return {"ok": True, "written": written, "run_time": run_time}
+
+
+@app.post("/tess/dev/clear-demo")
+def dev_clear_demo(payload: dict = None) -> dict:
+    """开发/演示专用：从预警库物理删除演示数据（seed-demo 的逆操作）。
+
+    ⚠️ 安全开关：同 seed-demo，仅当 TESS_DEV_SEED=1/true 时启用；否则 403。
+    鉴权：仍受全局 X-API-Key 守卫。
+
+    body: { "source": "realtime-kpi" }   默认只清 realtime-kpi 的 demo（RT-HOUR-*），
+                                       即 /tess/realtime-kpi/alerts 接口掺入的测试数据；
+          { "source": "anomaly-warning" } 清 anomaly-warning 的 demo（AW-CAMP-*）；
+          { "all": true }                 清全部 demo（两个 source 都清）。
+    返回：{ ok, deleted, sources }
+    """
+    if os.getenv("TESS_DEV_SEED", "0").lower() not in ("1", "true", "yes", "on"):
+        raise HTTPException(
+            status_code=403, detail="dev clear disabled (set TESS_DEV_SEED=1 to enable)"
+        )
+    payload = payload or {}
+    if payload.get("all"):
+        sources = [None]
+    else:
+        src = payload.get("source")  # None -> 仅 realtime-kpi（本接口默认语义）
+        sources = [src or "realtime-kpi"]
+    total = 0
+    done = []
+    for s in sources:
+        n = ALERTS.delete_by_event_ids(DEMO_EVENT_IDS, source=s)
+        total += n
+        done.append({"source": s or "all", "deleted": n})
+    return {"ok": True, "deleted": total, "sources": done}
 
 
 @app.post("/tess/cron/run")

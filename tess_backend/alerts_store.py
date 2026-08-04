@@ -271,6 +271,26 @@ class AlertStore:
                 seen[a.event_id] = d
         return list(seen.values())[:limit]
 
+    def delete_by_event_ids(self, event_ids: list, source: Optional[str] = None) -> int:
+        """按 event_id 集合（可加 source 过滤）物理删除记录。返回删除条数。
+
+        用途：开发/演示清理 —— 把 demo 置顶记录（如 RT-HOUR-13/14/15、AW-CAMP-*）
+        从库里彻底移除，避免其继续污染接口响应。
+        """
+        if not event_ids:
+            return 0
+        from sqlalchemy import text as _text
+        placeholders = ", ".join(f":e{i}" for i in range(len(event_ids)))
+        params = {f"e{i}": v for i, v in enumerate(event_ids)}
+        sql = f"DELETE FROM alerts WHERE event_id IN ({placeholders})"
+        if source:
+            sql += " AND source = :src"
+            params["src"] = source
+        with self.Session() as s:
+            res = s.execute(_text(sql), params)
+            s.commit()
+            return res.rowcount or 0
+
     def ack(self, alert_id: int, resolution: str, acked_by: Optional[str] = None,
             note: Optional[str] = None) -> bool:
         """标记某条告警已被运营确认/处理。成功返回 True，id 不存在返回 False。
