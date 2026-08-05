@@ -120,6 +120,9 @@ def fetch_bi_analysis_context(
       'kpi_compare'            -> 指标趋势与同期对比（KPI 趋势 + 区间对比）
       'campaign_ranking'       -> 跨 Campaign 排名/诊断（涨跌榜 rising/falling，按 revenue_change 排序，答"哪个 Campaign 环比下滑最快"）
 
+      'pkg_deepdive'           -> 包名维度（/advertiser-publisher-pkg-maps 归因 + /report 聚合，答"com.x 这个包的跑量/转化"）
+      'owner_performance'      -> AM/BD 负责人维度（/advertisers?am|bd= 解析名下广告主 + /report 聚合，答"Betty 名下客户消耗"）
+
     返回结构化的上下文 dict，供 LLM 生成简报。每个子数据源独立容错：
     单个接口失败只会在对应字段标记 error，不会拖垮整个分析。
     """
@@ -321,12 +324,14 @@ def fetch_bi_analysis_context(
             or (e["total_conversions"] > 0 and e["postback_gap"] > 0.1 * e["total_conversions"])
         ]
 
-        # 若调用方指定 publisher_id，额外拉取该渠道的细分质量（/campaign-quality/publisher/channels）
+        # 若调用方同时指定 publisher_id 与 campaign_ids，额外拉取该渠道的细分质量
+        # （/campaign-quality/publisher/channels 实测需要 campaign_ids，否则 422；publisher 维度下钻无 campaign 上下文，跳过）
         channel_quality, err_ch = (None, None)
-        if params.get("publisher_id"):
+        if params.get("publisher_id") and params.get("campaign_ids"):
             channel_quality, err_ch = _safe_api_get(
                 connector, "/campaign-quality/publisher/channels",
-                params={"publisher_id": str(params["publisher_id"])}, token=token,
+                params={"publisher_id": str(params["publisher_id"]),
+                        "campaign_ids": params["campaign_ids"]}, token=token,
             )
 
         return {
@@ -591,12 +596,113 @@ def fetch_bi_analysis_context(
             "errors": [e for e in (err_fluc,) if e],
         }
 
+    # ---------------------------------------------------------------
+    # 场景 12：包名维度（跨 Campaign 消耗 / PKG 映射 / 转化率）
+    # ---------------------------------------------------------------
+    elif analysis_type == "pkg_deepdive":
+        pkg = params.get("package_name")
+        if not pkg:
+            return {"analysis_type": "pkg_deepdive",
+                    "errors": ["pkg_deepdive 需要 package_name（包名，如 com.xxx.yyy 或 pkg:xxx）"]}
+        pkg = str(pkg)
+        maps, err_m = _safe_api_get(
+            connector, "/advertiser-publisher-pkg-maps",
+            params={"packagename": pkg, "page": 1, "page_size": 100}, token=token)
+        m_items = (maps or {}).get("items", []) if isinstance(maps, dict) else []
+        adv_ids = sorted({_fmt_id(i.get("advertiser_id")) for i in m_items if i.get("advertiser_id")})
+        pub_ids = sorted({_fmt_id(i.get("publisher_id")) for i in m_items if i.get("publisher_id")})
+
+        start_7d = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+        end = today.strftime("%Y-%m-%d")
+        if adv_ids or pub_ids:
+            r_params = {"dimensions": "campaign,publisher", "date_start": start_7d, "date_end": end,
+                        "page": 1, "page_size": 100}
+            # 主过滤用广告主（pkg-maps 归因出的归属广告主）；仅当无广告主时才退化按渠道过滤（兜底，较粗）
+            if adv_ids:
+                r_params["advertiser_ids"] = ",".join(adv_ids)
+            elif pub_ids:
+                r_params["publisher_ids"] = ",".join(pub_ids)
+            report, err_r = _safe_api_get(connector, "/report", params=r_params, token=token)
+            r_items = (report or {}).get("items", []) if isinstance(report, dict) else []
+            # 注：/report 行 package_name 多为空，且映射渠道与实际投放渠道未必一致，
+            # 故不再按 package_name 二次过滤（否则整体归零）；归因透明度由下方 publisher_ids 字段保留。
+        else:
+            report, err_r = (None, None)
+            r_items = []
+        agg = _aggregate_report(r_items)
+        return {
+            "analysis_type": "pkg_deepdive",
+            "package_name": pkg,
+            "pkg_maps_count": len(m_items),
+            "advertiser_ids": adv_ids,
+            "publisher_ids": pub_ids,
+            "time_range": f"{start_7d} ~ {end}",
+            "metric_note": "包名系统级表现由 /advertiser-publisher-pkg-maps 解析出归属的广告主/渠道，再用 /report 聚合近 7 日营收/利润/Margin；若 pkg-maps 无该包登记，则无法归因系统级消耗（接口未提供 /report?package_name 过滤）。",
+            "report_summary": agg,
+            "report_rows": _pick_many(r_items,
+                ["date", "campaign_id", "campaign_name", "publisher_id", "publisher_name",
+                 "revenue", "profit", "payout", "clicks", "conversions", "cvr", "margin_rate"], 15),
+            "errors": [e for e in (err_m, err_r) if e],
+        }
+
+    # ---------------------------------------------------------------
+    # 场景 13：AM/BD 负责人维度（名下广告主实时消耗与对账）
+    # ---------------------------------------------------------------
+    elif analysis_type == "owner_performance":
+        uid = params.get("owner_user_id")
+        if not uid:
+            return {"analysis_type": "owner_performance",
+                    "errors": ["owner_performance 需要 owner_user_id（由负责人姓名经 /users/options 解析，或显式透传）"]}
+        role = params.get("owner_role") or None
+        # 未指定角色则 am/bd 双查取并集
+        adv_ids = set()
+        for r in (["am", "bd"] if role is None else [role]):
+            # 分页扫描（API 限制 page_size<=100，单角色最多取 5 页 = 500 个广告主）
+            for pg in range(1, 6):
+                advs, _ = _safe_api_get(connector, "/advertisers",
+                                        params={r: str(uid), "page": pg, "page_size": 100}, token=token)
+                items = (advs or {}).get("items", []) if isinstance(advs, dict) else []
+                if not items:
+                    break
+                for it in items:
+                    adv_ids.add(_fmt_id(it.get("id")))
+                if len(items) < 100:
+                    break
+        adv_ids = sorted(adv_ids)
+        start_7d = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+        end = today.strftime("%Y-%m-%d")
+        if adv_ids:
+            report, err_r = _safe_api_get(
+                connector, "/report",
+                params={"dimensions": "advertiser", "date_start": start_7d, "date_end": end,
+                        "advertiser_ids": ",".join(adv_ids), "page": 1, "page_size": 100}, token=token)
+            r_items = (report or {}).get("items", []) if isinstance(report, dict) else []
+        else:
+            report, err_r = (None, None)
+            r_items = []
+        agg = _aggregate_report(r_items)
+        return {
+            "analysis_type": "owner_performance",
+            "owner_role": role or "am+bd",
+            "owner_user_id": str(uid),
+            "owner_name": params.get("owner_name"),
+            "advertiser_count": len(adv_ids),
+            "advertiser_ids": adv_ids,
+            "time_range": f"{start_7d} ~ {end}",
+            "metric_note": "负责人名下广告主由 /advertisers?am= / ?bd= 解析；消耗经 /report(advertiser_ids) 聚合近 7 日营收/利润/Margin。注：Teensing 无 /advertisers/am/{id} 嵌套路由（实测 404），改走 am/bd 字段过滤。",
+            "report_summary": agg,
+            "report_rows": _pick_many(r_items,
+                ["date", "advertiser_id", "advertiser_name", "campaign_id", "campaign_name",
+                 "revenue", "profit", "payout", "clicks", "conversions"], 15),
+            "errors": [e for e in (err_r,) if e],
+        }
+
     else:
         raise ValueError(
             f"未知的 analysis_type={analysis_type!r}；"
             "支持: daily_summary / scaling_opportunity / finance_check / account_overview / "
             "publisher_deepdive / scaling_capacity / campaign_detail / advertiser_deepdive / "
-            "traffic_policy_check / kpi_compare / campaign_ranking"
+            "traffic_policy_check / kpi_compare / campaign_ranking / pkg_deepdive / owner_performance"
         )
 
 
@@ -700,6 +806,8 @@ def _build_user_prompt(analysis_type: str, ctx: dict) -> str:
         "traffic_policy_check": "以下是该渠道/活动的映射、替换与屏蔽规则，请核查流量策略配置是否完整、是否存在风险。",
         "kpi_compare": "以下是该 Campaign 的指标趋势与同期对比，请分析波动原因与环比变化。",
         "campaign_ranking": "以下是各 Campaign 的环比涨跌榜（rising/falling，字段含 campaign_id、campaign_name、revenue、revenue_change）。请找出利润/营收环比下滑最快的 Campaign，给出 campaign_id、名称、下滑幅度与可能原因。注意：涨跌榜口径为营收(revenue)环比，接口未提供独立利润(profit)环比字段，若用户问「利润」请明确说明并以营收环比作答。",
+        "pkg_deepdive": "以下是该包名在系统中的归属（广告主/渠道映射）与近 7 日跨 Campaign 营收/利润/Margin 表现，请分析该包的跑量情况、主要投放渠道与转化效率，并说明数据口径（来自 pkg-maps 归因 + /report 聚合，非单 campaign 视角）。",
+        "owner_performance": "以下是该 AM/BD 负责人名下所有广告主近 7 日的消耗与利润表现，请汇总其业绩（总营收/利润、头部广告主、异常项），并说明数据口径（/advertisers?am|bd= 解析名下广告主 + /report 聚合）。",
     }.get(analysis_type, "请基于以下数据做商业分析。")
 
     return (
@@ -792,6 +900,8 @@ ANALYSIS_TYPES = {
     "traffic_policy_check",
     "kpi_compare",
     "campaign_ranking",
+    "pkg_deepdive",
+    "owner_performance",
 }
 
 # 关键词路由表（优先级自上而下：先匹配更具体的类型）。
@@ -807,6 +917,8 @@ _ANALYSIS_KEYWORDS: list = [
     ("advertiser_deepdive", ["广告主", "advertiser", "主户", "客户"]),
     ("traffic_policy_check", ["替换渠道", "切量", "切流量", "流量策略", "屏蔽", "block", "replace", "映射", "渠道映射"]),
     ("campaign_ranking", ["利润环比下滑", "利润下滑", "营收下滑", "环比下滑", "下滑最快", "跌幅最大", "掉得最快", "降幅最大", "哪个campaign", "哪个活动", "哪个 campaign", "谁掉得最快", "利润下降最快", "营收下降最快"]),
+    ("pkg_deepdive", ["包名", "这个包", "应用包", "包的表现", "包跑量", "package", "pkg"]),
+    ("owner_performance", ["负责人名下", "am 名下", "bd 名下", "名下客户", "名下广告主", "业绩盘点", "手上的客户", "负责的渠道"]),
     ("kpi_compare", ["环比", "对比", "波动", "暴跌", "暴涨", "趋势", "trend", "对比昨日"]),
 ]
 
@@ -828,63 +940,231 @@ def infer_analysis_type(question: str) -> Optional[str]:
     return None
 
 
-def extract_entity_id(question: str, params: Optional[dict]) -> tuple:
-    """从自然语言问题 + 显式参数中识别实体 id，映射到对应的深度 analysis_type。
+def extract_entities(question: str, params: Optional[dict]) -> dict:
+    """从自然语言问题中抽取五维实体（Campaign / Advertiser / Publisher / Package / Owner）。
 
-    优先级：显式参数(campaign_id/advertiser_id/publisher_id) > 问题里的正则实体。
-    这是比关键词表更高优先级的路由判断（解决"5845554camp 的 ctit"这类实体下钻问题）。
-    返回 (analysis_type, params)；未识别到实体则返回 (None, params)。
+    返回实体 dict（均为已识别的原始值，id 类可能为 None，名称/代号类记录待解析）：
+        {
+          "campaign_id":   str|None,
+          "advertiser_id": str|None, "advertiser_name": str|None,
+          "publisher_id":  str|None, "publisher_name": str|None, "channel": str|None,
+          "package_name":  str|None,
+          "owner_name":    str|None, "owner_role": "am"|"bd"|None,
+          "owner_user_id": str|None,
+        }
+    显性参数（params 里已带的 id）优先级最高，直接采纳。
 
-    支持两种语序：
-      - 数字 + 关键字：如 "5845554camp" / "5845554 campaign"
-      - 关键字 + 数字：如 "campaign id5845554" / "campaign 5845554" / "cid: 5845554"
-      - ctit/etit 语境下，若问题含 "id1234567" 紧贴写法，也补抽为 campaign_id
+    注意：仅做「抽取」，不做名称->id 的 API 解析；解析在 resolve_entities 中完成
+    （需要 connector）。两条语序都支持：数字+关键字 与 关键字+数字。
     """
     params = params or {}
     q = (question or "").lower()
-
-    # 1) 显式参数优先
+    out = {
+        "campaign_id": None, "advertiser_id": None, "advertiser_name": None,
+        "publisher_id": None, "publisher_name": None, "channel": None,
+        "package_name": None, "owner_name": None, "owner_role": None,
+        "owner_user_id": None,
+    }
+    # 1) 显性参数优先（前端胶囊/显式透传）
     if params.get("campaign_id"):
-        return "campaign_detail", params
+        out["campaign_id"] = str(params["campaign_id"])
     if params.get("advertiser_id"):
-        return "advertiser_deepdive", params
+        out["advertiser_id"] = str(params["advertiser_id"])
     if params.get("publisher_id"):
-        return "publisher_deepdive", params
+        out["publisher_id"] = str(params["publisher_id"])
+    if params.get("package_name"):
+        out["package_name"] = str(params["package_name"])
+    if params.get("owner_user_id"):
+        out["owner_user_id"] = str(params["owner_user_id"])
+        out["owner_name"] = params.get("owner_name") or out["owner_name"]
+        out["owner_role"] = params.get("owner_role") or out["owner_role"]
 
-    # 通用：关键字在前、数字在后（中间可夹 "id" / 分隔符），最多跳过 15 个非数字字符
-    # 注意：不用 \\b 收尾，避免中文关键字（广告主/渠道）后无单词边界导致整体失配
-    KW_BEFORE_NUM = r"(?:{kw})[^\d]{{0,15}}?(\d{{4,}})"
+    # 通用：关键字在前、数字/代号在后，中间最多 15 个非数字字符（支持夹 id/分隔符）
+    KW_BEFORE = r"(?:{kw})[^\d]{{0,15}}?(\d{{4,}})"
 
-    # 2) campaign：数字+关键字，或 关键字+数字，或 ctit/etit 语境
-    camp_m = re.search(r"(\d{4,})\s*(?:camp|campaign)\b", q)            # 5845554camp
-    if not camp_m:
-        camp_m = re.search(KW_BEFORE_NUM.format(kw=r"camp|campaign|cid|campaign_id"), q)  # campaign id5845554
-    has_ctit = re.search(r"\b(ctit|etit)\b", q)
-    if camp_m or has_ctit:
-        cid = camp_m.group(1) if camp_m else None
-        if not cid and has_ctit:
-            # 仅 ctit/etit 语境：从 "id1234567" / "#1234567" 紧贴写法补抽 campaign_id
-            m2 = re.search(r"(?:id|#)\s*(\d{4,})", q)
-            cid = m2.group(1) if m2 else None
-        if cid:
-            return "campaign_detail", {**params, "campaign_id": cid}
-        # ctit/etit 但问题里没有可识别的 id，无法下钻，交由关键词/浅层兜底
-        return None, params
+    # 2) Campaign（数字+camp / 关键字+数字 / id\d+ 紧贴 ctit/etit）
+    if not out["campaign_id"]:
+        m = re.search(r"(\d{4,})\s*(?:camp|campaign)\b", q)
+        if not m:
+            m = re.search(KW_BEFORE.format(kw=r"camp|campaign|cid|campaign_id"), q)
+        if m:
+            out["campaign_id"] = m.group(1)
+        else:
+            has_ctit = re.search(r"\b(ctit|etit)\b", q)
+            if has_ctit:
+                m2 = re.search(r"(?:id|#)\s*(\d{4,})", q)
+                if m2:
+                    out["campaign_id"] = m2.group(1)
 
-    # 3) 广告主 / 客户（同样支持两种语序）
-    adv_m = re.search(r"(\d{4,})\s*(?:adv|advertiser|广告主)\b", q)
-    if not adv_m:
-        adv_m = re.search(KW_BEFORE_NUM.format(kw=r"adv|advertiser|广告主"), q)
-    if adv_m:
-        return "advertiser_deepdive", {**params, "advertiser_id": adv_m.group(1)}
+    # 3) Advertiser（adv_数字 / advertiser 数字 / 广告主+名称）
+    if not out["advertiser_id"]:
+        m = (re.search(r"adv[:_\s]*(\d{4,})", q)
+             or re.search(r"(\d{4,})\s*(?:adv|advertiser)\b", q)
+             or re.search(r"(?:adv|advertiser|广告主|客户)[\s_:：\-]{0,5}(\d{4,})", q))
+        if m:
+            out["advertiser_id"] = m.group(1)
+        else:
+            # 名称形式：广告主/客户 前或后紧跟 ASCII 名称（如 oppo-mmp-Betty / Adv_xxx）
+            m2 = (re.search(r"([A-Za-z0-9][A-Za-z0-9_\-]{2,})\s*(?:这个广告主|的广告主|这个客户|的客户|广告主)", q)
+                  or re.search(r"(?:广告主|客户)[\s_:：\-]{0,5}([A-Za-z0-9][A-Za-z0-9_\-]{2,})", q))
+            if m2:
+                out["advertiser_name"] = m2.group(1)
 
-    # 4) 渠道 / publisher（同样支持两种语序）
-    pub_m = re.search(r"(\d{4,})\s*(?:pub|publisher|渠道)\b", q)
-    if not pub_m:
-        pub_m = re.search(KW_BEFORE_NUM.format(kw=r"pub|publisher|渠道"), q)
-    if pub_m:
-        return "publisher_deepdive", {**params, "publisher_id": pub_m.group(1)}
+    # 4) Publisher（pub_数字 / publisher 数字 / 渠道 数字 / sub_mkt 代号 / 渠道+名称）
+    if not out["publisher_id"]:
+        m = (re.search(r"pub[:_\s]*(\d{2,})", q)
+             or re.search(r"(\d{2,})\s*(?:pub|publisher)\b", q)
+             or re.search(r"(?:pub|publisher|渠道|媒体)[\s_:：\-]{0,5}(\d{2,})", q))
+        if m:
+            out["publisher_id"] = m.group(1)
+        if not out["publisher_id"] and not out["publisher_name"]:
+            # 渠道代号（sub_mkt_X 或 ASCII 代号）或渠道名称；纯 ASCII 限定避免误吞中文词
+            m2 = (re.search(r"([A-Za-z0-9_]*sub_mkt[A-Za-z0-9_\-]*)", q)
+                  or re.search(r"([A-Za-z0-9][A-Za-z0-9_\-]{2,})\s*(?:这个渠道|的渠道|这个媒体|的媒体|渠道)", q)
+                  or re.search(r"(?:渠道|媒体)[\s_:：\-]{0,5}([A-Za-z0-9][A-Za-z0-9_\-]{2,})", q))
+            if m2:
+                tok = m2.group(1)
+                if tok.isdigit():
+                    out["publisher_id"] = tok
+                elif tok.lower().startswith("sub_mkt") or re.search(r"[A-Za-z]", tok):
+                    out["channel"] = tok
+                else:
+                    out["publisher_name"] = tok
 
+    # 5) Package Name（com.x.y 点分标识符 / pkg: / 包名）
+    if not out["package_name"]:
+        m = (re.search(r"([a-z][a-z0-9_]*\.[a-z0-9_]+(?:\.[a-z0-9_]+)+)", q)
+             or re.search(r"pkg[:\s:]*([\w.]+)", q)
+             or re.search(r"包名[^\w]{0,5}([\w.]+)", q))
+        if m:
+            out["package_name"] = m.group(1)
+
+    # 6) Owner（AM/BD/负责人 + 名称；或「名称 的客户/负责的/手上的/名下」）
+    if not out["owner_name"] and not out["owner_user_id"]:
+        m = re.search(r"\b(am|bd|负责人)[\s:：]*([\w\u4e00-\u9fa5]+)", q)
+        if m:
+            role = m.group(1).lower()
+            out["owner_role"] = "am" if role == "am" else ("bd" if role == "bd" else None)
+            out["owner_name"] = m.group(2)
+        else:
+            m2 = re.search(r"([\w\u4e00-\u9fa5]+)(?:\s*(?:的客户|负责的|手上|名下|管理))", q)
+            if m2:
+                out["owner_name"] = m2.group(1)
+    return out
+
+
+def resolve_entities(entities: dict, connector, token: Optional[str] = None) -> dict:
+    """把 extract_entities 抽出的名称/代号解析成可下钻的 id（需要 connector 调 API）。
+
+    成功解析则回填对应 *_id 字段；解析失败保持 None，由上层路由决定兜底。
+    解析路径（均经实测存在）：
+      - 广告主名 -> /advertisers 列表扫描 name 子串（API 的 name/search 过滤无效）
+      - 渠道代号 -> /mapping-publisher-channels?channel= 反解 publisher_id
+      - 渠道名   -> /publishers 列表扫描 name 子串
+      - 负责人名 -> /users/options 扁平用户目录按 name/real_name 子串匹配
+    """
+    e = dict(entities)
+
+    # 广告主名称 -> id
+    if not e.get("advertiser_id") and e.get("advertiser_name"):
+        aid = _find_in_list(connector, "/advertisers", e["advertiser_name"], token,
+                            id_field="id", name_field="name")
+        if aid:
+            e["advertiser_id"] = aid
+
+    # 渠道：代号 -> 映射反解；名称 -> 列表扫描
+    if not e.get("publisher_id") and (e.get("publisher_name") or e.get("channel")):
+        if e.get("channel"):
+            ch, _ = _safe_api_get(connector, "/mapping-publisher-channels",
+                                  params={"channel": e["channel"], "page": 1, "page_size": 5}, token=token)
+            items = (ch or {}).get("items", []) if isinstance(ch, dict) else []
+            if items:
+                e["publisher_id"] = _fmt_id(items[0].get("publisher_id"))
+        if not e.get("publisher_id") and e.get("publisher_name"):
+            pid = _find_in_list(connector, "/publishers", e["publisher_name"], token,
+                                id_field="id", name_field="name")
+            if pid:
+                e["publisher_id"] = pid
+
+    # 负责人名称 -> user id
+    if not e.get("owner_user_id") and e.get("owner_name"):
+        opts, _ = _safe_api_get(connector, "/users/options", token=token)
+        opts = opts if isinstance(opts, list) else []
+        target = e["owner_name"].lower()
+        for u in opts:
+            nm = str(u.get("name") or "").lower()
+            rn = str(u.get("real_name") or "").lower()
+            if target in nm or target in rn or nm.startswith(target) or rn.startswith(target):
+                e["owner_user_id"] = _fmt_id(u.get("id"))
+                break
+    return e
+
+
+def _find_in_list(connector, path, name, token, id_field="id", name_field="name", max_pages=10):
+    """分页扫描某列表接口，按 name 子串匹配返回首个 id（用于名称->id 解析）。"""
+    target = (name or "").lower()
+    if not target:
+        return None
+    for pg in range(1, max_pages + 1):
+        d, _ = _safe_api_get(connector, path, params={"page": pg, "page_size": 100}, token=token)
+        items = (d or {}).get("items", []) if isinstance(d, dict) else []
+        if not items:
+            break
+        for it in items:
+            nm = str(it.get(name_field) or "").lower()
+            if target in nm or nm.startswith(target):
+                return _fmt_id(it.get(id_field))
+        if len(items) < 100:
+            break
+    return None
+
+
+def _aggregate_report(items):
+    """把 /report 多行归集为 total / by_campaign / by_publisher 汇总。"""
+    if not items:
+        return {"total": {"revenue": 0, "profit": 0, "payout": 0, "clicks": 0, "conversions": 0},
+                "by_campaign": [], "by_publisher": []}
+    tot = {"revenue": 0.0, "profit": 0.0, "payout": 0.0, "clicks": 0, "conversions": 0}
+    by_c, by_p = {}, {}
+    for it in items:
+        rev = _to_float(it.get("revenue")); pr = _to_float(it.get("profit"))
+        po = _to_float(it.get("payout")); cl = int(_to_float(it.get("clicks")))
+        cv = int(_to_float(it.get("conversions")))
+        tot["revenue"] += rev; tot["profit"] += pr; tot["payout"] += po
+        tot["clicks"] += cl; tot["conversions"] += cv
+        ckey = _fmt_id(it.get("campaign_id"))
+        if ckey:
+            c = by_c.setdefault(ckey, {"campaign_id": ckey, "campaign_name": it.get("campaign_name"),
+                                      "revenue": 0.0, "profit": 0.0, "conversions": 0})
+            c["revenue"] += rev; c["profit"] += pr; c["conversions"] += cv
+        pkey = _fmt_id(it.get("publisher_id"))
+        if pkey:
+            p = by_p.setdefault(pkey, {"publisher_id": pkey, "publisher_name": it.get("publisher_name"),
+                                      "revenue": 0.0, "profit": 0.0, "conversions": 0})
+            p["revenue"] += rev; p["profit"] += pr; p["conversions"] += cv
+    for c in by_c.values():
+        c["revenue"] = round(c["revenue"], 2); c["profit"] = round(c["profit"], 2)
+    for p in by_p.values():
+        p["revenue"] = round(p["revenue"], 2); p["profit"] = round(p["profit"], 2)
+    return {
+        "total": {k: round(v, 2) for k, v in tot.items()},
+        "by_campaign": sorted(by_c.values(), key=lambda x: x["revenue"], reverse=True)[:8],
+        "by_publisher": sorted(by_p.values(), key=lambda x: x["revenue"], reverse=True)[:8],
+    }
+
+
+def extract_entity_id(question: str, params: Optional[dict]) -> tuple:
+    """向后兼容薄封装：返回 (analysis_type 或 None, params)。
+
+    新代码建议直接用 extract_entities + resolve_entities。此处保留以兼容旧调用方。
+    """
+    ents = extract_entities(question, params)
+    if ents.get("campaign_id"):
+        return "campaign_detail", {**params, "campaign_id": ents["campaign_id"]}
+    if ents.get("advertiser_id"):
+        return "advertiser_deepdive", {**params, "advertiser_id": ents["advertiser_id"]}
+    if ents.get("publisher_id"):
+        return "publisher_deepdive", {**params, "publisher_id": ents["publisher_id"]}
     return None, params
 
 
@@ -936,7 +1216,10 @@ def process_question(
 
     上下文选择优先级（①②③ 走深度取数层，④ 走浅层全局兜底）：
       ① 显式 analysis_type（前端胶囊透传）        -> route_source="explicit"
-      ② 问题正则识别实体 id（extract_entity_id）  -> campaign/advertiser/publisher id 下钻，route_source="entity"
+      ② 五维实体抽取（extract_entities+resolve_entities）-> 按命中优先级
+         campaign_id > advertiser_id > publisher_id > package_name > owner_user_id
+         各自下钻到 campaign_detail / advertiser_deepdive / publisher_deepdive /
+         pkg_deepdive / owner_performance，route_source="entity"
       ③ 关键词推断 analysis_type（infer_analysis_type）-> 命中则同样走深度上下文，route_source="inferred"
       ④ 三者皆无/不合法                           -> 退回浅层全局上下文 fetch_qa_context（原行为，无 route_source）
 
@@ -949,8 +1232,23 @@ def process_question(
     if analysis_type in ANALYSIS_TYPES:
         route_source = "explicit"
     else:
-        # ② 实体正则提取（优先级高于关键词表）：识别 campaign/advertiser/publisher id
-        ent_type, params = extract_entity_id(question, params)
+        # ② 五维实体抽取（优先级高于关键词表）：Campaign/Advertiser/Publisher/Package/Owner
+        ents = extract_entities(question, params)
+        ents = resolve_entities(ents, connector, token)  # 名称/代号 -> 可下钻 id
+        params = params or {}  # 确保后续 {**params, ...} 字典展开安全（process_question 默认 params=None）
+        ent_type = None
+        if ents.get("campaign_id"):
+            ent_type, params = "campaign_detail", {**params, "campaign_id": ents["campaign_id"]}
+        elif ents.get("advertiser_id"):
+            ent_type, params = "advertiser_deepdive", {**params, "advertiser_id": ents["advertiser_id"]}
+        elif ents.get("publisher_id"):
+            ent_type, params = "publisher_deepdive", {**params, "publisher_id": ents["publisher_id"]}
+        elif ents.get("package_name"):
+            ent_type, params = "pkg_deepdive", {**params, "package_name": ents["package_name"]}
+        elif ents.get("owner_user_id"):
+            ent_type, params = "owner_performance", {**params, "owner_user_id": ents["owner_user_id"],
+                                                    "owner_role": ents.get("owner_role"),
+                                                    "owner_name": ents.get("owner_name")}
         if ent_type:
             analysis_type = ent_type
             route_source = "entity"

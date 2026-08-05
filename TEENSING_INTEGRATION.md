@@ -429,13 +429,17 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
   "analysis_type": "daily_summary" | "scaling_opportunity" | "finance_check"
                 | "account_overview" | "publisher_deepdive" | "scaling_capacity"
                 | "campaign_detail" | "advertiser_deepdive" | "traffic_policy_check" | "kpi_compare"
-                | "campaign_ranking",
-  // 实体下钻类型（campaign_detail / advertiser_deepdive / traffic_policy_check / kpi_compare）需要对应实体 id
+                | "campaign_ranking" | "pkg_deepdive" | "owner_performance",
+  // 共 13 种（新增 pkg_deepdive 包名维度 / owner_performance 负责人维度）
+  // 实体下钻类型（campaign_detail / advertiser_deepdive / traffic_policy_check / kpi_compare /
+  //   pkg_deepdive / owner_performance / publisher_deepdive）需要对应实体 id
   // campaign_ranking 为跨 Campaign 排名/诊断类型，无需实体 id，按营收环比涨跌榜作答（如"哪个 Campaign 利润环比下滑最快"）
   // 实体 id 可放在顶层或 params 内：
   "campaign_id": 5845554,        // campaign_detail / kpi_compare 必填
   "advertiser_id": 1000734,      // advertiser_deepdive 必填
-  "publisher_id": 1000571,       // traffic_policy_check 选填（也可只传 campaign_id 自动解析 publisher）
+  "publisher_id": 1000571,       // publisher_deepdive / traffic_policy_check 选填（也可只传 campaign_id 自动解析 publisher）
+  "package_name": "com.xxx.yyy", // pkg_deepdive 必填（包名，经 /advertiser-publisher-pkg-maps 归因广告主/渠道）
+  "owner_user_id": 118,          // owner_performance 必填（AM/BD 负责人 user id；可由姓名经 /users/options 解析）
   "params": { "report_month": "2026-08" }   // 仅 finance_check 可选
 }
 ```
@@ -499,7 +503,7 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 
 #### E. 实体下钻与流量策略（新增，已探测确认）
 
-随「完全体路由网关」扩张接入，支撑单 Campaign / 广告主 / 流量策略 / KPI 对比四类深度下钻。
+随「完全体路由网关」扩张接入，支撑单 Campaign / 广告主 / 渠道 / 包名 / 负责人五维实体深度下钻（见 §10.5 全量 13 种场景）。
 
 | 端点 | 入参（实测正确名） | 关键字段 | 已用于场景 |
 |---|---|---|---|
@@ -512,12 +516,17 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 | `GET /mapping-publisher-channels` | `publisher_id` | `items[]`（渠道映射） | `traffic_policy_check` |
 | `GET /replace-channels` | `publisher_id` | `items[]`（替换渠道规则） | `traffic_policy_check` |
 | `GET /publisher-campaign-blocks` | `publisher_id` 或 `campaign_id` | `items[]`（屏蔽规则） | `traffic_policy_check` |
+| `GET /advertisers?am=<id>` / `?bd=<id>` | 字段过滤（**非** `/advertisers/am/{id}` 嵌套路由，后者实测 404） | `items[]`（该负责人名下广告主） | `owner_performance` |
+| `GET /advertiser-publisher-pkg-maps` | `packagename=`（注意是 `packagename` 非 `package_name`；模糊匹配） | `items[]: {advertiser_id, publisher_id, packagename}` | `pkg_deepdive`（包名→广告主/渠道归因） |
+| `GET /users/options` | 无（扁平用户目录，实测仅返回少量用户） | `items[]: {id, name, real_name}` | `owner_performance`（负责人姓名→user id 解析） |
 
 > ⚠️ **参数易错点**：`/campaign-ctit-etit` 真实入参是**单数 `campaign_id`**（其余 Campaign 级接口多是复数 `campaign_ids`）；`traffic_policy_check` 若只给 `campaign_id`，代码会先调 `/campaigns?campaign_ids=...` 反解出 `publisher_id` 再去拉映射/替换/屏蔽规则。
+> ⚠️ **负责人（AM/BD）解析**：Teensing **无** `/advertisers/am/{id}` / `/advertisers/bd/{id}` 嵌套路由（实测 404），必须走 `/advertisers?am=<id>` / `?bd=<id>` 字段过滤；负责人姓名→id 经 `/users/options` 扁平目录解析，但该目录**覆盖有限**（实测仅返回少数用户），故自然语言说「Betty 名下客户」时，若 Betty 不在该目录内会解析失败、退回兜底。
+> ⚠️ **包名归因**：`/advertiser-publisher-pkg-maps` 的 `packagename=` 为**模糊匹配**（如 `link.merge.puzzle.onnect.number` 会命中 199 条跨多广告主的映射）；`pkg_deepdive` 取回的 `advertiser_ids` 即包名在系统内的归属广告主集合，再用 `/report` 聚合近 7 日表现。Teensing 接口**未提供** `/report?package_name=` 直接过滤，故包名维度必须经由 pkg-maps 归因。
 
 #### 已确认不可用（HTTP 404，勿依赖）
 
-`/external/invoices`、`/overview/summary|performance|kpi|quality|conversion|advertiser`、`/report/day|daily|campaign|publisher`、`/campaign-quality/campaign|advertiser`、`/campaign/list`、`/statistics/overview`、`/dashboard`、`/metrics`、`/kpi`。
+`/external/invoices`、`/overview/summary|performance|kpi|quality|conversion|advertiser`、`/report/day|daily|campaign|publisher`、`/campaign-quality/campaign|advertiser`、`/campaign/list`、`/statistics/overview`、`/dashboard`、`/metrics`、`/kpi`、**`/advertisers/am/{id}` / `/advertisers/bd/{id}`（嵌套路由 404，改走 `?am=` / `?bd=` 字段过滤）**。
 
 > 注：`/report/export` 存在但返回文件流（CSV / 带 UTF-8 BOM），非 JSON，不适合直接喂给 LLM 简报，故未列入。
 
@@ -553,8 +562,10 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 | `traffic_policy_check` | 流量策略核查：渠道映射 / 替换渠道 / 屏蔽规则 | `/mapping-publisher-channels` + `/replace-channels` + `/publisher-campaign-blocks`（仅给 campaign_id 时先 `/campaigns` 反解 publisher_id） | `mapping_publisher_channels`（映射）、`replace_channels`（替换规则）、`blocks`（屏蔽规则） |
 | `kpi_compare` | 单 Campaign 指标趋势与同期对比 | `/campaign-kpi-trend`(campaign_ids) + `/campaign-compare`(campaign_ids + date_start/date_end) | `kpi_trend`（近期时序）、`compare`（区间环比对照，默认最近 7 日→今日） |
 | `campaign_ranking` | 跨 Campaign 排名/诊断：哪个 Campaign 环比下滑最快 | `/overview/ranking/fluctuation`（rising/falling 涨跌榜，按 `revenue_change` 排序） | `rising_top` / `falling_top`（各 Top10，`falling_top` 已按 `revenue_change` 升序，[0] 即下滑最快）、`metric_note`（口径说明：接口仅提供营收环比，未提供独立利润环比） |
+| `pkg_deepdive` | 单个包名（Package Name）维度：该包在系统内归属的广告主/渠道及近 7 日跨 Campaign 跑量/利润/Margin | `/advertiser-publisher-pkg-maps?packagename=`（归因 `advertiser_ids`/`publisher_ids`）+ `/report`(`dimensions=campaign,publisher`, `advertiser_ids`) | `package_name`, `pkg_maps_count`, `advertiser_ids`, `publisher_ids`, `report_summary`(total/by_campaign/by_publisher) |
+| `owner_performance` | AM/BD 负责人维度：名下所有广告主近 7 日消耗与利润表现 | `/advertisers?am=\|?bd=`（解析名下广告主）+ `/report`(`dimensions=advertiser`, `advertiser_ids`) | `owner_role`, `owner_user_id`, `advertiser_count`, `advertiser_ids`, `report_summary` |
 
-> 前三个场景（`account_overview` / `publisher_deepdive` / `scaling_capacity`）支持「全局/账户级」自动研判；`campaign_ranking` 为跨 Campaign 排名/诊断类型（无需实体 id，按营收环比涨跌榜作答）；其余四个（`campaign_detail` / `advertiser_deepdive` / `traffic_policy_check` / `kpi_compare`）为**实体下钻类型**，必须由请求显式传入实体 id（顶层或 `params` 内），或在 `/tess/ask` 里由问题正则自动抽取（见 §10.6 ②）。
+> 前三个场景（`account_overview` / `publisher_deepdive` / `scaling_capacity`）支持「全局/账户级」自动研判；`campaign_ranking` 为跨 Campaign 排名/诊断类型（无需实体 id，按营收环比涨跌榜作答）；其余六个（`campaign_detail` / `advertiser_deepdive` / `publisher_deepdive` / `traffic_policy_check` / `kpi_compare` / `pkg_deepdive` / `owner_performance`）为**实体下钻类型**，必须由请求显式传入实体 id（顶层或 `params` 内），或在 `/tess/ask` 里由问题五维正则自动抽取（见 §10.6 ②）。
 
 **实现要点（实测验证）：**
 - `/campaigns` 支持 `campaign_ids=逗号列表` 精确过滤（上限 `page_size=100`）；`scaling_capacity` 先聚合 `/report` 拿到相关 campaign_id，再分批（每批≤100）回查 cap，避免 3M 全量拉取与 422 报错。
@@ -570,11 +581,17 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 
 **深度下钻（可选）**：`/tess/ask` 不只能答浅层全局问题，还复用 `/tess/analytics` 同一套深度取数层（`fetch_bi_analysis_context`）。上下文选择优先级（①②③ 走深度上下文，④ 走浅层兜底）：
 1. **显式透传**：请求体带 `analysis_type`（前端胶囊直接透传，确定性最强）→ `route_source="explicit"`；
-2. **实体正则识别（新增）**：不带 `analysis_type`、但问题里含实体 id 时，用 `extract_entity_id()` 正则抽取并映射到对应深度类型。**支持两种语序**（数字+关键字 或 关键字+数字，中间可夹 `id`/分隔符）——如 `5845554camp` / `campaign id5845554` / `campaign 5845554` / 含 `ctit|etit`（并可从 `id5845554` 紧贴写法补抽）→ `campaign_detail`（自动取 campaign_id）；`广告主 1000734` / `1000734adv` → `advertiser_deepdive`；`1000571pub` / `1000571渠道` → `publisher_deepdive`；命中即下钻，`route_source="entity"`；
+2. **实体正则识别（五维实体下钻）**：不带 `analysis_type`、但问题里含实体时，用 `extract_entities()` 抽取并在 `resolve_entities()` 里把名称/代号解析成可下钻 id（名称→id 解析经 `/advertisers`/`/publishers`/`/advertiser-publisher-pkg-maps`/`/users/options` 列表扫描）。**命中优先级** `campaign_id > advertiser_id > publisher_id > package_name > owner_user_id`，各自下钻到 `campaign_detail` / `advertiser_deepdive` / `publisher_deepdive` / `pkg_deepdive` / `owner_performance`。支持两种语序与多种写法，例如：
+   - **Campaign**：`5845554camp` / `campaign id5845554` / `campaign 5845554` / 含 `ctit|etit`（可紧贴 `id5845554` 补抽）→ `campaign_detail`
+   - **Advertiser**：`广告主 1000734` / `1000734adv` / `oppo-mmp-Betty 这个广告主`（名称自动抽取）→ `advertiser_deepdive`
+   - **Publisher**：`1000571pub` / `1000571渠道` / `Pub_1000684`（数字 id 或 `pub_` 前缀）→ `publisher_deepdive`
+   - **Package**：`com.melodong.game 这个包` / `link.merge.puzzle.onnect.number 这个包的营收` → `pkg_deepdive`（经 pkg-maps 归因广告主/渠道）
+   - **Owner（AM/BD）**：`AM 118 名下客户` / `Betty 手上的客户`（姓名经 `/users/options` 解析；目录覆盖有限时退回兜底）→ `owner_performance`
+   命中即下钻，`route_source="entity"`；
 3. **后端关键词推断**：都不命中时，用轻量关键词把问题映射到深度类型（如「放量空间」→ `scaling_capacity`、「对账」→ `finance_check`、`ctit`/`漏斗` → `campaign_detail`、`对比`/`趋势` → `kpi_compare`、「利润环比下滑最快」/`哪个 Campaign 掉最快` → `campaign_ranking`），命中即下钻，`route_source="inferred"`；
 4. **浅层兜底**：①②③ 皆未命中 → 退回原「全局态势」上下文（`fetch_qa_context`），保证仍能量身答（无 `route_source` 字段）。
 
-> 注意优先级：② 实体正则高于 ③ 关键词表，因此「帮我分析一下这个 5845554camp 的 ctit」或「campaign id5845554 的 ctit」都会精确落到 `campaign_detail`（而非被笼统的关键词命中），不再出现"数据不足"。顶层或 `params` 内显式传入的 `campaign_id` / `advertiser_id` / `publisher_id` 会直接覆盖正则推断。
+> 注意优先级：② 实体正则高于 ③ 关键词表，因此「帮我分析一下这个 5845554camp 的 ctit」或「campaign id5845554 的 ctit」都会精确落到 `campaign_detail`（而非被笼统的关键词命中），不再出现"数据不足"。顶层或 `params` 内显式传入的 `campaign_id` / `advertiser_id` / `publisher_id` / `package_name` / `owner_user_id` 会直接覆盖正则推断。
 
 ```
 POST /tess/ask
@@ -586,15 +603,21 @@ X-Operator-Id: <运营ID>             # 可选，审计
 # 方式 A：纯自由提问（后端自动判断是否下钻）
 { "question": "昨天整体营收表现如何？有没有需要重点关注的异常？" }
 
-# 方式 B：前端胶囊显式下钻（analysis_type 与 /tess/analytics 同枚举，共 11 种）
+# 方式 B：前端胶囊显式下钻（analysis_type 与 /tess/analytics 同枚举，共 13 种）
 { "question": "各 Campaign 还有多少放量空间？", "analysis_type": "scaling_capacity", "params": {} }
 # 财务对账可带月份：{ "question": "本月对账", "analysis_type": "finance_check", "params": { "report_month": "2026-08" } }
 # 实体下钻：显式传 id（顶层或 params 内皆可）
 { "question": "分析 5845554 的 ctit", "campaign_id": 5845554 }
 { "question": "广告主 1000734 最近表现", "advertiser_id": 1000734 }
 { "question": "渠道 1000571 的替换与屏蔽规则", "publisher_id": 1000571 }
+{ "question": "com.melodong.game 这个包近 7 日营收与利润", "package_name": "com.melodong.game" }   # pkg_deepdive
+{ "question": "AM 118 名下客户近 7 日总营收", "analysis_type": "owner_performance",
+  "params": { "owner_user_id": "118", "owner_role": "am", "owner_name": "am118" } }   # owner_performance
 # 或不传 id、让问题正则自动抽取：
 { "question": "帮我分析一下这个 5845554camp 的 ctit" }   # -> 自动识别 campaign_detail + campaign_id=5845554
+{ "question": "oppo-mmp-Betty 这个广告主最近跑得怎么样" }   # -> 自动识别 advertiser_deepdive
+{ "question": "Pub_1000684 这个渠道质量如何" }   # -> 自动识别 publisher_deepdive
+{ "question": "link.merge.puzzle.onnect.number 这个包近 7 日的营收和利润怎么样" }   # -> 自动识别 pkg_deepdive
 ```
 
 返回（深度下钻时 `context_summary` 额外回显 `analysis_type` / `route_source` / `date_or_month`）：
