@@ -39,6 +39,7 @@ from .data_connector import (
     _num,
 )
 from .analytics import process_data_analysis_query, process_question
+from .tools_adapter import dispatch_tool, load_tool_schemas
 from .gaid_vault import VAULT, RedactFilter
 from .audit_log import QueryLogStore
 from .alerts_store import AlertStore
@@ -1056,6 +1057,42 @@ def remediation_execute(rid: str) -> dict:
         raise HTTPException(status_code=409, detail=str(e))
     STORE.observe_remediation(rec["state"])
     return rec
+
+
+# ---------------------------------------------------------------------------
+# 混合架构：LLM Tool Calling 宽工具（强约束，内部一律走确定性引擎）
+# ---------------------------------------------------------------------------
+
+@app.get("/tess/tools")
+def list_tools() -> dict:
+    """返回供 LLM 消费的 tool schema 清单（tess_analyze / tess_ask / tess_fetch_warning）。
+
+    LLM 的 tool_call 只产出结构化参数块；真正端点选择与参数矫正由
+    POST /tess/tool 在服务端完成，杜绝裸暴露细粒度 API。
+    """
+    return {"tools": load_tool_schemas()}
+
+
+@app.post("/tess/tool")
+def call_tool(payload: dict, request: Request) -> dict:
+    """LLM Tool Calling 宽工具统一入口：由 LLM 的 tool_call 触发。
+
+    body: {
+      "tool": "tess_analyze" | "tess_ask" | "tess_fetch_warning",
+      "arguments": { ...工具参数... }      # LLM 产出的结构化参数块
+    }
+    鉴权 / 按权限取数同 /tess/analytics、/tess/ask（X-API-Key + X-Teensing-Token）。
+    后端依据 arguments 强约束路由到确定性引擎，不应出现静默错数或幻觉。
+    """
+    tool = (payload or {}).get("tool")
+    if tool not in ("tess_analyze", "tess_ask", "tess_fetch_warning"):
+        raise HTTPException(status_code=400, detail=f"不支持的 tool={tool!r}")
+    try:
+        return dispatch_tool(tool, (payload or {}).get("arguments") or {}, request)
+    except HTTPException:
+        raise
+    except Exception as e:  # 数据 API / LLM 异常都不应泄露堆栈
+        raise HTTPException(status_code=502, detail=f"tool 执行失败：{type(e).__name__}: {e}")
 
 
 @app.get("/healthz")

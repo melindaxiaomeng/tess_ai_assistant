@@ -1,0 +1,72 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "tess_analyze",
+      "description": "对 Teensing 投放数据做结构化分析/下钻。支持五维实体（campaign / advertiser / publisher / package / owner）任意组合；同时提供 >=2 个实体时自动做交叉维度 AND 联合分析。后端完成参数矫正（campaign_id 转 campaign_ids、强制 publisher 维度联合等），LLM 无需关心底层端点细节。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "analysis_type": {
+            "type": "string",
+            "enum": ["daily_summary", "scaling_opportunity", "finance_check", "account_overview", "publisher_deepdive", "scaling_capacity", "campaign_detail", "advertiser_deepdive", "traffic_policy_check", "kpi_compare", "campaign_ranking", "pkg_deepdive", "owner_performance", "cross_dimension"],
+            "description": "可选：显式分析类型（如前端胶囊透传）。省略时由后端按命中实体数自动判定（>=2 实体 -> cross_dimension；单实体 -> 对应下钻类型；无实体 -> account_overview）。"
+          },
+          "campaign_id": {"type": "integer", "description": "Campaign ID，如 5845554。"},
+          "advertiser_id": {"type": "integer", "description": "广告主 ID。"},
+          "publisher_id": {"type": "integer", "description": "Publisher / 渠道 ID。"},
+          "package_name": {"type": "string", "description": "应用包名，如 com.x.y 或 link.merge.puzzle.onnect.number。"},
+          "owner_user_id": {"type": "integer", "description": "负责人(AM/BD) 用户 ID；建议直接传数字 ID，避免依赖姓名解析。"},
+          "owner_role": {"type": "string", "enum": ["am", "bd"], "description": "负责人角色，配合 owner_user_id。"}
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tess_ask",
+      "description": "用自然语言向 Tess 提问（业务问答 / 诊断 / 概念解释）。后端先做五维实体抽取与路由：命中实体则深度下钻，命中关键词则推断类型，都不命中则走浅层问答兜底（如解释 CTIT 是什么、日常对话）。LLM 无需选择端点或拼接参数。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "question": {"type": "string", "description": "自然语言问题，如「广告主 1000839 在渠道 1000684 上近 7 日营收怎么样」「什么是 CTIT」。"},
+          "analysis_type": {
+            "type": "string",
+            "enum": ["daily_summary", "scaling_opportunity", "finance_check", "account_overview", "publisher_deepdive", "scaling_capacity", "campaign_detail", "advertiser_deepdive", "traffic_policy_check", "kpi_compare", "campaign_ranking", "pkg_deepdive", "owner_performance", "cross_dimension"]
+          },
+          "campaign_id": {"type": "integer"},
+          "advertiser_id": {"type": "integer"},
+          "publisher_id": {"type": "integer"},
+          "package_name": {"type": "string"},
+          "owner_user_id": {"type": "integer"},
+          "owner_role": {"type": "string", "enum": ["am", "bd"]}
+        },
+        "required": ["question"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "tess_fetch_warning",
+      "description": "拉取 Tess 定时诊断产出的预警 / 实时大盘异常，返回可按严重度与营收过滤的告警列表，供 LLM 摘要或运营跟进。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": ["anomaly-warning", "realtime-kpi", "all"],
+            "description": "预警来源：anomaly-warning=异常预警涨跌榜；realtime-kpi=实时 KPI 小时级骤降；all=两者合并。默认 anomaly-warning。"
+          },
+          "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+          "min_severity": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"], "description": "仅返回 >= 该严重度的告警。"},
+          "min_revenue": {"type": "number", "description": "仅返回营收 >= 该 USD 的告警。"},
+          "include_acked": {"type": "boolean", "default": true, "description": "是否包含已确认(已处理)的告警。"}
+        },
+        "required": []
+      }
+    }
+  }
+]
