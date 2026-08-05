@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""验证 /tess/analytics 十三类数据分析场景（含五维实体下钻）。
+"""验证 /tess/analytics 十四类数据分析场景（含五维实体下钻 + 交叉维度）。
 
 两种运行模式：
   1) 模块直跑（默认，需 .env 配置真实 Teensing + LLM）：
@@ -56,6 +56,7 @@ ALL_TYPES = [
     "campaign_ranking",
     "pkg_deepdive",
     "owner_performance",
+    "cross_dimension",
 ]
 
 

@@ -68,6 +68,24 @@
 
 ---
 
+## 5. 交叉维度（Cross-Dimension）
+
+当**一个问题同时命中 ≥2 个维度**时，自动触发 `cross_dimension`，把所有实体作为**联合过滤**打 `/report`（各维度取交集 AND）。包名经 `/advertiser-publisher-pkg-maps` 归因到广告主、负责人经 `/advertisers?am=|?bd=` 归因到名下广告主，再与显式 `advertiser_id` 取交集。
+
+| 提问示例 | 触发类型 | 命中维度 |
+|---|---|---|
+| `广告主 1000839 在渠道 1000684 上近 7 日营收` | `cross_dimension` | advertiser × publisher |
+| `AM 118 名下的广告主 1000839 近 7 日表现` | `cross_dimension` | owner × advertiser |
+| `campaign 5845554 在渠道 1000684 的回传情况` | `cross_dimension` | campaign × publisher |
+| `link.merge.puzzle.onnect.number 这个包在渠道 1000684 上` | `cross_dimension` | package × publisher |
+| `oppo-mmp-Betty 在 Pub_1000684 渠道上的消耗` | `cross_dimension` | advertiser × publisher |
+| `AM 118 名下客户里 link.merge.puzzle.onnect.number 这个包跑了多少` | `cross_dimension` | owner × package |
+
+> 单维提问（如仅含一个实体）仍走各自单维下钻（见第 1–4 节），不会因为"提到了多个词"误判为交叉——必须满足**两个及以上可解析实体**。
+> 交叉语义为**取交集**：`owner X 的包 Y` = X 名下**且**推广 Y 的广告主，而非两者并集。
+
+---
+
 ## 前端胶囊（显式透传）对照
 
 若前端用胶囊直接透传 `analysis_type`，可对应提问意图：
@@ -79,6 +97,7 @@
 | Publisher | `publisher_deepdive` | `publisher_id` |
 | Package | `pkg_deepdive` | `package_name` |
 | Owner | `owner_performance` | `owner_user_id` + `owner_role` |
+| 交叉维度 | `cross_dimension` | `params` 内 ≥2 个：`campaign_id` / `advertiser_id` / `publisher_id` / `package_name` / `owner_user_id` |
 | 流量策略 | `traffic_policy_check` | `campaign_id` 或 `publisher_id` |
 | KPI 对比 | `kpi_compare` | `campaign_id` |
 | 排名诊断 | `campaign_ranking` | — |

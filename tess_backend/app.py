@@ -278,7 +278,7 @@ SUPPORTED = (
     "daily_summary", "scaling_opportunity", "finance_check",
     "account_overview", "publisher_deepdive", "scaling_capacity",
     "campaign_detail", "advertiser_deepdive", "traffic_policy_check", "kpi_compare",
-    "campaign_ranking", "pkg_deepdive", "owner_performance",
+    "campaign_ranking", "pkg_deepdive", "owner_performance", "cross_dimension",
 )
 
 
@@ -291,7 +291,8 @@ def post_analytics(payload: dict, request: Request) -> dict:
         "analysis_type": "daily_summary" | "scaling_opportunity" | "finance_check"
                          | "account_overview" | "publisher_deepdive" | "scaling_capacity"
                          | "campaign_detail" | "advertiser_deepdive" | "traffic_policy_check" | "kpi_compare"
-                         | "campaign_ranking" | "pkg_deepdive" | "owner_performance",
+                         | "campaign_ranking" | "pkg_deepdive" | "owner_performance" | "cross_dimension",
+        # cross_dimension 需 params 内 ≥2 个实体 id（campaign_id/advertiser_id/publisher_id/package_name/owner_user_id）
         "params": { "report_month": "2026-08" }   # finance_check 可选
         # 实体下钻可选参数：campaign_id / advertiser_id / publisher_id（如 campaign_detail 需 campaign_id）
         #   pkg_deepdive 需 package_name（包名，如 com.xxx.yyy）；owner_performance 需 owner_user_id（负责人）
@@ -365,7 +366,7 @@ def post_ask(payload: dict, request: Request) -> dict:
       {
         "question": "自然语言问题（如：昨天营收为什么跌了？哪些 Campaign 最赚钱？）",
         "history": []        # 预留多轮上下文，当前版本未启用
-        "analysis_type": "campaign_detail" | ...   # 可选：显式深度下钻类型（前端胶囊透传，支持 13 种）
+        "analysis_type": "campaign_detail" | ...   # 可选：显式深度下钻类型（前端胶囊透传，支持 14 种含 cross_dimension）
         "params": { "report_month": "2026-08" }  # 可选：随 analysis_type 透传（如财务对账月份）
         # 实体下钻可选参数（也可放在 params 里）：campaign_id / advertiser_id / publisher_id
       }

@@ -697,12 +697,75 @@ def fetch_bi_analysis_context(
             "errors": [e for e in (err_r,) if e],
         }
 
+    # ---------------------------------------------------------------
+    # 场景 14：交叉维度（≥2 个实体联合过滤，各维度取交集 AND）
+    #   例：广告主×渠道 / 负责人×包 / Campaign×渠道 / 包×渠道
+    # ---------------------------------------------------------------
+    elif analysis_type == "cross_dimension":
+        cid = params.get("campaign_id")
+        aid = params.get("advertiser_id")
+        pid = params.get("publisher_id")
+        pkg = params.get("package_name")
+        oid = params.get("owner_user_id")
+        orole = params.get("owner_role")
+        cross_dims = params.get("cross_dims") or []
+
+        # 包名 / 负责人 归因到广告主，并与显式 advertiser_id 取交集
+        adv_ids = _resolve_cross_advertiser_ids(
+            connector, token, pkg=pkg, owner_user_id=oid, owner_role=orole,
+            seed_adv_ids=[aid] if aid else None)
+        campaign_ids = [str(cid)] if cid else []
+        publisher_ids = [str(pid)] if pid else []
+
+        # dimension 选择：覆盖所有参与过滤的实体维度
+        dims = []
+        if campaign_ids:
+            dims.append("campaign")
+        if adv_ids:
+            dims.append("advertiser")
+        if publisher_ids:
+            dims.append("publisher")
+        dims = dims or ["advertiser"]
+
+        start_7d = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+        end = today.strftime("%Y-%m-%d")
+        r_params = {"dimensions": ",".join(dims), "date_start": start_7d, "date_end": end,
+                    "page": 1, "page_size": 100}
+        if adv_ids:
+            r_params["advertiser_ids"] = ",".join(adv_ids)
+        if publisher_ids:
+            r_params["publisher_ids"] = ",".join(publisher_ids)
+        if campaign_ids:
+            r_params["campaign_ids"] = ",".join(campaign_ids)
+        report, err_r = _safe_api_get(connector, "/report", params=r_params, token=token)
+        r_items = (report or {}).get("items", []) if isinstance(report, dict) else []
+        agg = _aggregate_report(r_items)
+        return {
+            "analysis_type": "cross_dimension",
+            "cross_dims": cross_dims,
+            "campaign_id": cid,
+            "advertiser_ids": adv_ids,
+            "publisher_ids": publisher_ids,
+            "package_name": pkg,
+            "owner_user_id": oid,
+            "owner_role": orole,
+            "time_range": f"{start_7d} ~ {end}",
+            "metric_note": "交叉维度：将解析到的多个实体（campaign/advertiser/publisher/package/owner）作为联合过滤打 /report（各维度取交集 AND）。package 经 /advertiser-publisher-pkg-maps 归因到广告主、owner 经 /advertisers?am=|?bd= 归因到名下广告主，再与显式 advertiser_id 取交集。",
+            "report_summary": agg,
+            "report_rows": _pick_many(r_items,
+                ["date", "campaign_id", "campaign_name", "advertiser_id", "advertiser_name",
+                 "publisher_id", "publisher_name", "revenue", "profit", "payout",
+                 "clicks", "conversions", "cvr", "margin_rate"], 15),
+            "errors": [e for e in (err_r,) if e],
+        }
+
     else:
         raise ValueError(
             f"未知的 analysis_type={analysis_type!r}；"
             "支持: daily_summary / scaling_opportunity / finance_check / account_overview / "
             "publisher_deepdive / scaling_capacity / campaign_detail / advertiser_deepdive / "
-            "traffic_policy_check / kpi_compare / campaign_ranking / pkg_deepdive / owner_performance"
+            "traffic_policy_check / kpi_compare / campaign_ranking / pkg_deepdive / "
+            "owner_performance / cross_dimension"
         )
 
 
@@ -808,6 +871,7 @@ def _build_user_prompt(analysis_type: str, ctx: dict) -> str:
         "campaign_ranking": "以下是各 Campaign 的环比涨跌榜（rising/falling，字段含 campaign_id、campaign_name、revenue、revenue_change）。请找出利润/营收环比下滑最快的 Campaign，给出 campaign_id、名称、下滑幅度与可能原因。注意：涨跌榜口径为营收(revenue)环比，接口未提供独立利润(profit)环比字段，若用户问「利润」请明确说明并以营收环比作答。",
         "pkg_deepdive": "以下是该包名在系统中的归属（广告主/渠道映射）与近 7 日跨 Campaign 营收/利润/Margin 表现，请分析该包的跑量情况、主要投放渠道与转化效率，并说明数据口径（来自 pkg-maps 归因 + /report 聚合，非单 campaign 视角）。",
         "owner_performance": "以下是该 AM/BD 负责人名下所有广告主近 7 日的消耗与利润表现，请汇总其业绩（总营收/利润、头部广告主、异常项），并说明数据口径（/advertisers?am|bd= 解析名下广告主 + /report 聚合）。",
+        "cross_dimension": "以下是多个实体维度的交叉切片（近 7 日，各维度取交集 AND）。请围绕【交叉维度】作答：先说明本次是哪几个维度交叉、过滤后样本量，再给出联合视角下的营收/利润/Margin、头部明细（用表格），并指出交叉后暴露的结构性问题（如某广告主在某渠道集中、某负责人客户转化差）。数据口径：package 经 pkg-maps 归因到广告主、owner 经 /advertisers?am|bd= 归因到名下广告主，再与显式 advertiser_id 取交集后联合打 /report。",
     }.get(analysis_type, "请基于以下数据做商业分析。")
 
     return (
@@ -902,6 +966,7 @@ ANALYSIS_TYPES = {
     "campaign_ranking",
     "pkg_deepdive",
     "owner_performance",
+    "cross_dimension",
 }
 
 # 关键词路由表（优先级自上而下：先匹配更具体的类型）。
@@ -1088,15 +1153,19 @@ def resolve_entities(entities: dict, connector, token: Optional[str] = None) -> 
 
     # 负责人名称 -> user id
     if not e.get("owner_user_id") and e.get("owner_name"):
-        opts, _ = _safe_api_get(connector, "/users/options", token=token)
-        opts = opts if isinstance(opts, list) else []
-        target = e["owner_name"].lower()
-        for u in opts:
-            nm = str(u.get("name") or "").lower()
-            rn = str(u.get("real_name") or "").lower()
-            if target in nm or target in rn or nm.startswith(target) or rn.startswith(target):
-                e["owner_user_id"] = _fmt_id(u.get("id"))
-                break
+        if re.fullmatch(r"\d+", str(e["owner_name"])):
+            # 纯数字（如「AM 118」）直接视为 user id，无需查目录
+            e["owner_user_id"] = str(e["owner_name"])
+        else:
+            opts, _ = _safe_api_get(connector, "/users/options", token=token)
+            opts = opts if isinstance(opts, list) else []
+            target = e["owner_name"].lower()
+            for u in opts:
+                nm = str(u.get("name") or "").lower()
+                rn = str(u.get("real_name") or "").lower()
+                if target in nm or target in rn or nm.startswith(target) or rn.startswith(target):
+                    e["owner_user_id"] = _fmt_id(u.get("id"))
+                    break
     return e
 
 
@@ -1151,6 +1220,44 @@ def _aggregate_report(items):
         "by_campaign": sorted(by_c.values(), key=lambda x: x["revenue"], reverse=True)[:8],
         "by_publisher": sorted(by_p.values(), key=lambda x: x["revenue"], reverse=True)[:8],
     }
+
+
+def _resolve_cross_advertiser_ids(connector, token, pkg=None, owner_user_id=None,
+                                  owner_role=None, seed_adv_ids=None):
+    """交叉维度下，把 包名 / 负责人 归因到广告主集合，并与显式 advertiser_id 取交集。
+
+    返回最终广告主 id 列表（可能为空）。语义：跨维度 = 同时满足（AND）。
+      - seed_adv_ids: 直接给定的 advertiser_id 集合（基础集）
+      - pkg: 包名 -> /advertiser-publisher-pkg-maps 归因出的归属广告主
+      - owner_user_id: 负责人 -> /advertisers?am=|?bd= 名下广告主
+    每次叠加一个维度都做交集，确保「owner X 的包 Y」= X 名下 且 推广 Y 的广告主。
+    """
+    base = set(str(x) for x in (seed_adv_ids or []) if x)
+    restricted = bool(base)  # 已有显式 advertiser_id 则后续维度都要与之交集
+    if pkg:
+        maps, _ = _safe_api_get(connector, "/advertiser-publisher-pkg-maps",
+                                params={"packagename": str(pkg), "page": 1, "page_size": 100}, token=token)
+        items = (maps or {}).get("items", []) if isinstance(maps, dict) else []
+        pkg_adv = {_fmt_id(i.get("advertiser_id")) for i in items if i.get("advertiser_id")}
+        base = pkg_adv if not restricted else (base & pkg_adv)
+        restricted = True
+    if owner_user_id:
+        owner_adv = set()
+        for r in (["am", "bd"] if owner_role is None else [owner_role]):
+            # 分页扫描（API 限制 page_size<=100，单角色最多 5 页 = 500 个广告主）
+            for pg in range(1, 6):
+                advs, _ = _safe_api_get(connector, "/advertisers",
+                                        params={r: str(owner_user_id), "page": pg, "page_size": 100}, token=token)
+                its = (advs or {}).get("items", []) if isinstance(advs, dict) else []
+                if not its:
+                    break
+                for it in its:
+                    owner_adv.add(_fmt_id(it.get("id")))
+                if len(its) < 100:
+                    break
+        base = owner_adv if not restricted else (base & owner_adv)
+        restricted = True
+    return sorted(base)
 
 
 def extract_entity_id(question: str, params: Optional[dict]) -> tuple:
@@ -1217,6 +1324,8 @@ def process_question(
     上下文选择优先级（①②③ 走深度取数层，④ 走浅层全局兜底）：
       ① 显式 analysis_type（前端胶囊透传）        -> route_source="explicit"
       ② 五维实体抽取（extract_entities+resolve_entities）-> 按命中优先级
+         若同时命中 ≥2 个维度 -> cross_dimension（联合过滤，各维度取交集），route_source="entity"
+         否则按最高优先级单维下钻：
          campaign_id > advertiser_id > publisher_id > package_name > owner_user_id
          各自下钻到 campaign_detail / advertiser_deepdive / publisher_deepdive /
          pkg_deepdive / owner_performance，route_source="entity"
@@ -1236,8 +1345,30 @@ def process_question(
         ents = extract_entities(question, params)
         ents = resolve_entities(ents, connector, token)  # 名称/代号 -> 可下钻 id
         params = params or {}  # 确保后续 {**params, ...} 字典展开安全（process_question 默认 params=None）
-        ent_type = None
+        # 统计命中的维度个数；≥2 个 -> 交叉维度联合下钻（其余单维维持原分支）
+        present = []
         if ents.get("campaign_id"):
+            present.append("campaign")
+        if ents.get("advertiser_id"):
+            present.append("advertiser")
+        if ents.get("publisher_id"):
+            present.append("publisher")
+        if ents.get("package_name"):
+            present.append("package")
+        if ents.get("owner_user_id"):
+            present.append("owner")
+        ent_type = None
+        if len(present) >= 2:
+            ent_type = "cross_dimension"
+            params = {**params, "campaign_id": ents.get("campaign_id"),
+                      "advertiser_id": ents.get("advertiser_id"),
+                      "publisher_id": ents.get("publisher_id"),
+                      "package_name": ents.get("package_name"),
+                      "owner_user_id": ents.get("owner_user_id"),
+                      "owner_role": ents.get("owner_role"),
+                      "owner_name": ents.get("owner_name"),
+                      "cross_dims": present}
+        elif ents.get("campaign_id"):
             ent_type, params = "campaign_detail", {**params, "campaign_id": ents["campaign_id"]}
         elif ents.get("advertiser_id"):
             ent_type, params = "advertiser_deepdive", {**params, "advertiser_id": ents["advertiser_id"]}
