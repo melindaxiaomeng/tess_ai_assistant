@@ -325,8 +325,30 @@ def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None,
                      "data_errors": [f"EXC: {type(e).__name__}: {e}"], "answer_len": 0,
                      "answer_head": "", "ok": False}]
     else:
-        # --no-llm：若带实体 id，则直接验证对应深度类型的取数（更贴近真实下钻）；否则验证浅层 fetch_qa_context
+        # --no-llm：不调真实 LLM，仅校验「路由到哪个类型 + 取到什么数据」
+        if question and not params:
+            # 纯自然语言路由测试：占位 LLM 跑 process_question 完整路由（extract_entities→下钻/cross）
+            from tess_backend.analytics import process_question as _pq
+
+            class _NoopLLM:
+                def complete(self, system, user, json_mode=False):
+                    return "(data-only test: 未调用真实 LLM)"
+
+            try:
+                res = _pq(question, connector, _NoopLLM(), token=token,
+                          operator_id="verify-script", token_mode="user" if user_token else "system",
+                          analysis_type=analysis_type, params=params)
+                cs = res.get("context_summary", {})
+                errs = cs.get("errors", [])
+                return [{"analysis_type": f"ask:{cs.get('analysis_type', 'shallow')}",
+                         "mode": "module+data-only(routing)", "route_source": cs.get("route_source"),
+                         "data_errors": errs, "answer_len": len(res.get("answer", "")),
+                         "ok": not errs}]
+            except Exception as e:  # noqa: BLE001
+                return [{"analysis_type": "ask", "mode": "module+data-only(routing)",
+                         "data_errors": [f"EXC: {type(e).__name__}: {e}"], "ok": False}]
         if params:
+            # 显式实体 id：直接验证对应深度类型的取数（更贴近真实下钻）
             ctx2 = fetch_bi_analysis_context(connector, analysis_type or "campaign_detail",
                                             token=token, params=params)
             errs = ctx2.get("errors", [])
@@ -340,7 +362,8 @@ def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None,
                                                    "pkg_maps_count", "package_name")
                                          if k in ctx2},
                      "ok": not errs}]
-        ctx2 = fetch_qa_context(connector, token=token, question=question)
+        # 无 question 无 params -> 浅层全局兜底
+        ctx2 = fetch_qa_context(connector, token=token, question=question or "")
         errs = ctx2.get("errors", [])
         return [{"analysis_type": "ask", "mode": "module+data-only",
                  "data_errors": errs,
