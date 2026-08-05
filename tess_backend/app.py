@@ -273,6 +273,14 @@ def diagnose(payload: dict, request: Request) -> dict:
     return result
 
 
+# 支持的 analysis_type 全集（/tess/analytics 预设 + /tess/ask 深度下钻新增类型）
+SUPPORTED = (
+    "daily_summary", "scaling_opportunity", "finance_check",
+    "account_overview", "publisher_deepdive", "scaling_capacity",
+    "campaign_detail", "advertiser_deepdive", "traffic_policy_check", "kpi_compare",
+)
+
+
 @app.post("/tess/analytics")
 def post_analytics(payload: dict, request: Request) -> dict:
     """主动式数据分析（Proactive BI）：按分析类型拉取 Teensing 业务数据，由 LLM 生成简报。
@@ -280,8 +288,10 @@ def post_analytics(payload: dict, request: Request) -> dict:
     请求体：
       {
         "analysis_type": "daily_summary" | "scaling_opportunity" | "finance_check"
-                         | "account_overview" | "publisher_deepdive" | "scaling_capacity",
+                         | "account_overview" | "publisher_deepdive" | "scaling_capacity"
+                         | "campaign_detail" | "advertiser_deepdive" | "traffic_policy_check" | "kpi_compare",
         "params": { "report_month": "2026-08" }   # finance_check 可选
+        # 实体下钻可选参数：campaign_id / advertiser_id / publisher_id（如 campaign_detail 需 campaign_id）
       }
     请求头（鉴权与按权限取数）：
       - X-API-Key        : Tess 与 Teensing 之间的共享密钥（网关注入，生产设了 TESS_API_KEY 后必带）
@@ -299,14 +309,15 @@ def post_analytics(payload: dict, request: Request) -> dict:
       }
     """
     analysis_type = (payload or {}).get("analysis_type")
-    SUPPORTED = ("daily_summary", "scaling_opportunity", "finance_check",
-                 "account_overview", "publisher_deepdive", "scaling_capacity")
     if analysis_type not in SUPPORTED:
         raise HTTPException(
             status_code=400,
             detail=f"不支持的 analysis_type={analysis_type!r}（支持 {', '.join(SUPPORTED)}）",
         )
     params = (payload or {}).get("params") or {}
+    for _k in ("campaign_id", "advertiser_id", "publisher_id"):
+        if (payload or {}).get(_k) is not None:
+            params[_k] = (payload or {}).get(_k)
     try:
         connector = get_data_connector()
     except (RuntimeError, ValueError) as e:
@@ -351,8 +362,9 @@ def post_ask(payload: dict, request: Request) -> dict:
       {
         "question": "自然语言问题（如：昨天营收为什么跌了？哪些 Campaign 最赚钱？）",
         "history": []        # 预留多轮上下文，当前版本未启用
-        "analysis_type": "scaling_capacity"   # 可选：显式深度下钻类型（前端胶囊透传）
+        "analysis_type": "campaign_detail" | ...   # 可选：显式深度下钻类型（前端胶囊透传，支持 10 种）
         "params": { "report_month": "2026-08" }  # 可选：随 analysis_type 透传（如财务对账月份）
+        # 实体下钻可选参数（也可放在 params 里）：campaign_id / advertiser_id / publisher_id
       }
     请求头（鉴权与按权限取数，同 /tess/analytics）：
       - X-API-Key        : Tess<->Teensing 共享密钥（网关注入，生产设了 TESS_API_KEY 后必带）
@@ -361,7 +373,9 @@ def post_ask(payload: dict, request: Request) -> dict:
                            生产 Teensing 连接器下两者皆无 -> 400
       - X-Operator-Id    : 可选，审计归因
     深度下钻说明：
-      - 不传 analysis_type 时，后端用关键词把问题映射到深度类型（命中即下钻），都不命中则退回浅层全局上下文；
+      - 路由优先级：① 显式 analysis_type（前端胶囊透传）> ② 问题正则识别实体 id（如
+        "5845554camp"/"ctit" -> campaign_detail，自动抽取 campaign_id；"广告主 1000734" -> advertiser_deepdive）
+        > ③ 关键词映射到深度类型 > ④ 都不命中退回浅层全局上下文；
       - 传了非法 analysis_type -> 400。
     返回：
       {
@@ -371,7 +385,7 @@ def post_ask(payload: dict, request: Request) -> dict:
         "context_summary": {
           "errors", "operator_id", "token_mode",
           "analysis_type",   # 仅深度下钻时存在：实际使用的分析类型
-          "route_source",    # 仅深度下钻时存在："explicit"(前端透传) | "inferred"(后端关键词)
+          "route_source",    # 仅深度下钻时存在："explicit"(前端透传) | "entity"(问题正则识别 id) | "inferred"(后端关键词)
           "date_or_month"    # 仅深度下钻时存在：日期/月份/时间范围
         }
       }
@@ -386,7 +400,10 @@ def post_ask(payload: dict, request: Request) -> dict:
             status_code=400,
             detail=f"不支持的 analysis_type={analysis_type!r}（支持 {', '.join(SUPPORTED)}）",
         )
-    params = (payload or {}).get("params") or None
+    params = dict((payload or {}).get("params") or {})
+    for _k in ("campaign_id", "advertiser_id", "publisher_id"):
+        if (payload or {}).get(_k) is not None:
+            params[_k] = (payload or {}).get(_k)
     try:
         connector = get_data_connector()
     except (RuntimeError, ValueError) as e:

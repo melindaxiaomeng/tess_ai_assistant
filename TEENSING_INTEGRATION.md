@@ -427,7 +427,13 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 
 {
   "analysis_type": "daily_summary" | "scaling_opportunity" | "finance_check"
-                | "account_overview" | "publisher_deepdive" | "scaling_capacity",
+                | "account_overview" | "publisher_deepdive" | "scaling_capacity"
+                | "campaign_detail" | "advertiser_deepdive" | "traffic_policy_check" | "kpi_compare",
+  // 实体下钻类型（campaign_detail / advertiser_deepdive / traffic_policy_check / kpi_compare）
+  // 需要对应实体 id，可放在顶层或 params 内：
+  "campaign_id": 5845554,        // campaign_detail / kpi_compare 必填
+  "advertiser_id": 1000734,      // advertiser_deepdive 必填
+  "publisher_id": 1000571,       // traffic_policy_check 选填（也可只传 campaign_id 自动解析 publisher）
   "params": { "report_month": "2026-08" }   // 仅 finance_check 可选
 }
 ```
@@ -456,7 +462,7 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 
 ### 10.2 真实可用 API 完整目录（已用生产 token 探测确认）
 
-> 下列端点均已用 `TESS_SYSTEM_TOKEN` 对 `TESS_DATA_API_BASE_URL` 实测存在并返回数据；BI 助手的数据加载器 `fetch_bi_analysis_context()` 即从其中按需编排。分四组：**A 大盘与绩效 / B 报表与聚合 / C 质量与扣量 / D 主数据目录（新发现，可扩展）**。
+> 下列端点均已用 `TESS_SYSTEM_TOKEN` 对 `TESS_DATA_API_BASE_URL` 实测存在并返回数据；BI 助手的数据加载器 `fetch_bi_analysis_context()` 即从其中按需编排。分五组：**A 大盘与绩效 / B 报表与聚合 / C 质量与扣量 / D 主数据目录 / E 实体下钻与流量策略（随完全体路由网关新增）**。
 
 #### A. 大盘与绩效（Overview & Performance）
 
@@ -489,6 +495,24 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 | `GET /publishers` | `{total, page, page_size, items[]}` | `id, name, margin, payment_terms, click_caps, conversion_caps, postback_url, …` | 渠道横向对比（已实现） |
 | `GET /advertisers` | `{total, page, page_size, items[]}` | `id, name, bd, am, margin, contract_valid_to, …` | 广告主结构复盘（已实现） |
 
+#### E. 实体下钻与流量策略（新增，已探测确认）
+
+随「完全体路由网关」扩张接入，支撑单 Campaign / 广告主 / 流量策略 / KPI 对比四类深度下钻。
+
+| 端点 | 入参（实测正确名） | 关键字段 | 已用于场景 |
+|---|---|---|---|
+| `GET /campaign-detail` | `campaign_ids`（复数） | `t_campaign_id, campaigns, events, advertisers` | `campaign_detail` |
+| `GET /campaign-quality` | `campaign_ids`（复数） | 按 `time_label` 的质量时序：`conversions, postback_conversions, q1_rate, q2_rate, reject_rate` | `campaign_detail` |
+| `GET /campaign-kpi-trend` | `campaign_ids`（复数） | 按 `time_label` 的指标趋势：`revenue, clicks, cvr, margin_rate, payout` | `campaign_detail` / `kpi_compare` |
+| `GET /campaign-ctit-etit` | **`campaign_id`（单数！）** | `ctit, etit`（转化/事件时间分布） | `campaign_detail` |
+| `GET /advertisers/{id}` | 路径参数 `id` | `name, user_name, bd, am, status, jointime` | `advertiser_deepdive` |
+| `GET /advertisers/campaign-daily-kpi` | `advertiser_id` | `total, campaigns[]`（日 KPI） | `advertiser_deepdive` |
+| `GET /mapping-publisher-channels` | `publisher_id` | `items[]`（渠道映射） | `traffic_policy_check` |
+| `GET /replace-channels` | `publisher_id` | `items[]`（替换渠道规则） | `traffic_policy_check` |
+| `GET /publisher-campaign-blocks` | `publisher_id` 或 `campaign_id` | `items[]`（屏蔽规则） | `traffic_policy_check` |
+
+> ⚠️ **参数易错点**：`/campaign-ctit-etit` 真实入参是**单数 `campaign_id`**（其余 Campaign 级接口多是复数 `campaign_ids`）；`traffic_policy_check` 若只给 `campaign_id`，代码会先调 `/campaigns?campaign_ids=...` 反解出 `publisher_id` 再去拉映射/替换/屏蔽规则。
+
 #### 已确认不可用（HTTP 404，勿依赖）
 
 `/external/invoices`、`/overview/summary|performance|kpi|quality|conversion|advertiser`、`/report/day|daily|campaign|publisher`、`/campaign-quality/campaign|advertiser`、`/campaign/list`、`/statistics/overview`、`/dashboard`、`/metrics`、`/kpi`。
@@ -513,30 +537,41 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 - **`/report/month` 参数名易错（已修正）**：Teensing 该接口真实参数名为 `start_date`/`end_date`，且接受 `YYYYMM`（无横杠）格式；早期代码误传 `report_month=2026-06`（带横杠）会被接口忽略 → 返回全 0 的"本月暂无数据"。现 `finance_check` 已改为内部把调用方契约 `report_month=2026-06` 转换成 `start_date=202606&end_date=202606` 透传，实测 6 月可返回真实数据（revenue≈717,744、calc_revenue≈714,462、payout≈403,454 等）。调用方仍按 `report_month` 传参即可，无需改前端。
 - 该能力依赖 `TESS_DATA_CONNECTOR=teensing` 的真实连接器（mock 模式不支持）。
 
-### 10.5 已实现的扩展场景（基于 §10.2 D 组主数据接口）
+### 10.5 已实现的扩展场景（基于 §10.2 D/E 组接口）
 
-下列 3 个场景已接入 `fetch_bi_analysis_context()` 与 `POST /tess/analytics`（作为给 Teensing 系统调用的后端集成面，由 Teensing 自身 UI 触发，无独立前端），将 BI 助手从「三大复盘」扩展到「账户 / 渠道 / 放量」全景。
+下列 7 个场景已接入 `fetch_bi_analysis_context()` 与 `POST /tess/analytics`（作为给 Teensing 系统调用的后端集成面，由 Teensing 自身 UI 触发，无独立前端）：前 3 个为「账户 / 渠道 / 放量」全局研判，后 4 个为「单 Campaign / 广告主 / 流量策略 / KPI 对比」实体下钻。
 
 | analysis_type | 业务问题 | 编排的真实接口 | 产出 |
 |---|---|---|---|
 | `account_overview` | 账户下广告主 / Campaign 结构、健康度 | `/campaigns` + `/advertisers` + `/overview/ranking` | 全局 campaign/advertiser 总量、首页 100 条抽样的活跃/缺失 Cap 统计、Top 广告主营收贡献 |
-| `publisher_deepdive` | 各渠道（Publisher）质量与扣量横向对比 | `/publishers` + `/campaign-quality/publisher` | 各渠道 clicks/conversions、postback 回传缺口、q1/q2/reject 扣量率，自动标记异常渠道 |
-| `scaling_capacity` | 哪些 Campaign 还有放量容量且回报好 | `/report`（按 `profit` 降序）聚合 → 反查 `/campaigns?campaign_ids=...` 取 `cap` | 近 7 日按 Campaign 聚合的利润/Margin，`scaling_room`（盈利高 Margin 且 Cap 偏低）/ `over_cap_waste`（亏损仍挂 Cap）清单 |
+| `publisher_deepdive` | 各渠道（Publisher）质量与扣量横向对比 | `/publishers` + `/campaign-quality/publisher`（可选 + `/campaign-quality/publisher/channels`） | 各渠道 clicks/conversions、postback 回传缺口、q1/q2/reject 扣量率，自动标记异常渠道 |
+| `scaling_capacity` | 哪些 Campaign 还有放量容量且回报好 | `/report`（按 `profit` 降序）聚合 → 反查 `/campaigns?campaign_ids=...` 取 `cap`（可选 `/global-settings` 取全局上限） | 近 7 日按 Campaign 聚合的利润/Margin，`scaling_room`（盈利高 Margin 且 Cap 偏低）/ `over_cap_waste`（亏损仍挂 Cap）清单，`global_cap`（全局放量上限） |
+| `campaign_detail` | 单个 Campaign 的微观下钻：配置 / 质量时序 / CTIT-ETIT / 指标趋势 | `/campaigns`(campaign_ids) + `/campaign-detail`(campaign_ids) + `/campaign-quality`(campaign_ids) + `/campaign-kpi-trend`(campaign_ids) + `/campaign-ctit-etit`(**campaign_id 单数**) | `campaign_config`（cap/status/kpi）、`detail`（事件结构）、`quality_timeseries`（扣量率时序）、`kpi_trend`（营收/cvr/margin 时序）、`ctit_etit` 分布 |
+| `advertiser_deepdive` | 单个广告主维度：档案 + 日 KPI + 旗下 Campaign | `/advertisers/{id}` + `/advertisers/campaign-daily-kpi`(advertiser_id) | `profile`（bd/am/status）、`daily_kpi`（total + 旗下 campaign 日 KPI） |
+| `traffic_policy_check` | 流量策略核查：渠道映射 / 替换渠道 / 屏蔽规则 | `/mapping-publisher-channels` + `/replace-channels` + `/publisher-campaign-blocks`（仅给 campaign_id 时先 `/campaigns` 反解 publisher_id） | `mapping_publisher_channels`（映射）、`replace_channels`（替换规则）、`blocks`（屏蔽规则） |
+| `kpi_compare` | 单 Campaign 指标趋势与同期对比 | `/campaign-kpi-trend`(campaign_ids) + `/campaign-compare`(campaign_ids + date_start/date_end) | `kpi_trend`（近期时序）、`compare`（区间环比对照，默认最近 7 日→今日） |
+
+> 前三个场景（`account_overview` / `publisher_deepdive` / `scaling_capacity`）支持「全局/账户级」自动研判；后四个（`campaign_detail` / `advertiser_deepdive` / `traffic_policy_check` / `kpi_compare`）为**实体下钻类型**，必须由请求显式传入实体 id（顶层或 `params` 内），或在 `/tess/ask` 里由问题正则自动抽取（见 §10.6 ②）。
 
 **实现要点（实测验证）：**
 - `/campaigns` 支持 `campaign_ids=逗号列表` 精确过滤（上限 `page_size=100`）；`scaling_capacity` 先聚合 `/report` 拿到相关 campaign_id，再分批（每批≤100）回查 cap，避免 3M 全量拉取与 422 报错。
 - `/campaign-quality/publisher` 的扣量/质量信号在 `total` 聚合对象里：`q1_rate` / `q2_rate` / `reject_rate` 为扣量率，`postback_conversions` 与 `conversions` 之差为回传缺口。
 - `account_overview` 的 active/inactive/missing_cap 仅来自首页 100 条**抽样**，文案已明确不可当作全局占比；全局规模以 `campaign_total` / `advertiser_total` 为准。
-- 主数据接口**不含营收时序**，放量/容量类指标从 `/report` 取数。
+- 主数据接口**不含营收时序**，放量/容量类指标从 `/report` 取数；单 Campaign 时序从 `/campaign-kpi-trend` / `/campaign-quality` 取数。
+- `campaign_detail` 对同一个 `campaign_id` 并发调用 5 个端点（config/detail/quality/trend/ctit），单源容错（任一个失败只在 `errors` 里体现，不影响其余）。
+- `kpi_compare` 的对比区间 `date_start`/`date_end` 缺省为「最近 7 日 → 今日」；`/campaign-compare` 真实入参即这两个日期字段（非 `report_month`）。
 
 ### 10.6 自然语言问答端点 `POST /tess/ask`（Tess AI Assistant 对话接口）
 
 面向 Teensing 前端「问一句、答一段」的对话场景。**字段契约即对接方当前约定**：请求体发 `question`，返回体取 `answer`（兼容 `.answer` / `.result` / `.data` 任一同义字段）。
 
-**深度下钻（可选）**：`/tess/ask` 不只能答浅层全局问题，还复用 `/tess/analytics` 同一套深度取数层（`fetch_bi_analysis_context`）。上下文选择优先级：
-1. **显式透传**：请求体带 `analysis_type`（前端胶囊直接透传，确定性最强）→ 走该类型深度上下文；
-2. **后端推断**：不带 `analysis_type` 时，用轻量关键词把问题映射到深度类型（如「放量空间」→ `scaling_capacity`、「对账」→ `finance_check`），命中即下钻；
-3. **浅层兜底**：都不命中 → 退回原「全局态势」上下文，保证仍能量身答。
+**深度下钻（可选）**：`/tess/ask` 不只能答浅层全局问题，还复用 `/tess/analytics` 同一套深度取数层（`fetch_bi_analysis_context`）。上下文选择优先级（①②③ 走深度上下文，④ 走浅层兜底）：
+1. **显式透传**：请求体带 `analysis_type`（前端胶囊直接透传，确定性最强）→ `route_source="explicit"`；
+2. **实体正则识别（新增）**：不带 `analysis_type`、但问题里含实体 id 时，用 `extract_entity_id()` 正则抽取并映射到对应深度类型——`5845554camp` / 含 `ctit|etit` → `campaign_detail`（自动取 campaign_id）；`广告主 1000734` / `1000734adv` → `advertiser_deepdive`；`1000571pub` / `1000571渠道` → `publisher_deepdive`；命中即下钻，`route_source="entity"`；
+3. **后端关键词推断**：都不命中时，用轻量关键词把问题映射到深度类型（如「放量空间」→ `scaling_capacity`、「对账」→ `finance_check`、`ctit`/`漏斗` → `campaign_detail`、`对比`/`趋势` → `kpi_compare`），命中即下钻，`route_source="inferred"`；
+4. **浅层兜底**：①②③ 皆未命中 → 退回原「全局态势」上下文（`fetch_qa_context`），保证仍能量身答（无 `route_source` 字段）。
+
+> 注意优先级：② 实体正则高于 ③ 关键词表，因此「帮我分析一下这个 5845554camp 的 ctit」会精确落到 `campaign_detail`（而非被笼统的关键词命中），不再出现"数据不足"。顶层或 `params` 内显式传入的 `campaign_id` / `advertiser_id` / `publisher_id` 会直接覆盖正则推断。
 
 ```
 POST /tess/ask
@@ -548,9 +583,15 @@ X-Operator-Id: <运营ID>             # 可选，审计
 # 方式 A：纯自由提问（后端自动判断是否下钻）
 { "question": "昨天整体营收表现如何？有没有需要重点关注的异常？" }
 
-# 方式 B：前端胶囊显式下钻（analysis_type 与 /tess/analytics 同枚举）
+# 方式 B：前端胶囊显式下钻（analysis_type 与 /tess/analytics 同枚举，共 10 种）
 { "question": "各 Campaign 还有多少放量空间？", "analysis_type": "scaling_capacity", "params": {} }
 # 财务对账可带月份：{ "question": "本月对账", "analysis_type": "finance_check", "params": { "report_month": "2026-08" } }
+# 实体下钻：显式传 id（顶层或 params 内皆可）
+{ "question": "分析 5845554 的 ctit", "campaign_id": 5845554 }
+{ "question": "广告主 1000734 最近表现", "advertiser_id": 1000734 }
+{ "question": "渠道 1000571 的替换与屏蔽规则", "publisher_id": 1000571 }
+# 或不传 id、让问题正则自动抽取：
+{ "question": "帮我分析一下这个 5845554camp 的 ctit" }   # -> 自动识别 campaign_detail + campaign_id=5845554
 ```
 
 返回（深度下钻时 `context_summary` 额外回显 `analysis_type` / `route_source` / `date_or_month`）：
@@ -565,9 +606,9 @@ X-Operator-Id: <运营ID>             # 可选，审计
     "errors": [],
     "operator_id": "op-1",
     "token_mode": "user",
-    "analysis_type": "scaling_capacity",   // 仅深度下钻时存在
-    "route_source": "explicit",            // 仅深度下钻时存在：explicit(前端透传) | inferred(后端关键词)
-    "date_or_month": "2026-07-28 ~ 2026-08-04"  // 仅深度下钻时存在
+    "analysis_type": "campaign_detail",       // 仅深度下钻时存在
+    "route_source": "entity",                 // 仅深度下钻时存在：explicit(前端透传) | entity(问题正则识别 id) | inferred(后端关键词)
+    "date_or_month": "2026-08-04"             // 仅深度下钻时存在
   }
 }
 ```

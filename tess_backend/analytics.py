@@ -22,6 +22,21 @@
   GET /campaigns                   -> Campaign 主数据目录 {total,items:[{id,name,advertiser_id,country,cap,click_cap,payout_event,status,kpi,...}]}
   GET /publishers                  -> Publisher(渠道) 目录 {total,items:[{id,name,margin,payment_terms,click_caps,postback_url,...}]}
   GET /advertisers                 -> Advertiser(广告主) 目录 {total,items:[{id,name,bd,am,margin,contract_valid_to,...}]}
+  GET /campaign-detail             -> 单 Campaign 详情 {t_campaign_id, campaigns, events, advertisers}（campaign_ids=）
+  GET /campaign-quality            -> Campaign 级质量时序 {items:[{time_label,conversions,postback_conversions,q1_rate,q2_rate,reject_rate}]}（campaign_ids=）
+  GET /campaign-kpi-trend          -> Campaign 指标趋势 {items:[{time_label,revenue,clicks,cvr,margin_rate,payout}]}（campaign_ids=）
+  GET /campaign-ctit-etit          -> CTIT/ETIT 时间分布 {ctit:{5s,5-30s,...}, etit:{...}}（campaign_id= 单数！）
+  GET /campaign-compare            -> 同期对比 {current_period,previous_period,revenue,profit,...}（campaign_ids= + date_start/date_end）
+  GET /advertisers/{id}            -> 广告主档案 {id,name,user_name,bd,am,status,...}
+  GET /advertisers/campaign-daily-kpi -> 广告主日 KPI {advertiser_id,total,campaigns[]}（advertiser_id=）
+  GET /publisher-campaigns         -> Publisher 旗下 Campaign {items:[{publisher_id,campaign_id,campaign_name,margin}]}（publisher_id=）
+  GET /mapping-publisher-channels  -> 渠道映射 {items:[{publisher_id,channel,replace_publisher_id,replace_channel}]}（publisher_id=）
+  GET /replace-channels            -> 替换渠道规则 {items:[{advertiser_id,campaign_id,channel,replace_channel}]}（publisher_id= 或 advertiser_id=）
+  GET /publisher-campaign-blocks   -> 屏蔽规则 {items:[{campaign_id,campaign_name,channels,status}]}（campaign_id= 或 publisher_id=）
+  GET /global-settings             -> 全局设置 {timezone,global_cap,service_warning,currency}
+  GET /publishers/campaign-daily-kpi -> Publisher 日 KPI {publisher_id,total,campaigns[]}（publisher_id=）
+  GET /campaign-quality/publisher/channels -> 渠道级质量 {items:[]}（publisher_id=）
+  POST /report/compare             -> 多 Campaign 对比（body: campaign_ids[],date_start,date_end）
 
 已确认不可用（HTTP 404，本模块不依赖）：
   /external/invoices、/overview/summary|performance|kpi|quality|conversion|advertiser、
@@ -34,6 +49,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
 import json
+import re
 
 # ---------------------------------------------------------------------------
 # BI 分析系统提示词（观点先行 / 数据支撑 / 动作导向）
@@ -97,7 +113,11 @@ def fetch_bi_analysis_context(
       'finance_check'          -> 月度对账与财务扣量分析
       'account_overview'       -> 账户全景（Campaign/Advertiser 主数据 + 广告主榜）
       'publisher_deepdive'     -> 渠道质量对比（Publisher 目录 + 扣量/质量率）
-      'scaling_capacity'       -> 放量容量评估（Campaign Cap + 近 7 日利润/Margin）
+      'scaling_capacity'       -> 放量容量评估（Campaign Cap + 近 7 日利润/Margin + 全局 Cap）
+      'campaign_detail'        -> 单 Campaign 微观下钻（配置/Cap/质量时序/CTIT-ETIT/指标趋势）
+      'advertiser_deepdive'    -> 广告主维度（档案 + 日 KPI + 旗下 Campaign）
+      'traffic_policy_check'   -> 流量策略核查（渠道映射/替换渠道/屏蔽规则）
+      'kpi_compare'            -> 指标趋势与同期对比（KPI 趋势 + 区间对比）
 
     返回结构化的上下文 dict，供 LLM 生成简报。每个子数据源独立容错：
     单个接口失败只会在对应字段标记 error，不会拖垮整个分析。
@@ -300,13 +320,22 @@ def fetch_bi_analysis_context(
             or (e["total_conversions"] > 0 and e["postback_gap"] > 0.1 * e["total_conversions"])
         ]
 
+        # 若调用方指定 publisher_id，额外拉取该渠道的细分质量（/campaign-quality/publisher/channels）
+        channel_quality, err_ch = (None, None)
+        if params.get("publisher_id"):
+            channel_quality, err_ch = _safe_api_get(
+                connector, "/campaign-quality/publisher/channels",
+                params={"publisher_id": str(params["publisher_id"])}, token=token,
+            )
+
         return {
             "analysis_type": "publisher_deepdive",
             "publisher_total": (pubs or {}).get("total") if isinstance(pubs, dict) else None,
             "quality_publisher_count": len(q_items),
             "top_publishers_by_clicks": enriched[:8],
             "flagged_quality_issues": flagged[:10],
-            "errors": [e for e in (err_p, err_q) if e],
+            "channel_quality": (channel_quality or {}).get("items", []) if isinstance(channel_quality, dict) else [],
+            "errors": [e for e in (err_p, err_q, err_ch) if e],
         }
 
     # ---------------------------------------------------------------
@@ -389,21 +418,158 @@ def fetch_bi_analysis_context(
         # 容量浪费：近 7 日亏损却仍挂着 Cap
         over_cap_waste = [c for c in candidates if c["profit_7d"] <= 0 and c["cap"] > 0][:8]
 
+        # 叠加全局 Cap 设置（/global-settings），用于判断账户级容量天花板
+        gsettings, err_g = _safe_api_get(connector, "/global-settings", token=token)
+
         return {
             "analysis_type": "scaling_capacity",
             "time_range": f"{start_7d} ~ {end}",
+            "global_cap": (gsettings or {}).get("global_cap") if isinstance(gsettings, dict) else None,
             "campaigns_with_performance": len(candidates),
             "scaling_room": scaling_room,
             "over_cap_waste": over_cap_waste,
             "top_by_profit": candidates[:8],
-            "errors": [e for e in (err_r, err_c) if e],
+            "errors": [e for e in (err_r, err_c, err_g) if e],
+        }
+
+    # ---------------------------------------------------------------
+    # 场景 7：单 Campaign 微观下钻（配置 / 质量 / CTIT-ETIT / 指标趋势）
+    # ---------------------------------------------------------------
+    elif analysis_type == "campaign_detail":
+        cid = params.get("campaign_id")
+        if not cid:
+            return {
+                "analysis_type": "campaign_detail",
+                "errors": ["campaign_detail 需要 campaign_id 参数（问题里含 '<id>camp' 或 'ctit/etit'，或显式传 campaign_id）"],
+            }
+        cid = str(cid)
+        cfg, err_cfg = _safe_api_get(
+            connector, "/campaigns", params={"campaign_ids": cid, "page": 1, "page_size": 10}, token=token,
+        )
+        detail, err_det = _safe_api_get(connector, "/campaign-detail", params={"campaign_ids": cid}, token=token)
+        quality, err_q = _safe_api_get(connector, "/campaign-quality", params={"campaign_ids": cid}, token=token)
+        trend, err_t = _safe_api_get(connector, "/campaign-kpi-trend", params={"campaign_ids": cid}, token=token)
+        ctit, err_c = _safe_api_get(connector, "/campaign-ctit-etit", params={"campaign_id": cid}, token=token)
+
+        cfg_items = (cfg or {}).get("items", []) if isinstance(cfg, dict) else []
+        det = detail if isinstance(detail, dict) else {}
+        q_items = (quality or {}).get("items", []) if isinstance(quality, dict) else []
+        t_items = (trend or {}).get("items", []) if isinstance(trend, dict) else []
+        ctit_data = ctit if isinstance(ctit, dict) else {}
+
+        return {
+            "analysis_type": "campaign_detail",
+            "campaign_id": cid,
+            "campaign_config": _pick_many(cfg_items[:1],
+                ["id", "name", "advertiser_id", "publisher_id", "country", "cap", "click_cap", "status", "kpi"]) if cfg_items else [],
+            "detail": {k: det.get(k) for k in ("t_campaign_id", "campaigns", "events", "advertisers")},
+            "quality_timeseries": _pick_many(q_items,
+                ["time_label", "conversions", "postback_conversions", "q1_rate", "q2_rate", "reject_rate"])[:7],
+            "kpi_trend": _pick_many(t_items,
+                ["time_label", "revenue", "clicks", "cvr", "margin_rate", "payout"])[:7],
+            "ctit_etit": {k: ctit_data.get(k) for k in ("ctit", "etit")},
+            "errors": [e for e in (err_cfg, err_det, err_q, err_t, err_c) if e],
+        }
+
+    # ---------------------------------------------------------------
+    # 场景 8：广告主维度（档案 + 日 KPI + 旗下 Campaign）
+    # ---------------------------------------------------------------
+    elif analysis_type == "advertiser_deepdive":
+        aid = params.get("advertiser_id")
+        if not aid:
+            return {"analysis_type": "advertiser_deepdive",
+                    "errors": ["advertiser_deepdive 需要 advertiser_id 参数"]}
+        aid = str(aid)
+        rec, err_r = _safe_api_get(connector, f"/advertisers/{aid}", token=token)
+        daily, err_d = _safe_api_get(
+            connector, "/advertisers/campaign-daily-kpi",
+            params={"advertiser_id": aid}, token=token,
+        )
+        rec_d = rec if isinstance(rec, dict) else {}
+        daily_d = daily if isinstance(daily, dict) else {}
+        return {
+            "analysis_type": "advertiser_deepdive",
+            "advertiser_id": aid,
+            "profile": {k: rec_d.get(k) for k in ("id", "name", "user_name", "bd", "am", "status", "status_name", "jointime")},
+            "daily_kpi": {
+                "advertiser_id": daily_d.get("advertiser_id"),
+                "start_date": daily_d.get("start_date"),
+                "end_date": daily_d.get("end_date"),
+                "total": daily_d.get("total"),
+                "campaigns": (daily_d.get("campaigns") or [])[:10],
+            },
+            "errors": [e for e in (err_r, err_d) if e],
+        }
+
+    # ---------------------------------------------------------------
+    # 场景 9：流量策略核查（渠道映射 / 替换渠道 / 屏蔽规则）
+    # ---------------------------------------------------------------
+    elif analysis_type == "traffic_policy_check":
+        pid = params.get("publisher_id")
+        cid = params.get("campaign_id")
+        if not pid and not cid:
+            return {"analysis_type": "traffic_policy_check",
+                    "errors": ["traffic_policy_check 需要 publisher_id 或 campaign_id 参数"]}
+        # 若只给了 campaign_id，先解析其 publisher_id 以拉取映射/替换规则
+        if not pid and cid:
+            c0, _ = _safe_api_get(connector, "/campaigns",
+                                  params={"campaign_ids": str(cid), "page": 1, "page_size": 1}, token=token)
+            c0_items = (c0 or {}).get("items", []) if isinstance(c0, dict) else []
+            pid = _to_float((c0_items[0] or {}).get("publisher_id")) if c0_items else None
+        pid_s = str(int(pid)) if pid else None
+        mapping, err_m = _safe_api_get(
+            connector, "/mapping-publisher-channels",
+            params={"publisher_id": pid_s} if pid_s else {}, token=token)
+        replace, err_rp = _safe_api_get(
+            connector, "/replace-channels",
+            params={"publisher_id": pid_s} if pid_s else {}, token=token)
+        block_params = {"campaign_id": str(cid)} if cid else ({"publisher_id": pid_s} if pid_s else {})
+        blocks, err_b = _safe_api_get(connector, "/publisher-campaign-blocks", params=block_params, token=token)
+        return {
+            "analysis_type": "traffic_policy_check",
+            "publisher_id": pid,
+            "campaign_id": cid,
+            "mapping_publisher_channels": (mapping or {}).get("items", []) if isinstance(mapping, dict) else [],
+            "replace_channels": (replace or {}).get("items", []) if isinstance(replace, dict) else [],
+            "blocks": (blocks or {}).get("items", []) if isinstance(blocks, dict) else [],
+            "errors": [e for e in (err_m, err_rp, err_b) if e],
+        }
+
+    # ---------------------------------------------------------------
+    # 场景 10：指标趋势与同期对比
+    # ---------------------------------------------------------------
+    elif analysis_type == "kpi_compare":
+        cid = params.get("campaign_id")
+        if not cid:
+            return {"analysis_type": "kpi_compare",
+                    "errors": ["kpi_compare 需要 campaign_id 参数（趋势/对比对象）"]}
+        cid = str(cid)
+        ds = params.get("date_start") or (today - timedelta(days=7)).strftime("%Y-%m-%d")
+        de = params.get("date_end") or today.strftime("%Y-%m-%d")
+        trend, err_t = _safe_api_get(connector, "/campaign-kpi-trend", params={"campaign_ids": cid}, token=token)
+        compare, err_c = _safe_api_get(
+            connector, "/campaign-compare",
+            params={"campaign_ids": cid, "date_start": ds, "date_end": de}, token=token,
+        )
+        t_items = (trend or {}).get("items", []) if isinstance(trend, dict) else []
+        cmp_d = compare if isinstance(compare, dict) else {}
+        return {
+            "analysis_type": "kpi_compare",
+            "campaign_id": cid,
+            "date_range": f"{ds} ~ {de}",
+            "kpi_trend": _pick_many(t_items,
+                ["time_label", "revenue", "clicks", "cvr", "margin_rate", "payout"])[:7],
+            "period_compare": {k: cmp_d.get(k) for k in
+                ("current_period", "previous_period", "revenue", "profit", "conversions", "cvr")},
+            "errors": [e for e in (err_t, err_c) if e],
         }
 
     else:
         raise ValueError(
             f"未知的 analysis_type={analysis_type!r}；"
-            "支持: daily_summary / scaling_opportunity / finance_check / "
-            "account_overview / publisher_deepdive / scaling_capacity"
+            "支持: daily_summary / scaling_opportunity / finance_check / account_overview / "
+            "publisher_deepdive / scaling_capacity / campaign_detail / advertiser_deepdive / "
+            "traffic_policy_check / kpi_compare"
         )
 
 
@@ -502,6 +668,10 @@ def _build_user_prompt(analysis_type: str, ctx: dict) -> str:
         "account_overview": "以下是 Campaign/Advertiser 主数据目录与广告主维度排名，请输出账户全景概览。注意：campaign 总量达数百万，下方 active/inactive/missing_cap 仅来自首页 100 条抽样，不能代表全局占比；全局规模请看 campaign_total/advertiser_total，头部广告主请看 top_advertisers_by_revenue。",
         "publisher_deepdive": "以下是 Publisher 渠道目录与扣量/质量率数据，请对比各渠道质量风险（reject/q1/q2 扣量、回传缺口），指出需核查的渠道。",
         "scaling_capacity": "以下是近 7 日各 Campaign 利润/Margin 与各自的 Cap 设置，请评估哪些 Campaign 有放量空间（盈利高 Margin 但 Cap 偏低）、哪些 Cap 被浪费（亏损仍挂 Cap）。",
+        "campaign_detail": "以下是单个 Campaign 的配置、质量时序、CTIT/ETIT 分布与指标趋势，请做微观下钻分析（漏斗/事件质量/放量空间）。",
+        "advertiser_deepdive": "以下是广告主档案与日 KPI 趋势，请分析该广告主的整体消耗与旗下活动表现。",
+        "traffic_policy_check": "以下是该渠道/活动的映射、替换与屏蔽规则，请核查流量策略配置是否完整、是否存在风险。",
+        "kpi_compare": "以下是该 Campaign 的指标趋势与同期对比，请分析波动原因与环比变化。",
     }.get(analysis_type, "请基于以下数据做商业分析。")
 
     return (
@@ -589,6 +759,10 @@ ANALYSIS_TYPES = {
     "account_overview",
     "publisher_deepdive",
     "scaling_capacity",
+    "campaign_detail",
+    "advertiser_deepdive",
+    "traffic_policy_check",
+    "kpi_compare",
 }
 
 # 关键词路由表（优先级自上而下：先匹配更具体的类型）。
@@ -600,6 +774,10 @@ _ANALYSIS_KEYWORDS: list = [
     ("account_overview", ["账户全景", "整体大盘", "总览", "概览", "全景", "account overview"]),
     ("daily_summary", ["复盘", "每日", "昨日", "昨天", "日报", "今日表现", "daily summary"]),
     ("scaling_opportunity", ["放量", "扩量", "加预算", "增长机会", "潜力", "机会", "加大投放", "scale"]),
+    ("campaign_detail", ["ctit", "etit", "漏斗", "转化时间", "事件质量", "活动详情", "单活动", "campaign详情"]),
+    ("advertiser_deepdive", ["广告主", "advertiser", "主户", "客户"]),
+    ("traffic_policy_check", ["替换渠道", "切量", "切流量", "流量策略", "屏蔽", "block", "replace", "映射", "渠道映射"]),
+    ("kpi_compare", ["环比", "对比", "波动", "暴跌", "暴涨", "趋势", "trend", "对比昨日"]),
 ]
 
 
@@ -618,6 +796,45 @@ def infer_analysis_type(question: str) -> Optional[str]:
             if kw.lower() in q:
                 return atype
     return None
+
+
+def extract_entity_id(question: str, params: Optional[dict]) -> tuple:
+    """从自然语言问题 + 显式参数中识别实体 id，映射到对应的深度 analysis_type。
+
+    优先级：显式参数(campaign_id/advertiser_id/publisher_id) > 问题里的正则实体。
+    这是比关键词表更高优先级的路由判断（解决"5845554camp 的 ctit"这类实体下钻问题）。
+    返回 (analysis_type, params)；未识别到实体则返回 (None, params)。
+    """
+    params = params or {}
+    q = (question or "").lower()
+
+    # 1) 显式参数优先
+    if params.get("campaign_id"):
+        return "campaign_detail", params
+    if params.get("advertiser_id"):
+        return "advertiser_deepdive", params
+    if params.get("publisher_id"):
+        return "publisher_deepdive", params
+
+    # 2) 问题正则：campaign（数字+camp/campaign，或 ctit/etit 关键词）
+    m = re.search(r"(\d{4,})\s*(?:camp|campaign)\b", q)
+    if m or re.search(r"\b(ctit|etit)\b", q):
+        if m:
+            return "campaign_detail", {**params, "campaign_id": m.group(1)}
+        # ctit/etit 但问题里没有 id，无法下钻，交由关键词/浅层兜底
+        return None, params
+
+    # 3) 广告主 / 客户
+    m = re.search(r"(\d{4,})\s*(?:adv|advertiser|广告主)\b", q)
+    if m:
+        return "advertiser_deepdive", {**params, "advertiser_id": m.group(1)}
+
+    # 4) 渠道 / publisher
+    m = re.search(r"(\d{4,})\s*(?:pub|publisher|渠道)\b", q)
+    if m:
+        return "publisher_deepdive", {**params, "publisher_id": m.group(1)}
+
+    return None, params
 
 
 def fetch_qa_context(connector, token: Optional[str] = None, question: str = "") -> dict:
@@ -666,26 +883,33 @@ def process_question(
 ) -> dict:
     """端到端执行一次自然语言问答，支持深度下钻。
 
-    上下文选择优先级：
-      ① 显式 analysis_type（前端胶囊透传）    -> 深度上下文 fetch_bi_analysis_context
-      ② 否则用关键词推断 analysis_type         -> 命中则同样走深度上下文
-      ③ 二者皆无/不合法                       -> 退回浅层全局上下文 fetch_qa_context（原行为）
+    上下文选择优先级（①②③ 走深度取数层，④ 走浅层全局兜底）：
+      ① 显式 analysis_type（前端胶囊透传）        -> route_source="explicit"
+      ② 问题正则识别实体 id（extract_entity_id）  -> campaign/advertiser/publisher id 下钻，route_source="entity"
+      ③ 关键词推断 analysis_type（infer_analysis_type）-> 命中则同样走深度上下文，route_source="inferred"
+      ④ 三者皆无/不合法                           -> 退回浅层全局上下文 fetch_qa_context（原行为，无 route_source）
 
     - connector / llm / token：与 analytics 同源（token 决定按谁的数据权限取数）
     - 返回 answer（Markdown），并附 result / data 别名以兼容调用方 .answer/.result/.data 取值
-    - context_summary 在走深度上下文时额外回显 analysis_type / route_source（explicit|inferred）/ date_or_month
+    - context_summary 在走深度上下文时额外回显 analysis_type / route_source（explicit|entity|inferred）/ date_or_month
     """
     # —— 1. 决定用哪套上下文 ——
     route_source = None
     if analysis_type in ANALYSIS_TYPES:
         route_source = "explicit"
     else:
-        inferred = infer_analysis_type(question)
-        if inferred:
-            analysis_type = inferred
-            route_source = "inferred"
+        # ② 实体正则提取（优先级高于关键词表）：识别 campaign/advertiser/publisher id
+        ent_type, params = extract_entity_id(question, params)
+        if ent_type:
+            analysis_type = ent_type
+            route_source = "entity"
+        else:
+            inferred = infer_analysis_type(question)
+            if inferred:
+                analysis_type = inferred
+                route_source = "inferred"
 
-    if route_source:  # ①② 走深度上下文（与 /tess/analytics 同一套取数）
+    if route_source:  # ①②③ 走深度上下文（与 /tess/analytics 同一套取数）
         ctx = fetch_bi_analysis_context(connector, analysis_type, token=token, params=params)
         ctx = _enrich_names_with_ids(ctx)  # 名称追加 (id)，便于核对实体
         ctx_text = _trim_for_prompt(ctx, limit=9000)  # 深度上下文更大，放宽截断

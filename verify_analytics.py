@@ -49,6 +49,10 @@ ALL_TYPES = [
     "account_overview",
     "publisher_deepdive",
     "scaling_capacity",
+    "campaign_detail",
+    "advertiser_deepdive",
+    "traffic_policy_check",
+    "kpi_compare",
 ]
 
 
@@ -101,7 +105,19 @@ def load_dotenv(path=os.path.join(PROJECT_ROOT, ".env")):
             os.environ.setdefault(k.strip(), v.strip())
 
 
-def run_module(types, use_llm, user_token=None):
+def build_params(campaign_id=None, advertiser_id=None, publisher_id=None):
+    """从命令行传入的实体 id 组装 params（仅保留非空的）。"""
+    p = {}
+    if campaign_id is not None:
+        p["campaign_id"] = campaign_id
+    if advertiser_id is not None:
+        p["advertiser_id"] = advertiser_id
+    if publisher_id is not None:
+        p["publisher_id"] = publisher_id
+    return p or None
+
+
+def run_module(types, use_llm, user_token=None, campaign_id=None, advertiser_id=None, publisher_id=None):
     from tess_backend.data_connector import get_data_connector
     from tess_backend.analytics import (
         fetch_bi_analysis_context,
@@ -111,6 +127,7 @@ def run_module(types, use_llm, user_token=None):
     connector = get_data_connector()
     # 默认用系统 token；传入 --user-token 则按该用户的权限取数（模拟线上透传）
     token = user_token or (os.getenv("TESS_SYSTEM_TOKEN") or None)
+    params = build_params(campaign_id, advertiser_id, publisher_id)
 
     results = []
     for at in types:
@@ -121,7 +138,7 @@ def run_module(types, use_llm, user_token=None):
                     os.getenv("TESS_LLM_API_KEY", ""),
                     os.getenv("TESS_LLM_MODEL", "deepseek-chat"),
                 )
-                res = process_data_analysis_query(at, connector, llm, token=token)
+                res = process_data_analysis_query(at, connector, llm, token=token, params=params)
                 report = res.get("report", "")
                 ctx_err = res.get("context_summary", {}).get("errors", [])
                 results.append({
@@ -139,17 +156,19 @@ def run_module(types, use_llm, user_token=None):
                     "report_len": 0, "report_head": "", "ok": False,
                 })
         else:
-            ctx = fetch_bi_analysis_context(connector, at, token=token)
+            ctx = fetch_bi_analysis_context(connector, at, token=token, params=params)
             errs = ctx.get("errors", [])
             # 抽取每个场景的关键计数，便于一眼判断是否有数据
             keys = ("campaign_total", "advertiser_total", "top_advertisers_by_revenue",
                     "flagged_quality_issues", "scaling_room", "over_cap_waste",
                     "top_by_profit", "today_kpi", "rising_gainers", "falling_losers",
-                    "scaling_candidates", "total_summary")
+                    "scaling_candidates", "total_summary", "campaign_config",
+                    "quality_timeseries", "kpi_trend", "ctit_etit", "profile",
+                    "daily_kpi", "mapping_publisher_channels", "replace_channels", "blocks")
             summary = {k: _len_or_val(ctx.get(k)) for k in keys if k in ctx}
             results.append({
                 "analysis_type": at, "mode": "module+data-only",
-                "data_errors": errs, "context_summary": summary,
+                "params": params, "data_errors": errs, "context_summary": summary,
                 "ok": not errs,
             })
     return results
@@ -207,12 +226,15 @@ def run_http(base_url, api_key, types, user_token=None):
     return results
 
 
-def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None, analysis_type=None):
+def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None,
+            analysis_type=None, campaign_id=None, advertiser_id=None, publisher_id=None):
     """验证 /tess/ask 自然语言问答端点。
 
     - base_url+api_key 给定 -> HTTP 模式打线上端点（带可选 X-Teensing-Token）
     - 否则 -> 模块直跑（需 .env 真实 LLM；--no-llm 时仅校验数据拉取）
     """
+    params = build_params(campaign_id, advertiser_id, publisher_id)
+
     if base_url and api_key:
         import urllib.request
 
@@ -220,6 +242,13 @@ def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None, ana
         body = {"question": question}
         if analysis_type:
             body["analysis_type"] = analysis_type
+        # 顶层实体 id（app.py 会将顶层 id 合并进 params）
+        if campaign_id is not None:
+            body["campaign_id"] = campaign_id
+        if advertiser_id is not None:
+            body["advertiser_id"] = advertiser_id
+        if publisher_id is not None:
+            body["publisher_id"] = publisher_id
         payload = json.dumps(body).encode("utf-8")
         headers = {"Content-Type": "application/json", "X-API-Key": api_key}
         if user_token:
@@ -249,7 +278,7 @@ def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None, ana
 
     # 模块直跑
     from tess_backend.data_connector import get_data_connector
-    from tess_backend.analytics import process_question
+    from tess_backend.analytics import process_question, fetch_qa_context
 
     connector = get_data_connector()
     token = user_token or (os.getenv("TESS_SYSTEM_TOKEN") or None)
@@ -262,7 +291,7 @@ def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None, ana
         try:
             res = process_question(question, connector, llm, token=token,
                                    operator_id="verify-script", token_mode="user" if user_token else "system",
-                                   analysis_type=analysis_type)
+                                   analysis_type=analysis_type, params=params)
             answer = res.get("answer", "")
             cs = res.get("context_summary", {})
             errs = cs.get("errors", [])
@@ -275,8 +304,19 @@ def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None, ana
                      "data_errors": [f"EXC: {type(e).__name__}: {e}"], "answer_len": 0,
                      "answer_head": "", "ok": False}]
     else:
-        # --no-llm：仅验证 fetch_qa_context 数据拉取
-        from tess_backend.analytics import fetch_qa_context
+        # --no-llm：若带实体 id，则直接验证对应深度类型的取数（更贴近真实下钻）；否则验证浅层 fetch_qa_context
+        if params:
+            ctx2 = fetch_bi_analysis_context(connector, analysis_type or "campaign_detail",
+                                            token=token, params=params)
+            errs = ctx2.get("errors", [])
+            return [{"analysis_type": f"ask:{analysis_type or 'campaign_detail(params)'}",
+                     "mode": "module+data-only", "params": params, "data_errors": errs,
+                     "context_summary": {k: _len_or_val(ctx2.get(k))
+                                         for k in ("campaign_config", "quality_timeseries",
+                                                   "kpi_trend", "ctit_etit", "profile", "daily_kpi",
+                                                   "mapping_publisher_channels", "replace_channels", "blocks")
+                                         if k in ctx2},
+                     "ok": not errs}]
         ctx2 = fetch_qa_context(connector, token=token, question=question)
         errs = ctx2.get("errors", [])
         return [{"analysis_type": "ask", "mode": "module+data-only",
@@ -289,7 +329,7 @@ def run_ask(question, use_llm, user_token=None, base_url=None, api_key=None, ana
 
 
 def main():
-    ap = argparse.ArgumentParser(description="验证 /tess/analytics 六类场景 与 /tess/ask 问答")
+    ap = argparse.ArgumentParser(description="验证 /tess/analytics 十类场景 与 /tess/ask 问答（含实体下钻）")
     ap.add_argument("--http", help="HTTP 模式：服务器 base url（如 https://host）")
     ap.add_argument("--api-key", help="HTTP 模式：X-API-Key")
     ap.add_argument("--user-token", help="透传终端用户 Teensing access_token（X-Teensing-Token）；用于按用户权限取数测试")
@@ -298,13 +338,18 @@ def main():
     ap.add_argument("--ask", help="测试 /tess/ask 自然语言问答：传入一个问题字符串")
     ap.add_argument("--analysis-type", choices=ALL_TYPES,
                     help="配合 --ask：显式指定深度下钻 analysis_type（前端胶囊透传）；不传则由后端关键词推断")
+    ap.add_argument("--campaign-id", type=int, help="实体下钻：campaign_id（campaign_detail / kpi_compare）")
+    ap.add_argument("--advertiser-id", type=int, help="实体下钻：advertiser_id（advertiser_deepdive）")
+    ap.add_argument("--publisher-id", type=int, help="实体下钻：publisher_id（traffic_policy_check）")
     ap.add_argument("--json", action="store_true", help="输出 JSON 而非可读报告")
     args = ap.parse_args()
 
     if args.ask:
         results = run_ask(args.ask, use_llm=not args.no_llm,
                           user_token=args.user_token, base_url=args.http, api_key=args.api_key,
-                          analysis_type=args.analysis_type)
+                          analysis_type=args.analysis_type,
+                          campaign_id=args.campaign_id, advertiser_id=args.advertiser_id,
+                          publisher_id=args.publisher_id)
     else:
         types = [args.type] if args.type else ALL_TYPES
         if args.http:
@@ -314,7 +359,9 @@ def main():
             results = run_http(args.http, args.api_key, types, user_token=args.user_token)
         else:
             load_dotenv()
-            results = run_module(types, use_llm=not args.no_llm, user_token=args.user_token)
+            results = run_module(types, use_llm=not args.no_llm, user_token=args.user_token,
+                                 campaign_id=args.campaign_id, advertiser_id=args.advertiser_id,
+                                 publisher_id=args.publisher_id)
 
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
