@@ -428,9 +428,11 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 {
   "analysis_type": "daily_summary" | "scaling_opportunity" | "finance_check"
                 | "account_overview" | "publisher_deepdive" | "scaling_capacity"
-                | "campaign_detail" | "advertiser_deepdive" | "traffic_policy_check" | "kpi_compare",
-  // 实体下钻类型（campaign_detail / advertiser_deepdive / traffic_policy_check / kpi_compare）
-  // 需要对应实体 id，可放在顶层或 params 内：
+                | "campaign_detail" | "advertiser_deepdive" | "traffic_policy_check" | "kpi_compare"
+                | "campaign_ranking",
+  // 实体下钻类型（campaign_detail / advertiser_deepdive / traffic_policy_check / kpi_compare）需要对应实体 id
+  // campaign_ranking 为跨 Campaign 排名/诊断类型，无需实体 id，按营收环比涨跌榜作答（如"哪个 Campaign 利润环比下滑最快"）
+  // 实体 id 可放在顶层或 params 内：
   "campaign_id": 5845554,        // campaign_detail / kpi_compare 必填
   "advertiser_id": 1000734,      // advertiser_deepdive 必填
   "publisher_id": 1000571,       // traffic_policy_check 选填（也可只传 campaign_id 自动解析 publisher）
@@ -550,8 +552,9 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 | `advertiser_deepdive` | 单个广告主维度：档案 + 日 KPI + 旗下 Campaign | `/advertisers/{id}` + `/advertisers/campaign-daily-kpi`(advertiser_id) | `profile`（bd/am/status）、`daily_kpi`（total + 旗下 campaign 日 KPI） |
 | `traffic_policy_check` | 流量策略核查：渠道映射 / 替换渠道 / 屏蔽规则 | `/mapping-publisher-channels` + `/replace-channels` + `/publisher-campaign-blocks`（仅给 campaign_id 时先 `/campaigns` 反解 publisher_id） | `mapping_publisher_channels`（映射）、`replace_channels`（替换规则）、`blocks`（屏蔽规则） |
 | `kpi_compare` | 单 Campaign 指标趋势与同期对比 | `/campaign-kpi-trend`(campaign_ids) + `/campaign-compare`(campaign_ids + date_start/date_end) | `kpi_trend`（近期时序）、`compare`（区间环比对照，默认最近 7 日→今日） |
+| `campaign_ranking` | 跨 Campaign 排名/诊断：哪个 Campaign 环比下滑最快 | `/overview/ranking/fluctuation`（rising/falling 涨跌榜，按 `revenue_change` 排序） | `rising_top` / `falling_top`（各 Top10，`falling_top` 已按 `revenue_change` 升序，[0] 即下滑最快）、`metric_note`（口径说明：接口仅提供营收环比，未提供独立利润环比） |
 
-> 前三个场景（`account_overview` / `publisher_deepdive` / `scaling_capacity`）支持「全局/账户级」自动研判；后四个（`campaign_detail` / `advertiser_deepdive` / `traffic_policy_check` / `kpi_compare`）为**实体下钻类型**，必须由请求显式传入实体 id（顶层或 `params` 内），或在 `/tess/ask` 里由问题正则自动抽取（见 §10.6 ②）。
+> 前三个场景（`account_overview` / `publisher_deepdive` / `scaling_capacity`）支持「全局/账户级」自动研判；`campaign_ranking` 为跨 Campaign 排名/诊断类型（无需实体 id，按营收环比涨跌榜作答）；其余四个（`campaign_detail` / `advertiser_deepdive` / `traffic_policy_check` / `kpi_compare`）为**实体下钻类型**，必须由请求显式传入实体 id（顶层或 `params` 内），或在 `/tess/ask` 里由问题正则自动抽取（见 §10.6 ②）。
 
 **实现要点（实测验证）：**
 - `/campaigns` 支持 `campaign_ids=逗号列表` 精确过滤（上限 `page_size=100`）；`scaling_capacity` 先聚合 `/report` 拿到相关 campaign_id，再分批（每批≤100）回查 cap，避免 3M 全量拉取与 422 报错。
@@ -568,7 +571,7 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 **深度下钻（可选）**：`/tess/ask` 不只能答浅层全局问题，还复用 `/tess/analytics` 同一套深度取数层（`fetch_bi_analysis_context`）。上下文选择优先级（①②③ 走深度上下文，④ 走浅层兜底）：
 1. **显式透传**：请求体带 `analysis_type`（前端胶囊直接透传，确定性最强）→ `route_source="explicit"`；
 2. **实体正则识别（新增）**：不带 `analysis_type`、但问题里含实体 id 时，用 `extract_entity_id()` 正则抽取并映射到对应深度类型。**支持两种语序**（数字+关键字 或 关键字+数字，中间可夹 `id`/分隔符）——如 `5845554camp` / `campaign id5845554` / `campaign 5845554` / 含 `ctit|etit`（并可从 `id5845554` 紧贴写法补抽）→ `campaign_detail`（自动取 campaign_id）；`广告主 1000734` / `1000734adv` → `advertiser_deepdive`；`1000571pub` / `1000571渠道` → `publisher_deepdive`；命中即下钻，`route_source="entity"`；
-3. **后端关键词推断**：都不命中时，用轻量关键词把问题映射到深度类型（如「放量空间」→ `scaling_capacity`、「对账」→ `finance_check`、`ctit`/`漏斗` → `campaign_detail`、`对比`/`趋势` → `kpi_compare`），命中即下钻，`route_source="inferred"`；
+3. **后端关键词推断**：都不命中时，用轻量关键词把问题映射到深度类型（如「放量空间」→ `scaling_capacity`、「对账」→ `finance_check`、`ctit`/`漏斗` → `campaign_detail`、`对比`/`趋势` → `kpi_compare`、「利润环比下滑最快」/`哪个 Campaign 掉最快` → `campaign_ranking`），命中即下钻，`route_source="inferred"`；
 4. **浅层兜底**：①②③ 皆未命中 → 退回原「全局态势」上下文（`fetch_qa_context`），保证仍能量身答（无 `route_source` 字段）。
 
 > 注意优先级：② 实体正则高于 ③ 关键词表，因此「帮我分析一下这个 5845554camp 的 ctit」或「campaign id5845554 的 ctit」都会精确落到 `campaign_detail`（而非被笼统的关键词命中），不再出现"数据不足"。顶层或 `params` 内显式传入的 `campaign_id` / `advertiser_id` / `publisher_id` 会直接覆盖正则推断。
@@ -583,7 +586,7 @@ X-Operator-Id: <运营ID>             # 可选，审计
 # 方式 A：纯自由提问（后端自动判断是否下钻）
 { "question": "昨天整体营收表现如何？有没有需要重点关注的异常？" }
 
-# 方式 B：前端胶囊显式下钻（analysis_type 与 /tess/analytics 同枚举，共 10 种）
+# 方式 B：前端胶囊显式下钻（analysis_type 与 /tess/analytics 同枚举，共 11 种）
 { "question": "各 Campaign 还有多少放量空间？", "analysis_type": "scaling_capacity", "params": {} }
 # 财务对账可带月份：{ "question": "本月对账", "analysis_type": "finance_check", "params": { "report_month": "2026-08" } }
 # 实体下钻：显式传 id（顶层或 params 内皆可）

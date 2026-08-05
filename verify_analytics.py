@@ -53,6 +53,7 @@ ALL_TYPES = [
     "advertiser_deepdive",
     "traffic_policy_check",
     "kpi_compare",
+    "campaign_ranking",
 ]
 
 

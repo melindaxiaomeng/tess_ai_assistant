@@ -118,6 +118,7 @@ def fetch_bi_analysis_context(
       'advertiser_deepdive'    -> 广告主维度（档案 + 日 KPI + 旗下 Campaign）
       'traffic_policy_check'   -> 流量策略核查（渠道映射/替换渠道/屏蔽规则）
       'kpi_compare'            -> 指标趋势与同期对比（KPI 趋势 + 区间对比）
+      'campaign_ranking'       -> 跨 Campaign 排名/诊断（涨跌榜 rising/falling，按 revenue_change 排序，答"哪个 Campaign 环比下滑最快"）
 
     返回结构化的上下文 dict，供 LLM 生成简报。每个子数据源独立容错：
     单个接口失败只会在对应字段标记 error，不会拖垮整个分析。
@@ -564,12 +565,38 @@ def fetch_bi_analysis_context(
             "errors": [e for e in (err_t, err_c) if e],
         }
 
+    # ---------------------------------------------------------------
+    # 场景 9：跨 Campaign 排名 / 诊断（"哪个 Campaign 利润环比下滑最快"）
+    # ---------------------------------------------------------------
+    elif analysis_type == "campaign_ranking":
+        fluc, err_fluc = _safe_api_get(connector, "/overview/ranking/fluctuation", token=token)
+        fluc_map = fluc if isinstance(fluc, dict) else {}
+        rising = fluc_map.get("rising") or []
+        falling = fluc_map.get("falling") or []
+
+        # 按营收环比（revenue_change）排序：falling 升序（最负=跌最快）在前
+        def _rc(x):
+            try:
+                return float(x.get("revenue_change") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        falling_sorted = sorted(falling, key=_rc)[:10]
+        rising_sorted = sorted(rising, key=lambda x: -_rc(x))[:10]
+
+        return {
+            "analysis_type": "campaign_ranking",
+            "metric_note": "涨跌榜口径为营收(revenue)环比（revenue_change）；接口未提供独立利润(profit)环比字段，利润口径以营收环比代理。falling_top 已按 revenue_change 升序排列，[0] 即环比下滑最快的 Campaign。",
+            "rising_top": rising_sorted,
+            "falling_top": falling_sorted,
+            "errors": [e for e in (err_fluc,) if e],
+        }
+
     else:
         raise ValueError(
             f"未知的 analysis_type={analysis_type!r}；"
             "支持: daily_summary / scaling_opportunity / finance_check / account_overview / "
             "publisher_deepdive / scaling_capacity / campaign_detail / advertiser_deepdive / "
-            "traffic_policy_check / kpi_compare"
+            "traffic_policy_check / kpi_compare / campaign_ranking"
         )
 
 
@@ -672,6 +699,7 @@ def _build_user_prompt(analysis_type: str, ctx: dict) -> str:
         "advertiser_deepdive": "以下是广告主档案与日 KPI 趋势，请分析该广告主的整体消耗与旗下活动表现。",
         "traffic_policy_check": "以下是该渠道/活动的映射、替换与屏蔽规则，请核查流量策略配置是否完整、是否存在风险。",
         "kpi_compare": "以下是该 Campaign 的指标趋势与同期对比，请分析波动原因与环比变化。",
+        "campaign_ranking": "以下是各 Campaign 的环比涨跌榜（rising/falling，字段含 campaign_id、campaign_name、revenue、revenue_change）。请找出利润/营收环比下滑最快的 Campaign，给出 campaign_id、名称、下滑幅度与可能原因。注意：涨跌榜口径为营收(revenue)环比，接口未提供独立利润(profit)环比字段，若用户问「利润」请明确说明并以营收环比作答。",
     }.get(analysis_type, "请基于以下数据做商业分析。")
 
     return (
@@ -763,6 +791,7 @@ ANALYSIS_TYPES = {
     "advertiser_deepdive",
     "traffic_policy_check",
     "kpi_compare",
+    "campaign_ranking",
 }
 
 # 关键词路由表（优先级自上而下：先匹配更具体的类型）。
@@ -777,6 +806,7 @@ _ANALYSIS_KEYWORDS: list = [
     ("campaign_detail", ["ctit", "etit", "漏斗", "转化时间", "事件质量", "活动详情", "单活动", "campaign详情"]),
     ("advertiser_deepdive", ["广告主", "advertiser", "主户", "客户"]),
     ("traffic_policy_check", ["替换渠道", "切量", "切流量", "流量策略", "屏蔽", "block", "replace", "映射", "渠道映射"]),
+    ("campaign_ranking", ["利润环比下滑", "利润下滑", "营收下滑", "环比下滑", "下滑最快", "跌幅最大", "掉得最快", "降幅最大", "哪个campaign", "哪个活动", "哪个 campaign", "谁掉得最快", "利润下降最快", "营收下降最快"]),
     ("kpi_compare", ["环比", "对比", "波动", "暴跌", "暴涨", "趋势", "trend", "对比昨日"]),
 ]
 
