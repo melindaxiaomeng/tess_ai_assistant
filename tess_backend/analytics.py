@@ -64,6 +64,7 @@ BI_SYSTEM_PROMPT = """你叫 Tess，是 Teensing 平台的专属 AdTech 商业�
 - 严禁编造数据中不存在的实体、数值或趋势；如果某维度数据为空/缺失，明确说明"该维度暂无数据，建议补充口径"，不要臆测。
 - 涉及金额/百分比必须直接引用输入数值，不得自行计算篡改。
 - 输出全部使用中文，语气专业、简洁，禁止客套寒暄。
+- 实体名称已附带 (id)，引用 Campaign / Publisher / Advertiser 时务必保留其 (id)，便于运营定位核对。
 """
 
 
@@ -442,6 +443,50 @@ def _pct_delta(today: Optional[dict], yesterday: Optional[dict]) -> dict:
     return out
 
 
+# 已知「名称字段 -> id 字段」配对：把 id 追加到名称后（如 "Nike MX (5832106)"），
+# 覆盖 campaign / publisher / advertiser 三类实体，以及主数据目录通用的 name/id。
+_NAME_ID_PAIRS = (
+    ("campaign_name", "campaign_id"),
+    ("publisher_name", "publisher_id"),
+    ("advertiser_name", "advertiser_id"),
+    ("name", "id"),  # /campaigns、/publishers、/advertisers 主数据目录
+)
+
+
+def _fmt_id(v) -> str:
+    """把 id 规整成字符串；整型数值去掉 .0（如 5832106.0 -> '5832106'）。"""
+    if v is None or v == "":
+        return ""
+    try:
+        f = float(v)
+        if f.is_integer():
+            return str(int(f))
+    except (TypeError, ValueError):
+        pass
+    return str(v)
+
+
+def _enrich_names_with_ids(obj):
+    """递归遍历上下文，给所有 (name, id) 配对的字段把 id 追加到名称后。
+
+    仅增强 name 字段（"name (id)"），不改 id 字段本身（前端可能单独依赖 id 做跳转/动作）。
+    """
+    if isinstance(obj, dict):
+        for name_field, id_field in _NAME_ID_PAIRS:
+            if name_field in obj and id_field in obj:
+                nm = obj.get(name_field)
+                idv = _fmt_id(obj.get(id_field))
+                if not nm or not idv:
+                    continue
+                obj[name_field] = f"{nm} ({idv})"
+        for v in obj.values():
+            _enrich_names_with_ids(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            _enrich_names_with_ids(v)
+    return obj
+
+
 def _build_user_prompt(analysis_type: str, ctx: dict) -> str:
     """把结构化上下文拼成给 LLM 的 user prompt。
 
@@ -496,6 +541,7 @@ def process_data_analysis_query(
     - operator_id / token_mode: 审计字段，原样回显到 context_summary。
     """
     ctx = fetch_bi_analysis_context(connector, analysis_type, token=token, params=params)
+    ctx = _enrich_names_with_ids(ctx)  # 名称追加 (id)，便于核对实体
     user_prompt = _build_user_prompt(analysis_type, ctx)
     report = llm.complete(BI_SYSTEM_PROMPT, user_prompt, json_mode=False)
     return {
@@ -522,6 +568,7 @@ ASK_SYSTEM_PROMPT = """你叫 Tess，是 Teensing 平台的专属 AdTech 智能�
 - 观点先行：先给结论，再用数据支撑，最后给可执行建议；
 - 数据必须来自上下文，严禁编造上下文里没有的数字、Campaign 名或实体；
 - 若上下文不足以回答，明确说明「数据不足，暂无法确认」，不要臆测；
+- 实体名称已附带 (id)，引用 Campaign / Publisher / Advertiser 时务必保留其 (id)，便于定位核对。
 - 用 Markdown 排版，关键结论可用 📊（复盘）/ 💡（洞察）/ 🚀（建议）标记。
 """
 
@@ -636,6 +683,7 @@ def process_question(
 
     if route_source:  # ①② 走深度上下文（与 /tess/analytics 同一套取数）
         ctx = fetch_bi_analysis_context(connector, analysis_type, token=token, params=params)
+        ctx = _enrich_names_with_ids(ctx)  # 名称追加 (id)，便于核对实体
         ctx_text = _trim_for_prompt(ctx, limit=9000)  # 深度上下文更大，放宽截断
         user_prompt = (
             f"【Teensing 业务数据上下文（深度下钻：{analysis_type}）】\n"
@@ -650,6 +698,7 @@ def process_question(
         }
     else:  # ③ 浅层全局兜底（保持原行为）
         ctx = fetch_qa_context(connector, token=token, question=question)
+        ctx = _enrich_names_with_ids(ctx)  # 名称追加 (id)，便于核对实体
         ctx_text = _trim_for_prompt(ctx, limit=6000)
         user_prompt = (
             "【Teensing 业务数据上下文】\n"
