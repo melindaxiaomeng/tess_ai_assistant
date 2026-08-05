@@ -567,11 +567,11 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 
 **深度下钻（可选）**：`/tess/ask` 不只能答浅层全局问题，还复用 `/tess/analytics` 同一套深度取数层（`fetch_bi_analysis_context`）。上下文选择优先级（①②③ 走深度上下文，④ 走浅层兜底）：
 1. **显式透传**：请求体带 `analysis_type`（前端胶囊直接透传，确定性最强）→ `route_source="explicit"`；
-2. **实体正则识别（新增）**：不带 `analysis_type`、但问题里含实体 id 时，用 `extract_entity_id()` 正则抽取并映射到对应深度类型——`5845554camp` / 含 `ctit|etit` → `campaign_detail`（自动取 campaign_id）；`广告主 1000734` / `1000734adv` → `advertiser_deepdive`；`1000571pub` / `1000571渠道` → `publisher_deepdive`；命中即下钻，`route_source="entity"`；
+2. **实体正则识别（新增）**：不带 `analysis_type`、但问题里含实体 id 时，用 `extract_entity_id()` 正则抽取并映射到对应深度类型。**支持两种语序**（数字+关键字 或 关键字+数字，中间可夹 `id`/分隔符）——如 `5845554camp` / `campaign id5845554` / `campaign 5845554` / 含 `ctit|etit`（并可从 `id5845554` 紧贴写法补抽）→ `campaign_detail`（自动取 campaign_id）；`广告主 1000734` / `1000734adv` → `advertiser_deepdive`；`1000571pub` / `1000571渠道` → `publisher_deepdive`；命中即下钻，`route_source="entity"`；
 3. **后端关键词推断**：都不命中时，用轻量关键词把问题映射到深度类型（如「放量空间」→ `scaling_capacity`、「对账」→ `finance_check`、`ctit`/`漏斗` → `campaign_detail`、`对比`/`趋势` → `kpi_compare`），命中即下钻，`route_source="inferred"`；
 4. **浅层兜底**：①②③ 皆未命中 → 退回原「全局态势」上下文（`fetch_qa_context`），保证仍能量身答（无 `route_source` 字段）。
 
-> 注意优先级：② 实体正则高于 ③ 关键词表，因此「帮我分析一下这个 5845554camp 的 ctit」会精确落到 `campaign_detail`（而非被笼统的关键词命中），不再出现"数据不足"。顶层或 `params` 内显式传入的 `campaign_id` / `advertiser_id` / `publisher_id` 会直接覆盖正则推断。
+> 注意优先级：② 实体正则高于 ③ 关键词表，因此「帮我分析一下这个 5845554camp 的 ctit」或「campaign id5845554 的 ctit」都会精确落到 `campaign_detail`（而非被笼统的关键词命中），不再出现"数据不足"。顶层或 `params` 内显式传入的 `campaign_id` / `advertiser_id` / `publisher_id` 会直接覆盖正则推断。
 
 ```
 POST /tess/ask

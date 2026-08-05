@@ -804,6 +804,11 @@ def extract_entity_id(question: str, params: Optional[dict]) -> tuple:
     优先级：显式参数(campaign_id/advertiser_id/publisher_id) > 问题里的正则实体。
     这是比关键词表更高优先级的路由判断（解决"5845554camp 的 ctit"这类实体下钻问题）。
     返回 (analysis_type, params)；未识别到实体则返回 (None, params)。
+
+    支持两种语序：
+      - 数字 + 关键字：如 "5845554camp" / "5845554 campaign"
+      - 关键字 + 数字：如 "campaign id5845554" / "campaign 5845554" / "cid: 5845554"
+      - ctit/etit 语境下，若问题含 "id1234567" 紧贴写法，也补抽为 campaign_id
     """
     params = params or {}
     q = (question or "").lower()
@@ -816,23 +821,39 @@ def extract_entity_id(question: str, params: Optional[dict]) -> tuple:
     if params.get("publisher_id"):
         return "publisher_deepdive", params
 
-    # 2) 问题正则：campaign（数字+camp/campaign，或 ctit/etit 关键词）
-    m = re.search(r"(\d{4,})\s*(?:camp|campaign)\b", q)
-    if m or re.search(r"\b(ctit|etit)\b", q):
-        if m:
-            return "campaign_detail", {**params, "campaign_id": m.group(1)}
-        # ctit/etit 但问题里没有 id，无法下钻，交由关键词/浅层兜底
+    # 通用：关键字在前、数字在后（中间可夹 "id" / 分隔符），最多跳过 15 个非数字字符
+    # 注意：不用 \\b 收尾，避免中文关键字（广告主/渠道）后无单词边界导致整体失配
+    KW_BEFORE_NUM = r"(?:{kw})[^\d]{{0,15}}?(\d{{4,}})"
+
+    # 2) campaign：数字+关键字，或 关键字+数字，或 ctit/etit 语境
+    camp_m = re.search(r"(\d{4,})\s*(?:camp|campaign)\b", q)            # 5845554camp
+    if not camp_m:
+        camp_m = re.search(KW_BEFORE_NUM.format(kw=r"camp|campaign|cid|campaign_id"), q)  # campaign id5845554
+    has_ctit = re.search(r"\b(ctit|etit)\b", q)
+    if camp_m or has_ctit:
+        cid = camp_m.group(1) if camp_m else None
+        if not cid and has_ctit:
+            # 仅 ctit/etit 语境：从 "id1234567" / "#1234567" 紧贴写法补抽 campaign_id
+            m2 = re.search(r"(?:id|#)\s*(\d{4,})", q)
+            cid = m2.group(1) if m2 else None
+        if cid:
+            return "campaign_detail", {**params, "campaign_id": cid}
+        # ctit/etit 但问题里没有可识别的 id，无法下钻，交由关键词/浅层兜底
         return None, params
 
-    # 3) 广告主 / 客户
-    m = re.search(r"(\d{4,})\s*(?:adv|advertiser|广告主)\b", q)
-    if m:
-        return "advertiser_deepdive", {**params, "advertiser_id": m.group(1)}
+    # 3) 广告主 / 客户（同样支持两种语序）
+    adv_m = re.search(r"(\d{4,})\s*(?:adv|advertiser|广告主)\b", q)
+    if not adv_m:
+        adv_m = re.search(KW_BEFORE_NUM.format(kw=r"adv|advertiser|广告主"), q)
+    if adv_m:
+        return "advertiser_deepdive", {**params, "advertiser_id": adv_m.group(1)}
 
-    # 4) 渠道 / publisher
-    m = re.search(r"(\d{4,})\s*(?:pub|publisher|渠道)\b", q)
-    if m:
-        return "publisher_deepdive", {**params, "publisher_id": m.group(1)}
+    # 4) 渠道 / publisher（同样支持两种语序）
+    pub_m = re.search(r"(\d{4,})\s*(?:pub|publisher|渠道)\b", q)
+    if not pub_m:
+        pub_m = re.search(KW_BEFORE_NUM.format(kw=r"pub|publisher|渠道"), q)
+    if pub_m:
+        return "publisher_deepdive", {**params, "publisher_id": pub_m.group(1)}
 
     return None, params
 
