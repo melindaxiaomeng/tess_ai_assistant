@@ -161,6 +161,78 @@ class ChatStore:
             lines.append(f"{who}：{m.get('content', '')}")
         return "\n".join(lines)
 
+    def export_rows(self, operator_id: Optional[str] = None) -> list:
+        """导出全量「轮」记录（按轮合并 user+assistant），供运营报表 / BI 拉取。
+
+        返回 list[dict]，字段：
+          chat_id / operator_id / question / answer / ts（该轮提问时间）/
+          analysis_type / route_source / campaign_id / advertiser_id /
+          publisher_id / package_name / owner_user_id
+        operator_id 给定则按运营隔离。
+        """
+        with self.Session() as s:
+            q = s.query(ChatSession)
+            if operator_id:
+                q = q.filter(ChatSession.operator_id == operator_id)
+            rows = q.all()
+        out = []
+        for row in rows:
+            msgs = row.messages or []
+            pending_q = None
+            for m in msgs:
+                if m.get("role") == "user":
+                    pending_q = m
+                elif m.get("role") == "assistant" and pending_q is not None:
+                    meta = pending_q.get("meta") or {}
+                    ents = meta.get("entities") or {}
+                    out.append({
+                        "chat_id": row.chat_id,
+                        "operator_id": row.operator_id,
+                        "question": pending_q.get("content", ""),
+                        "answer": m.get("content", ""),
+                        "ts": pending_q.get("ts"),
+                        "analysis_type": meta.get("analysis_type"),
+                        "route_source": meta.get("route_source"),
+                        "campaign_id": ents.get("campaign_id"),
+                        "advertiser_id": ents.get("advertiser_id"),
+                        "publisher_id": ents.get("publisher_id"),
+                        "package_name": ents.get("package_name"),
+                        "owner_user_id": ents.get("owner_user_id"),
+                    })
+                    pending_q = None
+        return out
+
+    def aggregate_stats(self, operator_id: Optional[str] = None) -> dict:
+        """聚合运营分析指标，供 /tess/chats/stats 报表看板。
+
+        含：会话数 / 轮数 / Top 问题 / Top 实体 / 各运营提问量 /
+        分析类型分布（单维各类型 + cross_dimension + None=QA）/ 路由来源分布 / 按天分桶。
+        """
+        from collections import Counter
+
+        rows = self.export_rows(operator_id)
+        q_counter = Counter(r["question"] for r in rows)
+        ent_counter: Counter = Counter()
+        for r in rows:
+            for k in ("campaign_id", "advertiser_id", "publisher_id", "package_name", "owner_user_id"):
+                v = r.get(k)
+                if v is not None:
+                    ent_counter[f"{k}={v}"] += 1
+        op_counter = Counter(r["operator_id"] for r in rows)
+        at_counter = Counter(str(r["analysis_type"]) for r in rows)
+        rs_counter = Counter(str(r["route_source"]) for r in rows)
+        day_counter = Counter((r["ts"] or "")[:10] for r in rows)
+        return {
+            "total_sessions": len({r["chat_id"] for r in rows}),
+            "total_turns": len(rows),
+            "top_questions": [{"question": q, "count": c} for q, c in q_counter.most_common(20)],
+            "top_entities": [{"entity": e, "count": c} for e, c in ent_counter.most_common(20)],
+            "per_operator": [{"operator_id": o, "count": c} for o, c in op_counter.most_common(50)],
+            "analysis_type_distribution": dict(at_counter),
+            "route_source_distribution": dict(rs_counter),
+            "daily_buckets": dict(sorted(day_counter.items())),
+        }
+
 
 # —— 模块级懒加载单例 + 多轮读写助手（供 app.py / tools_adapter 复用）——
 _STORE: Optional[ChatStore] = None
@@ -185,10 +257,19 @@ def load_history(chat_id: str):
 
 
 def record_turn(chat_id: str, operator_id: str, question: str, answer: str,
-                entities: Optional[dict]) -> None:
-    """把一轮问答写回会话；chat_id 为空则不写（单轮模式）。"""
+                entities: Optional[dict], analysis_type: Optional[str] = None,
+                route_source: Optional[str] = None) -> None:
+    """把一轮问答写回会话；chat_id 为空则不写（单轮模式）。
+
+    每条 user 消息的 meta 额外记录 analysis_type / route_source，
+    供运营分析「问题类型分布（单维/cross/QA）」使用（见 /tess/chats/export|stats）。
+    """
     if not chat_id:
         return
     store = get_chat_store()
-    store.append(chat_id, operator_id, "user", question, meta={"entities": entities or {}})
+    store.append(chat_id, operator_id, "user", question, meta={
+        "entities": entities or {},
+        "analysis_type": analysis_type,
+        "route_source": route_source,
+    })
     store.append(chat_id, operator_id, "assistant", answer)

@@ -180,7 +180,13 @@ def dispatch_tool(tool_name: str, args: dict, request=None) -> dict:
                 _ents = resolve_entities(_ents, connector, token)
             except Exception:
                 _ents = {}
-            record_turn(chat_id, operator, str(question), result.get("answer", ""), _ents)
+            cs = result.get("context_summary", {})
+            record_turn(
+                chat_id, operator, str(question), result.get("answer", ""),
+                _ents,
+                analysis_type=cs.get("analysis_type"),
+                route_source=cs.get("route_source"),
+            )
         return result
 
     if tool_name == "tess_fetch_warning":

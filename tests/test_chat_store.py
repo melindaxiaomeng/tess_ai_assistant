@@ -230,3 +230,72 @@ def test_chats_list_endpoint(monkeypatch, tmp_path):
     s1 = next(s for s in body["sessions"] if s["chat_id"] == "sessL1")
     assert s1["title"] == "广告主 1000839 的营收"
     assert s1["message_count"] == 4
+
+
+# ------------------- 报表导出 / 聚合（P9 运营分析） -------------------
+
+def test_export_rows_and_aggregate(store):
+    store.append("cX", "opX", "user", "广告主营收",
+                 meta={"entities": {"advertiser_id": 1000839},
+                       "analysis_type": "advertiser_deepdive", "route_source": "entity"})
+    store.append("cX", "opX", "assistant", "营收 100")
+    store.append("cX", "opX", "user", "campaign 营收",
+                 meta={"entities": {"campaign_id": 5845554},
+                       "analysis_type": "campaign_detail", "route_source": "entity"})
+    store.append("cX", "opX", "assistant", "营收 200")
+    store.append("cY", "opY", "user", "QA 问题",
+                 meta={"entities": {}, "analysis_type": None, "route_source": None})
+    store.append("cY", "opY", "assistant", "这是 CTIT 解释")
+
+    rows = store.export_rows()
+    assert len(rows) == 3  # 3 个 user+assistant 配对
+    assert rows[0]["question"] == "广告主营收"
+    assert rows[0]["analysis_type"] == "advertiser_deepdive"
+    assert rows[0]["advertiser_id"] == 1000839
+    assert rows[0]["answer"] == "营收 100"
+
+    # 按 operator 隔离
+    only_x = store.export_rows(operator_id="opX")
+    assert len(only_x) == 2
+    assert all(r["operator_id"] == "opX" for r in only_x)
+
+    stats = store.aggregate_stats()
+    assert stats["total_sessions"] == 2
+    assert stats["total_turns"] == 3
+    assert stats["analysis_type_distribution"].get("advertiser_deepdive") == 1
+    assert stats["analysis_type_distribution"].get("campaign_detail") == 1
+    assert stats["analysis_type_distribution"].get("None") == 1
+    assert stats["route_source_distribution"].get("entity") == 2
+    assert stats["route_source_distribution"].get("None") == 1
+    assert stats["top_entities"][0]["entity"] == "advertiser_id=1000839"
+    assert stats["per_operator"][0]["operator_id"] == "opX"
+    assert any(k for k in stats["daily_buckets"])  # 有日期分桶
+
+
+def test_export_and_stats_endpoints(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    # 制造数据：带 chat_id 的问答（落库 analysis_type / route_source）
+    c.post("/tess/ask", json={"question": "广告主 1000839 的营收", "chat_id": "sessE1"})
+    c.post("/tess/ask", json={"question": "它昨天的利润", "chat_id": "sessE1"})
+
+    # export json
+    rj = c.get("/tess/chats/export?format=json")
+    assert rj.status_code == 200
+    jbody = rj.json()
+    assert jbody["count"] == 2
+    assert jbody["rows"][0]["analysis_type"] == "advertiser_deepdive"
+    assert jbody["rows"][0]["route_source"] == "entity"
+
+    # export csv
+    rc = c.get("/tess/chats/export?format=csv")
+    assert rc.status_code == 200
+    assert rc.headers["content-type"].startswith("text/csv")
+    assert "question" in rc.text and "analysis_type" in rc.text
+
+    # stats
+    rs = c.get("/tess/chats/stats")
+    assert rs.status_code == 200
+    sbody = rs.json()
+    assert sbody["total_sessions"] == 1
+    assert sbody["total_turns"] == 2
+    assert sbody["analysis_type_distribution"].get("advertiser_deepdive") == 2

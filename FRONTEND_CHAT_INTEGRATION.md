@@ -105,7 +105,61 @@ messages.push({ role: "assistant", content: resp.answer }); // 注意取 resp.an
 
 > 注意：当前前端策略是"抽屉打开期间恒定 chat_id、关闭/刷新换新 id"，所以每个抽屉打开会落一条新会话；历史列表会逐条累积，点击即可恢复任意一条。若想"重开抽屉接着聊上次的"，把当前 `chat_id` 存 `localStorage` 即可（无需新接口）。
 
-## 6. 注意事项
+## 6. 运营分析报表接口（出报表用）
+
+> 这两个接口用于**把大家问的问题 / 回答 / 实体 / 谁问的 / 何时**导出来做优化分析。受 `X-API-Key` 守卫；按 `X-Operator-Id` 隔离（不传则只看 `anonymous` 桶）。
+
+### 6.1 `GET /tess/chats/export?format=json|csv`
+导出全量「轮」记录（每轮 = 一问一答合并成一行），可直接拉进 Excel / BI。
+
+- `format=json`（默认）：
+```json
+{
+  "count": 2,
+  "rows": [
+    { "chat_id":"sess-1", "operator_id":"opX", "question":"广告主 1000839 的营收",
+      "answer":"### 诊断结论...", "ts":"2026-09-12T08:00:00Z",
+      "analysis_type":"advertiser_deepdive", "route_source":"entity",
+      "campaign_id":null, "advertiser_id":1000839, "publisher_id":null,
+      "package_name":null, "owner_user_id":null }
+  ]
+}
+```
+- `format=csv`：同字段的扁平 CSV 下载（文件名 `tess_chats.csv`），`question` / `answer` 若含换行会被 csv 模块正确包裹。
+
+字段说明：`analysis_type` 区分「单维下钻类型 / cross_dimension / null(纯问答兜底)」，是做「问题类型分布」分析的关键维度；`route_source`（`explicit|entity|inferred`）区分问题是怎么被路由的。
+
+### 6.2 `GET /tess/chats/stats`
+后端算好的聚合指标，前端可直接渲染成报表看板：
+```json
+{
+  "total_sessions": 12, "total_turns": 58,
+  "top_questions": [{"question":"广告主 1000839 的营收","count":9}],
+  "top_entities":   [{"entity":"advertiser_id=1000839","count":11}],
+  "per_operator":   [{"operator_id":"opX","count":40}],
+  "analysis_type_distribution": {"advertiser_deepdive":20,"cross_dimension":8,"campaign_detail":12,"None":18},
+  "route_source_distribution":   {"entity":40,"explicit":6,"inferred":2,"None":10},
+  "daily_buckets": {"2026-09-10":15,"2026-09-11":23,"2026-09-12":20}
+}
+```
+- `top_questions`：高频问题原文（优化话术 / 预设胶囊的线索）
+- `top_entities`：被问得最多的 campaign / 广告主 / 渠道（运营重点对象）
+- `per_operator`：各运营提问量（活跃度 / 培训重点）
+- `analysis_type_distribution`：**单维 vs 交叉维度 vs 纯问答** 占比（判断要不要强化某类下钻）
+- `daily_buckets`：提问按天分布
+
+### 6.3 验证（部署后）
+```bash
+# 导出 CSV（拿去 Excel）
+curl -s -H "X-API-Key: $TESS_API_KEY" -H "X-Operator-Id: opX" \
+  "http://<Tess服务器IP>:8080/tess/chats/export?format=csv" -o tess_chats.csv
+
+# 看聚合
+curl -s -H "X-API-Key: $TESS_API_KEY" -H "X-Operator-Id: opX" \
+  "http://<Tess服务器IP>:8080/tess/chats/stats" | jq .
+```
+
+## 7. 注意事项
 
 - **`chat_id` 必须每次相同才能多轮**；换 id = 新会话（历史不继承）。
 - 不传 `chat_id` 也能正常问答，只是无法追问指代（退化为单轮兜底）。
