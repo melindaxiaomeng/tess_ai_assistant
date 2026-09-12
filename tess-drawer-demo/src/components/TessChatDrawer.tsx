@@ -22,13 +22,13 @@ export interface TessChatMessage {
 export interface TessChatDrawerProps {
   backend: string; // 如 http://<Tess服务器IP>:8080
   apiKey?: string; // X-API-Key（生产必带，守卫 /tess/*）
-  teensingToken?: string; // X-Teensing-Token（运营 SaaS access_token，按权限取数 RBAC）
+  platformId?: string; // X-Platform-Id（平台标识；后端按它取该平台 token）
 }
 
 export const TessChatDrawer: React.FC<TessChatDrawerProps> = ({
   backend,
   apiKey,
-  teensingToken,
+  platformId,
 }) => {
   // —— 改动 1：生成并持有 chat_id（每次“新对话”换一个新的）——
   const [chatId, setChatId] = useState<string>(() => crypto.randomUUID());
@@ -61,7 +61,7 @@ export const TessChatDrawer: React.FC<TessChatDrawerProps> = ({
         "Content-Type": "application/json",
       };
       if (apiKey) headers["X-API-Key"] = apiKey;
-      if (teensingToken) headers["X-Teensing-Token"] = teensingToken;
+      if (platformId) headers["X-Platform-Id"] = platformId;
 
       const res = await fetch(`${base}/tess/ask`, {
         method: "POST",

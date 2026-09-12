@@ -422,7 +422,7 @@ Nginx 注入的 `<TESS_API_KEY>` 必须与 Tess 容器启动时的 `TESS_API_KEY
 POST /tess/analytics
 Content-Type: application/json
 X-API-Key: <TESS_API_KEY>            # Tess<->Teensing 共享密钥（网关注入）
-X-Teensing-Token: <终端用户 SaaS access_token>   # 可选：按「该用户」权限取数；缺省回退系统 token
+X-Platform-Id: <平台标识>            # 可选：按该平台 token 取数；缺省回退全局系统 token
 X-Operator-Id: <运营ID>             # 可选：仅审计归因
 
 {
@@ -445,9 +445,9 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 }
 ```
 
-**按用户权限取数（重要）**：`X-Teensing-Token` 是**终端运营/用户的 SaaS access_token**，Tess 原样透传给 Teensing 作为其取数凭据；Teensing 按该用户的 RBAC/数据权限返回数据 —— **用户看不到其无权访问的 Campaign / 广告主 / 营收**。缺失时回退到 Tess 的 `TESS_SYSTEM_TOKEN`（系统级、无按人过滤，仅限内部 / 定时任务等无终端用户场景）。生产（Teensing 真实连接器）下若两者皆无，接口返回 `400`。
+**按平台取数（重要）**：`X-Platform-Id` 是平台标识（如 `Melodong`），Tess 按 it 从 `tess_platforms` 表取该平台的系统 token 调 Teensing；**前端不接触任何 token 明文**。未带/未注册则回退到 Tess 的 `TESS_SYSTEM_TOKEN`（全局兜底，写在后端配置）。生产（Teensing 真实连接器）下若两者皆无，接口返回 `400`。（原「运营个人 token X-Teensing-Token」口子已下线，后端不再读取。）
 
-> ⚠️ **两个密钥切勿混淆**：`X-API-Key` 是 **Tess↔Teensing 的共享密钥**，由 Teensing 的 Nginx/网关层统一注入（前端永不接触）；`X-Teensing-Token` 是**每个登录用户自己的 access_token**，必须由 Teensing 前端从当前用户会话里取出后**逐请求带上**。**不要把 `X-Teensing-Token` 写进 Nginx 注入**——否则所有请求共用同一个 token，按用户隔离就失效了。
+> ⚠️ **两个密钥切勿混淆**：`X-API-Key` 是 **Tess↔Teensing 的共享密钥**，由 Teensing 的 Nginx/网关层统一注入（前端永不接触）；`X-Platform-Id` 只是平台标识字符串，token 本体存在 Tess 后端数据库（`tess_platforms`），前端带不到、也拿不到。
 
 返回：
 
@@ -460,12 +460,12 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
     "date_or_month": "2026-08-03",
     "errors": [],
     "operator_id": "anonymous",     // 来自 X-Operator-Id，审计用
-    "token_mode": "user"            // "user"=按调用方 X-Teensing-Token 权限取数；"system"=系统 token
+    "token_mode": "platform"        // "platform"=按 X-Platform-Id 平台 token 取数；"system"=全局系统 token
   }
 }
 ```
 
-`report` 为 Markdown 简报（含 📊/💡/🚀 三段），前端可直接渲染；`errors` 列表非空表示部分数据源拉取失败（接口已做单源容错，不会整轮崩）；`token_mode` 让前端 / 审计方一眼看出本次结果是否按用户权限隔离。
+`report` 为 Markdown 简报（含 📊/💡/🚀 三段），前端可直接渲染；`errors` 列表非空表示部分数据源拉取失败（接口已做单源容错，不会整轮崩）；`token_mode` 让前端 / 审计方一眼看出本次结果用的哪个平台的 token。
 
 ### 10.2 真实可用 API 完整目录（已用生产 token 探测确认）
 
@@ -599,7 +599,7 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 POST /tess/ask
 Content-Type: application/json
 X-API-Key: <TESS_API_KEY>            # 同 §10.1，网关注入
-X-Teensing-Token: <终端用户 access_token>   # 同 §10.1，按用户权限取数；缺省回退系统 token
+X-Platform-Id: <平台标识>            # 同 §10.1，按平台 token 取数；缺省回退全局系统 token
 X-Operator-Id: <运营ID>             # 可选，审计
 
 # 方式 A：纯自由提问（后端自动判断是否下钻）
@@ -640,7 +640,7 @@ X-Operator-Id: <运营ID>             # 可选，审计
     "endpoint": "/tess/ask",
     "errors": [],
     "operator_id": "op-1",
-    "token_mode": "user",
+    "token_mode": "platform",
     "analysis_type": "campaign_detail",       // 仅深度下钻时存在
     "route_source": "entity",                 // 仅深度下钻时存在：explicit(前端透传) | entity(问题正则识别 id) | inferred(后端关键词)
     "date_or_month": "2026-08-04"             // 仅深度下钻时存在

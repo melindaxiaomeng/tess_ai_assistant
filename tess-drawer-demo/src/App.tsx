@@ -10,7 +10,7 @@ import { SAMPLE_INPUT, MOCK_OUTPUT } from "./sample";
 export default function App() {
   const [backend, setBackend] = useState("https://8.141.113.22:8443");
   const [apiKey, setApiKey] = useState("");
-  const [token, setToken] = useState(""); // X-Teensing-Token：按权限取数（RBAC）
+  const [platformId, setPlatformId] = useState(""); // X-Platform-Id：后端按它取该平台 token
   const [input, setInput] = useState(JSON.stringify(SAMPLE_INPUT, null, 2));
 
   // Drawer 当前展示的数据
@@ -151,12 +151,12 @@ export default function App() {
           onChange={(e) => setApiKey(e.target.value)}
           placeholder="可选（留空=不鉴权）"
         />
-        <label className="text-gray-500">Teensing Token</label>
+        <label className="text-gray-500">Platform Id</label>
         <input
           className="w-[200px] border border-gray-300 rounded-md px-3 py-1.5 font-mono text-xs"
-          value={token}
-          onChange={(e) => setToken(e.target.value)}
-          placeholder="可选（X-Teensing-Token）"
+          value={platformId}
+          onChange={(e) => setPlatformId(e.target.value)}
+          placeholder="可选（X-Platform-Id，如 Melodong）"
         />
         <button
           className="border border-blue-600 text-blue-600 rounded-md px-3 py-1.5 hover:bg-blue-50"
@@ -255,7 +255,7 @@ export default function App() {
           Tess 自然语言问答（多轮 chat_id 会话）
         </h3>
         <div className="max-w-2xl">
-          <TessChatDrawer backend={backend} apiKey={apiKey} teensingToken={token} />
+          <TessChatDrawer backend={backend} apiKey={apiKey} platformId={platformId} />
         </div>
       </div>
 

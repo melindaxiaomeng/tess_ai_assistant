@@ -6,8 +6,8 @@
   endpoint、question（原始输入/问题）、answer（Tess 归一化诊断）、
   status、confidence、meta（可选附加信息）。
 - recent() 支持按 operator_id 过滤，便于「查某个人问过什么 / 答了什么」。
-- 配合 P5 数据接入的 token 透传：operator_id 与拉数据用的 X-Teensing-Token
-  同源，天然实现「按访问者权限回数据 + 按访问者留痕」的闭环。
+- 配合 P9 按平台取数：operator_id（谁问的）与 platform_id（哪个平台的数据）
+  一起留痕，实现「按平台取数 + 按访问者留痕」的闭环。
 """
 
 from __future__ import annotations

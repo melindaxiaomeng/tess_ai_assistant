@@ -34,7 +34,7 @@ await fetch("/tess/ask", {
   headers: {
     "Content-Type": "application/json",
     "X-API-Key": "YOUR_KEY",        // 生产必带（TESS_API_KEY 设了之后）
-    "X-Teensing-Token": userToken,  // 运营 SaaS access_token，按权限取数（RBAC）
+    "X-Platform-Id": platformId,    // 平台标识（如 "Melodong"）；后端按它取该平台 token
     "X-Operator-Id": userId,        // 可选，审计归因
   },
   body: JSON.stringify({
@@ -176,7 +176,7 @@ class TessDrawer {
   async ask(q) {
     const resp = await fetch("/tess/ask", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-API-Key": KEY, "X-Teensing-Token": TOKEN },
+      headers: { "Content-Type": "application/json", "X-API-Key": KEY, "X-Platform-Id": PID },
       body: JSON.stringify({ question: q, chat_id: this.chat_id }),
     }).then(r => r.json());
     return resp.answer;          // 渲染这个
@@ -192,7 +192,7 @@ class TessDrawer {
 本仓库 `tess-drawer-demo/` 已内置多轮问答抽屉，可直接 `npm install && npm run dev` 跑起来看效果：
 
 - `tess-drawer-demo/src/components/TessChatDrawer.tsx` —— 多轮问答组件（含上面 3 处改动 + `新对话` 按钮 + 消息流累积渲染）。
-- `tess-drawer-demo/src/App.tsx` —— 顶部配置栏新增 `Teensing Token` 输入，底部挂载 `TessChatDrawer`，把 `backend / apiKey / token` 透传下去。
+- `tess-drawer-demo/src/App.tsx` —— 顶部配置栏的 `Platform Id` 输入（X-Platform-Id），底部挂载 `TessChatDrawer`，把 `backend / apiKey / platformId` 透传下去。
 - 演示：先问“广告主 X 在渠道 Y 上近 7 日营收怎么样？”，再问“它昨天的营收呢？”即可看到 chat_id 自动指代、无需重复实体。
 
 ---
@@ -205,20 +205,20 @@ class TessDrawer {
 
 ### 8.1 前端所有请求加一个 `X-Platform-Id` 头
 
-在 §3 的 headers 里再加一行即可（与 `X-Operator-Id` / `X-Teensing-Token` 同级）：
+在 §3 的 headers 里加一行即可（与 `X-Operator-Id` 同级；**前端不传任何 token**）：
 
 ```js
 headers: {
   "Content-Type": "application/json",
   "X-API-Key": KEY,            // 对外接口鉴权
-  "X-Teensing-Token": TOKEN,   // 运营 RBAC（若有；否则回退平台级 token）
   "X-Operator-Id": userId,     // 谁问的（审计）
-  "X-Platform-Id": platformId, // ← 新增：平台标识（如 "facemoji" / "brandb"）
+  "X-Platform-Id": platformId, // ← 平台标识（如 "Melodong"），与注册 id 逐字符一致
 }
 ```
 
-- 后端按 `X-Platform-Id` 解析出该平台的系统 token 去 Teensing 取数；
-  未带则按 `X-Teensing-Token` → 全局 `TESS_SYSTEM_TOKEN` 回退（向后兼容旧前端）。
+- 后端按 `X-Platform-Id` 从 `tess_platforms` 表解析出该平台的系统 token 去 Teensing 取数；
+  未带/未注册则回退全局 `TESS_SYSTEM_TOKEN`（写在后端 `.env` / compose，前端不接触任何 token）。
+  注意：**不要传 `X-Teensing-Token`**——该「运营个人 token」口子已下线，后端不再读取。
 - 多轮 `POST /tess/ask` 带 `X-Platform-Id` 时，本轮问答会被打上该 `platform_id`，
   后续 `GET /tess/chats` / `/tess/chats/export` / `/tess/chats/stats` 也支持 `?platform=` 过滤。
 - 预警拉取 `GET /tess/alerts` / `/tess/realtime-kpi/alerts` 同样支持 `?platform=` 或头过滤，

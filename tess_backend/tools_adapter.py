@@ -109,7 +109,7 @@ def _resolve_runtime(request):
 
     返回 (connector, llm, token, token_mode, operator, platform_id)，
     token 与 platform_id 按 P9 平台规则解析：
-      1) 运营 X-Teensing-Token（最高） 2) 平台级 token（X-Platform-Id） 3) 全局 TESS_SYSTEM_TOKEN。
+      1) 平台级 token（X-Platform-Id 对应 tess_platforms 记录） 2) 全局 TESS_SYSTEM_TOKEN。
     """
     from .app import (
         _get_data_connector,
@@ -129,7 +129,7 @@ def _resolve_runtime(request):
     if isinstance(connector, TeensingDataConnector) and not effective_token:
         raise HTTPException(
             status_code=400,
-            detail="生产数据接入需携带取数凭据：运营 X-Teensing-Token、或平台级 token（X-Platform-Id 对应）、或 TESS_SYSTEM_TOKEN",
+            detail="生产数据接入需取数凭据：平台级 token（X-Platform-Id 对应平台已注册且启用）、或在后端配置 TESS_SYSTEM_TOKEN",
         )
     return connector, llm, effective_token, token_mode, operator, platform_id
 

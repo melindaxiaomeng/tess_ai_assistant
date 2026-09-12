@@ -4,9 +4,9 @@
 设计要点：
 - DataConnector 为抽象接口（Protocol），便于测试时换 Mock、生产时换 Teensing。
 - TeensingDataConnector 读环境变量（TESS_DATA_API_BASE_URL 等），调用真实异常数据 API。
-- **鉴权透传（P6）**：token 不在 Tess 落库，而是「每次调用由调用方经请求头
-  X-Teensing-Token 传入」，connector 原样作为 Bearer 转发给 Teensing；
-  Teensing 按该运营的 RBAC/数据权限返回数据 —— 实现「按访问者权限回数据」。
+- **鉴权透传（P9）**：token 不在 connector 里写死，而是每次调用时传入——来源为
+  平台级 token（按 X-Platform-Id 从 tess_platforms 解析）或全局 TESS_SYSTEM_TOKEN，
+  connector 原样作为 Bearer 转发给 Teensing。
 - normalize_to_context() 兼容两种上游形状：
   (a) 直接就是 PRD §4.1 Context（Mock 样例走这里）；
   (b) Teensing fluctuation/anomaly 形状（含 name/change/revenue/profit/margin）。
@@ -188,8 +188,8 @@ class TeensingDataConnector:
                   例：https://saas.teensing.com/api/v1）
     可选：TESS_DATA_API_TIMEOUT（请求超时秒，默认 10）
 
-    鉴权：token 由每次调用透传（来自请求头 X-Teensing-Token），作为 Bearer 发给
-          Teensing；环境变量 TESS_DATA_API_KEY 仅作兜底（多数场景不使用）。
+    鉴权：token 由每次调用透传（平台级 token 或全局 TESS_SYSTEM_TOKEN），作为
+          Bearer 发给 Teensing；环境变量 TESS_DATA_API_KEY 仅作兜底（多数场景不使用）。
     """
 
     def __init__(

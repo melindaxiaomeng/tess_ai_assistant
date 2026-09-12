@@ -296,12 +296,14 @@ docker compose up -d --build    # 改代码后重新构建
   - `GET /overview/ranking/fluctuation`（涨跌榜，含 `revenue/clicks/cvr/profit/margin/change`）
   - 经 `normalize_to_context()` 归一化为 PRD §4.1 Context 后送诊断编排。
 
-### 11.2 鉴权透传（按访问者权限回数据）
-- 生产模式**不**在 Tess 落库任何 SaaS 凭据。前端调用 Tess 时，在请求头带上：
-  - `X-Teensing-Token: <当前运营已登录 SaaS 的 access_token>`
-  - Tess 原样作为 `Authorization: Bearer` 转发给 Teensing；Teensing 按该运营的 RBAC / 数据权限返回数据。**无需额外账号体系，天然不越权。**
-- `POST /tess/diagnose-from-source` 在 teensing 模式下**强制要求** `X-Teensing-Token`，缺则返回 `400`。
-- 另有兜底环境变量 `TESS_DATA_API_KEY`（服务端固定凭据），仅在无前端透传的特殊场景使用。
+### 11.2 取数凭据（按平台回数据）
+- 前端调用 Tess 时**不带任何 token**，只带平台标识头：
+  - `X-Platform-Id: <平台标识>`（如 `Melodong`；需先经 `/tess/admin/platforms` 注册该平台及其 token）
+  - Tess 按 it 从 `tess_platforms` 表取该平台的系统 token，作为 `Authorization: Bearer` 转发给 Teensing。
+- 未带 / 未注册 `X-Platform-Id` 时回退全局 `TESS_SYSTEM_TOKEN`（写在后端 `.env` / compose）。
+- `POST /tess/diagnose-from-source` 在 teensing 模式下要求「平台 token 或全局 token」至少有其一，缺则返回 `400`。
+- 另有兜底环境变量 `TESS_DATA_API_KEY`（服务端固定凭据），仅在无平台注册的特殊场景使用。
+- （原「运营个人 token X-Teensing-Token」口子已下线，后端不再读取该头。）
 
 ### 11.3 问答审计（记录每个人问了什么、答了什么）
 - 每次 `POST /tess/diagnose` 与 `POST /tess/diagnose-from-source` 都会写入本地 SQLite 审计库（路径由 `TESS_AUDIT_DB` 指定，默认 `tess_audit.db`）。
@@ -310,11 +312,11 @@ docker compose up -d --build    # 改代码后重新构建
 
 ### 11.4 调用示例（curl）
 ```bash
-# 按当前运营权限拉取并诊断
+# 按平台 token 拉取并诊断
 curl -X POST http://localhost:8080/tess/diagnose-from-source \
   -H "Content-Type: application/json" \
   -H "X-Operator-Id: alice" \
-  -H "X-Teensing-Token: <alice 的 SaaS access_token>" \
+  -H "X-Platform-Id: Melodong" \
   -d '{"limit": 5}'
 
 # 查看某运营的问答审计

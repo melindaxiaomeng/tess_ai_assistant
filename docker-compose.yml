@@ -46,7 +46,7 @@ services:
       TESS_DATA_CONNECTOR: "${TESS_DATA_CONNECTOR:-mock}"
       # Teensing 异常数据 API 根地址（TESS_DATA_CONNECTOR=teensing 时必填，需含 /api/v1 前缀）
       TESS_DATA_API_BASE_URL: "${TESS_DATA_API_BASE_URL}"
-      # Teensing 数据 API 兜底 Token（多数场景留空，由调用方经 X-Teensing-Token 透传）
+      # 全局兜底 Token：未带/未注册 X-Platform-Id 的请求用它取数（分平台 token 见 tess_platforms 表）
       TESS_DATA_API_KEY: "${TESS_DATA_API_KEY}"
       # P9 平台管理密钥：专管 /tess/admin/platforms 增删改查，与对外 X-API-Key 隔离。
       # 留空=平台管理接口禁用（403）。生产必填，调用方请求头带 X-Admin-Key。

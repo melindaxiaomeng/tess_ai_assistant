@@ -386,17 +386,44 @@ def test_is_sudden_cliff_edge_cases():
 
 
 def test_teensing_requires_token_via_app(client, monkeypatch):
-    """生产(teensing)模式下，/tess/diagnose-from-source 缺 X-Teensing-Token 应 400。"""
+    """生产(teensing)模式下，/tess/diagnose-from-source 无平台 token 且无全局 TESS_SYSTEM_TOKEN 应 400。"""
     monkeypatch.setattr(app_module, "_DATA_CONNECTOR", TeensingDataConnector(
         base_url="https://saas.example.com/api/v1"
     ))
+    monkeypatch.delenv("TESS_SYSTEM_TOKEN", raising=False)
     resp = client.post(
         "/tess/diagnose-from-source",
         json={"limit": 2},
-        headers={"X-Operator-Id": "alice"},  # 有运营身份但无 token
+        headers={"X-Operator-Id": "alice"},  # 有运营身份但无任何 token
     )
     assert resp.status_code == 400
-    assert "X-Teensing-Token" in resp.json()["detail"]
+    assert "X-Platform-Id" in resp.json()["detail"]
+    assert "TESS_SYSTEM_TOKEN" in resp.json()["detail"]
+
+
+def test_teensing_diagnose_uses_global_token(client, monkeypatch):
+    """生产模式下未带 X-Platform-Id 时应回退全局 TESS_SYSTEM_TOKEN 取数（不要求前端传 token）。"""
+    captured = {}
+
+    def fake_fetch(self, limit, token=None):
+        captured["token"] = token
+        return []
+
+    monkeypatch.setattr(
+        app_module, "_DATA_CONNECTOR",
+        TeensingDataConnector(base_url="https://saas.example.com/api/v1"),
+    )
+    monkeypatch.setattr(
+        TeensingDataConnector, "fetch_recent_anomalies", fake_fetch
+    )
+    monkeypatch.setenv("TESS_SYSTEM_TOKEN", "SYS_TOKEN_FOR_TEST")
+    resp = client.post(
+        "/tess/diagnose-from-source",
+        json={"limit": 2},
+        headers={"X-Operator-Id": "alice"},  # 不带任何 token 头
+    )
+    assert resp.status_code == 200
+    assert captured["token"] == "SYS_TOKEN_FOR_TEST"
 
 
 def test_audit_log_records_per_operator(client):
