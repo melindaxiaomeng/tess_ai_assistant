@@ -84,7 +84,7 @@ def _client_with_vault(monkeypatch):
     monkeypatch.setattr(
         app_module,
         "_get_llm_client",
-        lambda: MockLLMClient(
+        lambda *a, **k: MockLLMClient(
             {
                 "status": "DIAGNOSED",
                 "confidence": 0.9,

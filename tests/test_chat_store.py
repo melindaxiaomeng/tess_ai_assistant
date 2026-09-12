@@ -163,7 +163,7 @@ def _client(monkeypatch, tmp_path):
     import tess_backend.app as app_module
     from fastapi.testclient import TestClient
 
-    monkeypatch.setattr(app_module, "_get_llm_client", lambda: CapturingLLM())
+    monkeypatch.setattr(app_module, "_get_llm_client", lambda *a, **k: CapturingLLM())
     monkeypatch.setattr(app_module, "_DATA_CONNECTOR", FakeConnector())
     cs._STORE = ChatStore(str(tmp_path / "http_chat.db"))
     return TestClient(app_module.app)

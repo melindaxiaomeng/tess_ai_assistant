@@ -110,7 +110,7 @@ def test_joint_endpoint():
     from fastapi.testclient import TestClient
 
     # 直接打桩 _get_llm_client，不触达真实模型
-    app_module._get_llm_client = lambda: MockLLMClient(JOINT_OK)
+    app_module._get_llm_client = lambda *a, **k: MockLLMClient(JOINT_OK)
     c = TestClient(app_module.app)
     resp = c.post("/tess/joint-diagnose", json={"events": [EV_A, EV_B]})
     assert resp.status_code == 200

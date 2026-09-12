@@ -63,3 +63,59 @@ def test_active_platforms_excludes_disabled(reg):
     act = reg.active_platforms()
     ids = [p["id"] for p in act]
     assert ids == ["a"]
+
+
+# ------------------- llm_api_key：平台级 LLM（DeepSeek）key -------------------
+
+def test_llm_api_key_crud(reg):
+    # 建平台时带 llm_api_key
+    row = reg.create("melo", "Melodong", "tok", llm_api_key="sk-melo")
+    assert row["llm_api_key"] == "sk-melo"
+    assert reg.resolve_llm("melo") == "sk-melo"
+    # 不带则为 NULL（回退全局 key）
+    reg.create("plain", "Plain", "tok2")
+    assert reg.get_dict("plain")["llm_api_key"] is None
+    assert reg.resolve_llm("plain") is None
+    # 可更新（换 key / 清空）
+    upd = reg.update("melo", llm_api_key="sk-melo-2")
+    assert upd["llm_api_key"] == "sk-melo-2"
+    reg.update("melo", llm_api_key="")
+    assert reg.resolve_llm("melo") is None
+    # 禁用平台不解析
+    reg.update("melo", llm_api_key="sk-x", is_active=False)
+    assert reg.resolve_llm("melo") is None
+    # 不存在 / 空参数 -> None
+    assert reg.resolve_llm("missing") is None
+    assert reg.resolve_llm(None) is None
+
+
+def test_active_platforms_includes_llm_key(reg):
+    reg.create("a", "A", "t-a", llm_api_key="sk-a")
+    reg.create("b", "B", "t-b")
+    act = {p["id"]: p for p in reg.active_platforms()}
+    assert act["a"]["llm_api_key"] == "sk-a"
+    assert act["b"]["llm_api_key"] is None
+
+
+def test_llm_api_key_lazy_migration(tmp_path):
+    """旧库（tess_platforms 无 llm_api_key 列）实例化时自动补列，不破坏存量数据。"""
+    from sqlalchemy import create_engine, text
+
+    db = str(tmp_path / "old_platforms.db")
+    eng = create_engine(f"sqlite:///{db}")
+    with eng.connect() as c:
+        c.execute(text(
+            "CREATE TABLE tess_platforms (id VARCHAR PRIMARY KEY, name VARCHAR, "
+            "token TEXT, base_url VARCHAR, is_active BOOLEAN, "
+            "created_at VARCHAR, updated_at VARCHAR)"
+        ))
+        c.execute(text(
+            "INSERT INTO tess_platforms (id, name, token, is_active) "
+            "VALUES ('old', 'Old Platform', 'tok-old', 1)"
+        ))
+        c.commit()
+
+    r = PlatformRegistry(db)  # __init__ 里 ensure_column 幂等补列
+    assert r.resolve("old") == ("tok-old", None)  # 存量 token 不受影响
+    r.update("old", llm_api_key="sk-migrated")
+    assert r.resolve_llm("old") == "sk-migrated"

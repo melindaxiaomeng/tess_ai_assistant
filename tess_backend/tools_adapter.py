@@ -124,9 +124,10 @@ def _resolve_runtime(request):
     from fastapi import HTTPException
 
     connector = _get_data_connector()
-    llm = _get_llm_client()
     operator = _operator_id(request) if request is not None else "anonymous"
     platform_id = _platform_id(request) if request is not None else None
+    # LLM key 按平台隔离：平台 llm_api_key（DeepSeek 按平台开 key）> 全局 TESS_LLM_API_KEY
+    llm = _get_llm_client(platform_id)
     effective_token, token_mode = _resolve_access_token(request, platform_id)
     if isinstance(connector, TeensingDataConnector) and not effective_token:
         raise HTTPException(

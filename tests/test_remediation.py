@@ -164,7 +164,7 @@ def test_store_state_machine_and_persistence():
 def _client():
     app_module.REMEDIATION_STORE = RemediationStore()  # 隔离，避免跨测试污染
     app_module.REMEDIATION_EXECUTOR = MockRemediationExecutor()
-    app_module._get_llm_client = lambda: MockLLMClient({
+    app_module._get_llm_client = lambda *a, **k: MockLLMClient({
         "action_type": "PAUSE_PUBLISHER",
         "target_id": "Pub_X",
         "params": {"duration_minutes": 120},

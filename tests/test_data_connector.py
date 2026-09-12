@@ -108,7 +108,7 @@ def test_get_data_connector_teensing_unconfigured(monkeypatch):
 def client(monkeypatch):
     # LLM 用 Mock，不触真实模型
     monkeypatch.setattr(
-        app_module, "_get_llm_client", lambda: MockLLMClient(_mock_response(0.92))
+        app_module, "_get_llm_client", lambda *a, **k: MockLLMClient(_mock_response(0.92))
     )
     # 数据接入层用 Mock connector，避免触真实 Teensing
     from tess_backend.data_connector import MockDataConnector as MC

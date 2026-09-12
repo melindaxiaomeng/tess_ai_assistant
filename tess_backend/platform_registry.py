@@ -5,11 +5,14 @@ base_url），后端按请求头 X-Platform-Id 解析出该平台的 token，再
 所有落库记录（chat_sessions / alerts）都打上 platform_id，以便按平台隔离与出报表。
 
 表 tess_platforms：
-  id         : 稳定字符串主键（如 "facemoji" / "brandb"），前端在 X-Platform-Id 携带
-  name       : 展示名（运营可读）
-  token      : 平台级系统 token（Text，不暴露给浏览器），仅服务端用于调 Teensing
-  base_url   : 可选，NULL 则回退全局 TESS_DATA_API_BASE_URL（多平台共用 base_url 时留空）
-  is_active  : 是否启用（禁用后不参与定时诊断，且取数回退全局 token）
+  id          : 稳定字符串主键（如 "facemoji" / "brandb"），前端在 X-Platform-Id 携带
+  name        : 展示名（运营可读）
+  token       : 平台级系统 token（Text，不暴露给浏览器），仅服务端用于调 Teensing
+  llm_api_key : 可选，该平台专用的 LLM（DeepSeek）API key —— 上层平台各自在 DeepSeek
+                开独立 key，Tess 调 LLM 时优先用它（用量/账单天然按平台区分），
+                为空则回退全局 TESS_LLM_API_KEY
+  base_url    : 可选，NULL 则回退全局 TESS_DATA_API_BASE_URL（多平台共用 base_url 时留空）
+  is_active   : 是否启用（禁用后不参与定时诊断，且取数回退全局 token）
   created_at / updated_at
 
 鉴权：平台管理接口（增删改查）由独立的「管理密钥」X-Admin-Key 守卫
@@ -37,6 +40,7 @@ class Platform(Base):
     id = mapped_column(String, primary_key=True)
     name = mapped_column(String, default="")
     token = mapped_column(Text, default="")
+    llm_api_key = mapped_column(Text, nullable=True, default=None)
     base_url = mapped_column(String, nullable=True, default=None)
     is_active = mapped_column(Boolean, default=True)
     created_at = mapped_column(String, default=lambda: _now())
@@ -55,6 +59,8 @@ class PlatformRegistry:
         self.engine = make_engine(self.url)
         self.Session = make_session_factory(self.engine)
         init_all(self.engine)
+        # 幂等加列：已上线的旧库（无 llm_api_key）自动补列，不破坏存量数据
+        ensure_column(self.engine, "tess_platforms", "llm_api_key", "TEXT")
 
     # —— 基础读写 ——
     def get(self, platform_id: str) -> Optional[Platform]:
@@ -75,7 +81,8 @@ class PlatformRegistry:
             return [_to_dict(r) for r in rows]
 
     def create(self, platform_id: str, name: str, token: str,
-               base_url: Optional[str] = None, is_active: bool = True) -> dict:
+               base_url: Optional[str] = None, is_active: bool = True,
+               llm_api_key: Optional[str] = None) -> dict:
         if not platform_id or not str(platform_id).strip():
             raise ValueError("platform_id 不能为空")
         if not token:
@@ -86,6 +93,7 @@ class PlatformRegistry:
             now = _now()
             row = Platform(
                 id=platform_id, name=name or platform_id, token=token,
+                llm_api_key=(llm_api_key or None),
                 base_url=base_url, is_active=is_active,
                 created_at=now, updated_at=now,
             )
@@ -94,7 +102,7 @@ class PlatformRegistry:
             return _to_dict(row)
 
     def update(self, platform_id: str, **fields) -> Optional[dict]:
-        allowed = {"name", "token", "base_url", "is_active"}
+        allowed = {"name", "token", "llm_api_key", "base_url", "is_active"}
         updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
         if not updates:
             return None
@@ -132,17 +140,31 @@ class PlatformRegistry:
         base = row.base_url or os.getenv("TESS_DATA_API_BASE_URL") or None
         return row.token, base
 
+    def resolve_llm(self, platform_id: Optional[str]) -> Optional[str]:
+        """按 platform_id 解析该平台专用的 LLM（DeepSeek）API key。
+
+        返回 None 的情况：platform_id 为空 / 平台不存在 / 平台禁用 / 未配置 llm_api_key。
+        调用方据此回退到全局 TESS_LLM_API_KEY。
+        """
+        if not platform_id:
+            return None
+        row = self.get(platform_id)
+        if row is None or not row.is_active:
+            return None
+        return row.llm_api_key or None
+
     def active_platforms(self) -> list:
-        """返回所有启用平台的取数配置：[ {id, token, base_url}, ... ]。
+        """返回所有启用平台的取数配置：[ {id, token, llm_api_key, base_url}, ... ]。
 
         供定时诊断遍历：每个平台跑一遍，alert 打上对应 platform_id。
-        base_url 为空则用全局默认。
+        base_url 为空则用全局默认；llm_api_key 为空则该平台 LLM 调用回退全局 key。
         """
         out = []
         for r in self.list(only_active=True):
             out.append({
                 "id": r["id"],
                 "token": r["token"],
+                "llm_api_key": r.get("llm_api_key"),
                 "base_url": r["base_url"] or os.getenv("TESS_DATA_API_BASE_URL") or None,
             })
         return out
@@ -153,6 +175,7 @@ def _to_dict(row: Platform) -> dict:
         "id": row.id,
         "name": row.name,
         "token": row.token,
+        "llm_api_key": row.llm_api_key,
         "base_url": row.base_url,
         "is_active": row.is_active,
         "created_at": row.created_at,

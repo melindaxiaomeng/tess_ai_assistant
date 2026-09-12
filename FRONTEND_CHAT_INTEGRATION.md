@@ -239,17 +239,23 @@ headers: {
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/tess/admin/platforms` | 列出全部平台（含 token、base_url、启用状态） |
-| POST | `/tess/admin/platforms` | 新增：body `{ id, name, token, base_url?, is_active? }` |
-| PUT | `/tess/admin/platforms/{id}` | 改：body 任意子集 `{ name, token, base_url, is_active }` |
+| GET | `/tess/admin/platforms` | 列出全部平台（含 token、llm_api_key、base_url、启用状态） |
+| POST | `/tess/admin/platforms` | 新增：body `{ id, name, token, llm_api_key?, base_url?, is_active? }` |
+| PUT | `/tess/admin/platforms/{id}` | 改：body 任意子集 `{ name, token, llm_api_key, base_url, is_active }` |
 | DELETE | `/tess/admin/platforms/{id}` | 删（历史记录保留原 platform_id，仅停该平台后续定时诊断） |
 
+字段说明：
+- `token`：平台级**取数** token（Tess 调 saas_v3.0 数据接口用），必填。
+- `llm_api_key`：该平台专用 **LLM（DeepSeek）key**，可选 —— 上层平台各自在 DeepSeek 开
+  独立 key（如 Melodong 的 `sk-1e62c...`），Tess 调 LLM 时优先用它，用量/账单按平台
+  区分；为空则回退全局 `TESS_LLM_API_KEY`。
+
 ```bash
-# 新增一个平台（token 由平台提供，各平台不同、共用 base_url 时只填 token）
+# 新增一个平台（token 由平台提供；llm_api_key 填该平台在 DeepSeek 开的专用 key）
 curl -s -X POST "https://<host>/tess/admin/platforms" \
   -H "X-Admin-Key: $TESS_ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"id":"facemoji","name":"Facemoji DSP","token":"<平台级系统token>","is_active":true}'
+  -d '{"id":"melodong","name":"Melodong","token":"<平台级系统token>","llm_api_key":"sk-<该平台DeepSeek key>","is_active":true}'
 
 # 只跑某平台的一次诊断（即时验证）
 curl -s -X POST "https://<host>/tess/cron/run" \

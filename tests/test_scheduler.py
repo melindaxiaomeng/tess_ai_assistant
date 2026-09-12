@@ -29,7 +29,7 @@ def _mock_response(conf=0.92):
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
-    monkeypatch.setattr(app_module, "_get_llm_client", lambda: MockLLMClient(_mock_response(0.92)))
+    monkeypatch.setattr(app_module, "_get_llm_client", lambda *a, **k: MockLLMClient(_mock_response(0.92)))
     monkeypatch.setattr(app_module, "_DATA_CONNECTOR", MockDataConnector())
     monkeypatch.setattr(app_module, "STORE", FeedbackStore())
     monkeypatch.setattr(app_module, "ALERTS", AlertStore(str(tmp_path / "alerts.db")))
@@ -39,7 +39,7 @@ def client(monkeypatch, tmp_path):
 
 
 def test_run_scheduled_diagnosis_stores_alerts(monkeypatch, tmp_path):
-    monkeypatch.setattr(app_module, "_get_llm_client", lambda: MockLLMClient(_mock_response(0.92)))
+    monkeypatch.setattr(app_module, "_get_llm_client", lambda *a, **k: MockLLMClient(_mock_response(0.92)))
     monkeypatch.setattr(app_module, "_DATA_CONNECTOR", MockDataConnector())
     store = AlertStore(str(tmp_path / "alerts.db"))
     monkeypatch.setattr(app_module, "ALERTS", store)

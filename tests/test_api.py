@@ -49,7 +49,7 @@ def _r6_input():
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setattr(
-        app_module, "_get_llm_client", lambda: MockLLMClient(_mock_response(0.92))
+        app_module, "_get_llm_client", lambda *a, **k: MockLLMClient(_mock_response(0.92))
     )
     from fastapi.testclient import TestClient
 
@@ -114,7 +114,7 @@ def kpi_alert_client(monkeypatch):
     from tess_backend.alerts_store import AlertStore
 
     monkeypatch.setattr(
-        app_module, "_get_llm_client", lambda: MockLLMClient(_mock_response(0.92))
+        app_module, "_get_llm_client", lambda *a, **k: MockLLMClient(_mock_response(0.92))
     )
     monkeypatch.setattr(app_module, "ALERTS", AlertStore(tempfile.mktemp(suffix=".db")))
     from fastapi.testclient import TestClient

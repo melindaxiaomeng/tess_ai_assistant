@@ -102,18 +102,33 @@ logging.getLogger("tess_backend").addFilter(RedactFilter())
 logging.getLogger("uvicorn").addFilter(RedactFilter())
 
 
-def _get_llm_client() -> LLMClient:
+def _get_llm_client(platform_id: Optional[str] = None) -> LLMClient:
     """依赖注入：生产读环境变量（默认 DeepSeek OpenAI 兼容端点）。
 
-    只需填 TESS_LLM_API_KEY 即可跑；base_url / model 有合理默认值。
+    LLM key 解析优先级（与取数 token 的平台隔离同理）：
+      1) 平台级 llm_api_key：按 X-Platform-Id 对应 tess_platforms 记录 ——
+         上层平台（如 Melodong）各自在 DeepSeek 开独立 key，用量/账单按平台区分；
+      2) 全局 TESS_LLM_API_KEY（兜底，所有平台共用）。
+    base_url / model 仍取全局 TESS_LLM_BASE_URL / TESS_LLM_MODEL（共用同一个 LLM 服务）。
     """
     base_url = os.getenv("TESS_LLM_BASE_URL", "https://api.deepseek.com")
-    api_key = os.getenv("TESS_LLM_API_KEY", "")
     model = os.getenv("TESS_LLM_MODEL", "deepseek-chat")
+    api_key = ""
+    if platform_id:
+        try:
+            api_key = get_platform_registry().resolve_llm(platform_id) or ""
+        except Exception:
+            api_key = ""
     if not api_key:
+        api_key = os.getenv("TESS_LLM_API_KEY", "")
+    if not api_key:
+        hint = (
+            f"（平台 {platform_id} 未配置 llm_api_key，且未设置全局 TESS_LLM_API_KEY）"
+            if platform_id else "（请设置 TESS_LLM_API_KEY）"
+        )
         raise HTTPException(
             status_code=503,
-            detail="Tess LLM 未配置（请设置 TESS_LLM_API_KEY）",
+            detail=f"Tess LLM 未配置{hint}",
         )
     return HttpLLMClient(base_url, api_key, model, json_mode=True)
 
@@ -141,11 +156,12 @@ def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None,
     platform_id 指定时只跑该平台；为 None 时遍历所有启用平台；
     若未注册任何平台，回退到全局 TESS_SYSTEM_TOKEN（platform_id="default"，旧行为）。
     token：优先平台 token（按平台 id 从 tess_platforms 取），回退 TESS_SYSTEM_TOKEN。
+    LLM key 同理按平台隔离：优先平台 llm_api_key（DeepSeek 按平台开 key、账单分开算），
+    回退全局 TESS_LLM_API_KEY；显式传入 llm 时（测试/内部调用）直接用。
     各平台共用同一 Teensing base_url（仅 token 不同），故单 connector 复用。
     返回本轮所有平台汇总诊断结果列表（meta 含 source 标签）。
     """
     connector = connector or _get_data_connector()
-    llm = llm or _get_llm_client()
     policy = load_policy()
 
     # 构造待跑平台清单：(platform_id, token)
@@ -166,7 +182,8 @@ def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None,
 
     all_results: list = []
     for pid, token in targets:
-        results = _diagnose_one_platform(connector, llm, token, pid, limit, policy)
+        platform_llm = llm or _get_llm_client(pid)  # 平台 key > 全局 key
+        results = _diagnose_one_platform(connector, platform_llm, token, pid, limit, policy)
         if results:
             ALERTS.save_batch(results, platform_id=pid)
         all_results.extend(results)
@@ -428,14 +445,15 @@ def post_analytics(payload: dict, request: Request) -> dict:
         connector = get_data_connector()
     except (RuntimeError, ValueError) as e:
         raise HTTPException(status_code=503, detail=f"Tess 未配置 Teensing 数据源：{e}")
-    llm = _get_llm_client()
+    platform_id = _platform_id(request)
+    operator = _operator_id(request) if request else "anonymous"
+    effective_token, token_mode = _resolve_access_token(request, platform_id)
+    # LLM key 按平台隔离：平台 llm_api_key > 全局 TESS_LLM_API_KEY
+    llm = _get_llm_client(platform_id)
     # 按访问者权限取数（核心）：
     #   优先用运营个人 token（X-Teensing-Token，按人 RBAC，各看各的）；
     #   未带则按 X-Platform-Id 从 tess_platforms 取该平台的 token；
     #   再缺失时回退到全局 TESS_SYSTEM_TOKEN（写死后端配置，前端不接触）。
-    platform_id = _platform_id(request)
-    operator = _operator_id(request) if request else "anonymous"
-    effective_token, token_mode = _resolve_access_token(request, platform_id)
     # 生产（真实连接器）下没有任何 token 则无法按权限取数 -> 400
     if isinstance(connector, TeensingDataConnector) and not effective_token:
         raise HTTPException(
@@ -518,10 +536,11 @@ def post_ask(payload: dict, request: Request) -> dict:
         connector = get_data_connector()
     except (RuntimeError, ValueError) as e:
         raise HTTPException(status_code=503, detail=f"Tess 未配置 Teensing 数据源：{e}")
-    llm = _get_llm_client()
     platform_id = _platform_id(request)
     operator = _operator_id(request) if request else "anonymous"
     effective_token, token_mode = _resolve_access_token(request, platform_id)
+    # LLM key 按平台隔离：平台 llm_api_key > 全局 TESS_LLM_API_KEY
+    llm = _get_llm_client(platform_id)
     if isinstance(connector, TeensingDataConnector) and not effective_token:
         raise HTTPException(
             status_code=400,
@@ -599,7 +618,7 @@ def diagnose_from_source(payload: dict = None, request: Request = None) -> dict:
             detail="生产数据接入需取数凭据：运营 X-Teensing-Token、或平台级 token（X-Platform-Id 对应平台已注册且启用）、或在后端配置 TESS_SYSTEM_TOKEN",
         )
     raw_events = connector.fetch_recent_anomalies(limit, token=effective_token or None)
-    llm = _get_llm_client()
+    llm = _get_llm_client(platform_id)  # 平台 llm_api_key > 全局 TESS_LLM_API_KEY
     results = []
     for raw in raw_events:
         ctx = normalize_to_context(raw)
@@ -939,8 +958,10 @@ def cron_run(payload: dict = None, request: Request = None) -> dict:
 def admin_list_platforms(request: Request) -> dict:
     """列出全部平台凭证（仅管理端用，受 X-Admin-Key 守卫）。
 
-    返回：{ count, platforms: [ {id, name, token, base_url, is_active, created_at, updated_at}, ... ] }
-    注意：token 原样返回（管理端需要查看/复制），但仅管理密钥可见，普通调用方拿不到。
+    返回：{ count, platforms: [ {id, name, token, llm_api_key, base_url, is_active,
+            created_at, updated_at}, ... ] }
+    注意：token / llm_api_key 原样返回（管理端需要查看/复制），但仅管理密钥可见，
+    普通调用方拿不到。
     """
     _require_admin(request)
     rows = get_platform_registry().list()
@@ -952,9 +973,11 @@ def admin_create_platform(payload: dict, request: Request) -> dict:
     """新增一个平台（受 X-Admin-Key 守卫）。
 
     body: { "id": "facemoji", "name": "Facemoji DSP", "token": "<平台级系统token>",
-            "base_url": null, "is_active": true }
+            "llm_api_key": "<该平台专用 DeepSeek key，可选>", "base_url": null, "is_active": true }
       - id：稳定字符串主键，前端在 X-Platform-Id 携带；必填、不可重复。
       - token：平台级系统 token（各平台共用 base_url 时，仅此处不同）；必填。
+      - llm_api_key：可选，该平台专用 LLM（DeepSeek）API key —— Tess 调 LLM 时优先用它，
+        用量/账单按平台区分；为空则回退全局 TESS_LLM_API_KEY。
       - base_url：可选，NULL 则回退全局 TESS_DATA_API_BASE_URL。
     """
     _require_admin(request)
@@ -966,6 +989,7 @@ def admin_create_platform(payload: dict, request: Request) -> dict:
     try:
         row = get_platform_registry().create(
             platform_id=pid, name=payload.get("name", ""), token=token,
+            llm_api_key=payload.get("llm_api_key"),
             base_url=payload.get("base_url"), is_active=bool(payload.get("is_active", True)),
         )
     except ValueError as e:
@@ -975,9 +999,9 @@ def admin_create_platform(payload: dict, request: Request) -> dict:
 
 @app.put("/tess/admin/platforms/{platform_id}")
 def admin_update_platform(platform_id: str, payload: dict, request: Request) -> dict:
-    """更新平台（受 X-Admin-Key 守卫）。可改 name / token / base_url / is_active。
+    """更新平台（受 X-Admin-Key 守卫）。可改 name / token / llm_api_key / base_url / is_active。
 
-    body（部分字段即可）：{ "token": "<新token>", "is_active": false }
+    body（部分字段即可）：{ "token": "<新token>", "llm_api_key": "<新DeepSeek key>", "is_active": false }
     """
     _require_admin(request)
     payload = payload or {}
