@@ -74,6 +74,21 @@ def test_admin_platforms_crud(client):
     assert client.get("/tess/admin/platforms", headers=h).json()["count"] == 0
 
 
+def test_admin_bypasses_global_api_key_guard(client, monkeypatch):
+    """生产开启 TESS_API_KEY 后，admin 接口仍只凭 X-Admin-Key 可用（不被全局 401 拦截）。"""
+    monkeypatch.setattr(app_module, "_TESS_API_KEY", "global-key")
+    h = {"X-Admin-Key": "test-admin"}
+    # 只带管理密钥、不带 X-API-Key -> 应 200（走 _require_admin 独立守卫）
+    res = client.get("/tess/admin/platforms", headers=h)
+    assert res.status_code == 200
+    # 全局守卫对其余 /tess/* 仍然生效：不带 X-API-Key 访问 alerts -> 401
+    assert client.get("/tess/alerts").status_code == 401
+    # 带对 X-API-Key 但没带管理密钥访问 admin -> 仍 403（不能靠调用方密钥越权）
+    assert client.get(
+        "/tess/admin/platforms", headers={"X-API-Key": "global-key"}
+    ).status_code == 403
+
+
 # ------------------- 预警平台过滤（?platform= / X-Platform-Id） -------------------
 
 def test_alerts_platform_filter(client, monkeypatch, tmp_path):

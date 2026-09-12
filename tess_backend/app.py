@@ -83,6 +83,10 @@ async def api_key_guard(request: Request, call_next):
         return await call_next(request)
     if request.url.path == "/healthz":  # 存活探针不鉴权
         return await call_next(request)
+    # 平台管理接口走独立的 X-Admin-Key 守卫（_require_admin），
+    # 不在全局 X-API-Key 范围内（运维通常只持有管理密钥，没有调用方密钥）。
+    if request.url.path.startswith("/tess/admin/"):
+        return await call_next(request)
     if _TESS_API_KEY:
         provided = request.headers.get("X-API-Key", "")
         if not provided or not hmac.compare_digest(provided, _TESS_API_KEY):
