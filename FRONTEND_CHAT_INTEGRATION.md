@@ -35,7 +35,7 @@ await fetch("/tess/ask", {
     "Content-Type": "application/json",
     "X-API-Key": "YOUR_KEY",        // 生产必带（TESS_API_KEY 设了之后）
     "X-Teensing-Token": userToken,  // ★ 当前登录运营的 saas access_token（按人取数，最高优先级）
-    "X-Platform-Id": platformId,    // 平台标识（如 "Melodong"）；未带运营 token 时按它取平台 token
+    "X-Platform-Id": platformId,    // 平台标识（如 "Melodong"）：落库打标 + 按平台选 LLM key（与取数无关）
     "X-Operator-Id": userId,        // 可选，审计归因
   },
   body: JSON.stringify({
@@ -205,11 +205,11 @@ class TessDrawer {
 
 ## 8. 多平台（P9）对接要点
 
-> 多个平台（各自独立的 Teensing 租户 token，共用同一 base_url）共用同一套 Tess 后端。
-> 每个平台用**不同的平台级系统 token**取数，且所有落库（对话 / 预警）都会打上 `platform_id`，
-> 以便按平台隔离、分平台出报表。
+> 多个平台共用同一套 Tess 后端。**取数已不走平台 token**（saas_v3.0 按运营个人 token 鉴权），
+> 平台标识（`X-Platform-Id`）只用于三件事：落库打 `platform_id`（分平台出报表）、
+> 分平台选 LLM key（`tess_platforms.llm_api_key`）、定时诊断按平台分批。
 
-### 8.1 前端请求头（按人 > 按平台，两级取数）
+### 8.1 前端请求头（按人 > 全局，两级取数）
 
 在 §3 的 headers 基础上（与 `X-Operator-Id` 同级）：
 
@@ -223,10 +223,9 @@ headers: {
 }
 ```
 
-- **优先级**：`X-Teensing-Token`（运营个人 token，Tess 原样转发给 saas_v3.0 数据接口，
-  按该运营 RBAC/数据权限返回数据，各运营各看各的）> 平台级 token（`X-Platform-Id`
-  从 `tess_platforms` 表解析）> 全局 `TESS_SYSTEM_TOKEN`（后端 `.env` / compose）。
-- 带 `X-Teensing-Token` 时 `token_mode` 为 `"user"`；带平台头时为 `"platform"`；兜底 `"system"`。
+- **取数优先级**：`X-Teensing-Token`（运营个人 token，Tess 原样转发给 saas_v3.0 数据接口，
+  按该运营 RBAC/数据权限返回数据，各运营各看各的）> 全局 `TESS_SYSTEM_TOKEN`（后端 `.env` / compose 兜底）。
+- 带 `X-Teensing-Token` 时 `token_mode` 为 `"user"`；兜底 `"system"`（平台 token 已废弃）。
 - 多轮 `POST /tess/ask` 带 `X-Platform-Id` 时，本轮问答会被打上该 `platform_id`，
   后续 `GET /tess/chats` / `/tess/chats/export` / `/tess/chats/stats` 也支持 `?platform=` 过滤。
 - 预警拉取 `GET /tess/alerts` / `/tess/realtime-kpi/alerts` 同样支持 `?platform=` 或头过滤，
@@ -239,23 +238,23 @@ headers: {
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/tess/admin/platforms` | 列出全部平台（含 token、llm_api_key、base_url、启用状态） |
-| POST | `/tess/admin/platforms` | 新增：body `{ id, name, token, llm_api_key?, base_url?, is_active? }` |
-| PUT | `/tess/admin/platforms/{id}` | 改：body 任意子集 `{ name, token, llm_api_key, base_url, is_active }` |
+| GET | `/tess/admin/platforms` | 列出全部平台（含 llm_api_key、启用状态） |
+| POST | `/tess/admin/platforms` | 新增：body `{ id, name, llm_api_key?, is_active? }` |
+| PUT | `/tess/admin/platforms/{id}` | 改：body 任意子集 `{ name, llm_api_key, is_active }` |
 | DELETE | `/tess/admin/platforms/{id}` | 删（历史记录保留原 platform_id，仅停该平台后续定时诊断） |
 
 字段说明：
-- `token`：平台级**取数** token（Tess 调 saas_v3.0 数据接口用），必填。
+- `token` / `base_url`：历史遗留字段（取数平台 token 已废弃），可不填，仅为兼容保留。
 - `llm_api_key`：该平台专用 **LLM（DeepSeek）key**，可选 —— 上层平台各自在 DeepSeek 开
   独立 key（如 Melodong 的 `sk-1e62c...`），Tess 调 LLM 时优先用它，用量/账单按平台
   区分；为空则回退全局 `TESS_LLM_API_KEY`。
 
 ```bash
-# 新增一个平台（token 由平台提供；llm_api_key 填该平台在 DeepSeek 开的专用 key）
+# 新增一个平台（llm_api_key 填该平台在 DeepSeek 开的专用 key；取数 token 已不需要）
 curl -s -X POST "https://<host>/tess/admin/platforms" \
   -H "X-Admin-Key: $TESS_ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"id":"melodong","name":"Melodong","token":"<平台级系统token>","llm_api_key":"sk-<该平台DeepSeek key>","is_active":true}'
+  -d '{"id":"melodong","name":"Melodong","llm_api_key":"sk-<该平台DeepSeek key>","is_active":true}'
 
 # 只跑某平台的一次诊断（即时验证）
 curl -s -X POST "https://<host>/tess/cron/run" \

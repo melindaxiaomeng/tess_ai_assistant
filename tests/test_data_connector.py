@@ -386,7 +386,7 @@ def test_is_sudden_cliff_edge_cases():
 
 
 def test_teensing_requires_token_via_app(client, monkeypatch):
-    """生产(teensing)模式下，/tess/diagnose-from-source 无平台 token 且无全局 TESS_SYSTEM_TOKEN 应 400。"""
+    """生产(teensing)模式下，/tess/diagnose-from-source 无运营 token 且无全局 TESS_SYSTEM_TOKEN 应 400。"""
     monkeypatch.setattr(app_module, "_DATA_CONNECTOR", TeensingDataConnector(
         base_url="https://saas.example.com/api/v1"
     ))
@@ -397,7 +397,7 @@ def test_teensing_requires_token_via_app(client, monkeypatch):
         headers={"X-Operator-Id": "alice"},  # 有运营身份但无任何 token
     )
     assert resp.status_code == 400
-    assert "X-Platform-Id" in resp.json()["detail"]
+    assert "X-Teensing-Token" in resp.json()["detail"]
     assert "TESS_SYSTEM_TOKEN" in resp.json()["detail"]
 
 
@@ -427,7 +427,7 @@ def test_teensing_diagnose_uses_global_token(client, monkeypatch):
 
 
 def test_operator_token_takes_priority_over_all(client, monkeypatch):
-    """运营个人 token（X-Teensing-Token）应压过平台 token 与全局 TESS_SYSTEM_TOKEN。"""
+    """运营个人 token（X-Teensing-Token）应压过全局 TESS_SYSTEM_TOKEN。"""
     captured = {}
 
     def fake_fetch(self, limit, token=None):
@@ -452,7 +452,7 @@ def test_operator_token_takes_priority_over_all(client, monkeypatch):
         },
     )
     assert resp.status_code == 200
-    assert captured["token"] == "ALICE_PERSONAL_TOKEN"  # 个人 token > 平台/全局
+    assert captured["token"] == "ALICE_PERSONAL_TOKEN"  # 个人 token > 全局
 
 
 def test_audit_log_records_per_operator(client):

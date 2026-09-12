@@ -93,6 +93,25 @@ def test_admin_bypasses_global_api_key_guard(client, monkeypatch):
     ).status_code == 403
 
 
+def test_admin_create_platform_without_token(client):
+    """取数平台 token 已废弃：注册平台只需 id（token 可不填）。"""
+    h = {"X-Admin-Key": "test-admin"}
+    created = client.post(
+        "/tess/admin/platforms",
+        json={"id": "melodong", "name": "Melodong", "llm_api_key": "sk-melo"},
+        headers=h,
+    )
+    assert created.status_code == 200
+    body = created.json()["platform"]
+    assert body["id"] == "melodong"
+    assert body["token"] == ""  # 历史遗留字段，默认空
+    assert body["llm_api_key"] == "sk-melo"
+    # 缺 id -> 422
+    bad = client.post("/tess/admin/platforms", json={"name": "x"}, headers=h)
+    assert bad.status_code == 422
+    client.delete("/tess/admin/platforms/melodong", headers=h)
+
+
 def test_admin_platforms_llm_api_key_roundtrip(client):
     """admin 接口可写入 / 查看 / 更新平台级 DeepSeek key。"""
     h = {"X-Admin-Key": "test-admin"}

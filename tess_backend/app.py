@@ -154,21 +154,22 @@ def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None,
     (2) 实时 KPI 小时级曲线（/overview/realtime-kpi）→ 提取骤降异常点 → 诊断（source="realtime-kpi"）
 
     platform_id 指定时只跑该平台；为 None 时遍历所有启用平台；
-    若未注册任何平台，回退到全局 TESS_SYSTEM_TOKEN（platform_id="default"，旧行为）。
-    token：优先平台 token（按平台 id 从 tess_platforms 取），回退 TESS_SYSTEM_TOKEN。
-    LLM key 同理按平台隔离：优先平台 llm_api_key（DeepSeek 按平台开 key、账单分开算），
+    若未注册任何平台，跑一遍全局（platform_id="default"，旧行为）。
+    取数 token：定时诊断无请求上下文（没有运营个人 token），统一用全局 TESS_SYSTEM_TOKEN。
+    LLM key 仍按平台隔离：优先平台 llm_api_key（DeepSeek 按平台开 key、账单分开算），
     回退全局 TESS_LLM_API_KEY；显式传入 llm 时（测试/内部调用）直接用。
-    各平台共用同一 Teensing base_url（仅 token 不同），故单 connector 复用。
+    各平台共用同一 Teensing base_url，故单 connector 复用。
     返回本轮所有平台汇总诊断结果列表（meta 含 source 标签）。
     """
     connector = connector or _get_data_connector()
     policy = load_policy()
 
-    # 构造待跑平台清单：(platform_id, token)
+    # 构造待跑平台清单：(platform_id, token) —— 平台仅用于打标与 LLM key 区分，
+    # 取数 token 统一全局 TESS_SYSTEM_TOKEN（平台 token 已废弃）
+    sys_token = os.getenv("TESS_SYSTEM_TOKEN") or ""
     targets: list = []
     if platform_id:
-        tok, _base = _resolve_platform_token(platform_id)
-        targets.append((platform_id, tok or os.getenv("TESS_SYSTEM_TOKEN") or ""))
+        targets.append((platform_id, sys_token))
     else:
         try:
             plats = get_platform_registry().active_platforms()
@@ -176,9 +177,9 @@ def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None,
             plats = []
         if plats:
             for p in plats:
-                targets.append((p["id"], p["token"] or os.getenv("TESS_SYSTEM_TOKEN") or ""))
+                targets.append((p["id"], sys_token))
         else:
-            targets.append(("default", os.getenv("TESS_SYSTEM_TOKEN") or ""))
+            targets.append(("default", sys_token))
 
     all_results: list = []
     for pid, token in targets:
@@ -188,14 +189,6 @@ def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None,
             ALERTS.save_batch(results, platform_id=pid)
         all_results.extend(results)
     return all_results
-
-
-def _resolve_platform_token(platform_id: str) -> tuple:
-    """取某平台的 (token, base_url)；平台不存在/禁用/异常时回退全局（返回 None）。"""
-    try:
-        return get_platform_registry().resolve(platform_id)
-    except Exception:
-        return None, None
 
 
 def _diagnose_one_platform(connector, llm, token, platform_id: str, limit: int, policy) -> list:
@@ -293,7 +286,7 @@ def _operator_id(request: Request) -> str:
 def _platform_id(request: Request) -> Optional[str]:
     """取平台标识：优先请求头 X-Platform-Id，其次查询参数 ?platform=；缺省 None。
 
-    用于把一次请求归属到具体平台（分平台 token 解析 + 落库打标 + 报表隔离）。
+    用于把一次请求归属到具体平台（LLM key 解析 + 落库打标 + 报表隔离）。
     """
     pid = request.headers.get("X-Platform-Id", "") or ""
     if not pid and getattr(request, "query_params", None):
@@ -311,26 +304,19 @@ def _teensing_token(request: Optional[Request]) -> str:
 def _resolve_access_token(request: Optional[Request], platform_id: Optional[str] = None) -> tuple:
     """解析本次调 saas_v3.0 数据接口用的 token 与模式。
 
-    优先级：
+    优先级（平台 token 已废弃：saas_v3.0 实际按运营 token 鉴权，平台级取数 token 无用武之地）：
       1) 运营个人 token（X-Teensing-Token：前端逐请求带当前登录运营的 access_token，
          saas_v3.0 按该运营的 RBAC/数据权限返回数据 —— 各运营各看各的）
-      2) 平台级 token（按 X-Platform-Id 从 tess_platforms 取，仅 token 不同、共用 base_url）
-      3) 全局 TESS_SYSTEM_TOKEN（兜底，写在后端 .env / compose，前端不接触）
+      2) 全局 TESS_SYSTEM_TOKEN（兜底，写在后端 .env / compose，前端不接触；
+         主要供定时诊断等无请求上下文的场景）
 
-    返回 (effective_token:str, token_mode:str)，token_mode ∈ {user, platform, system}。
+    返回 (effective_token:str, token_mode:str)，token_mode ∈ {user, system}。
     """
     user_token = _teensing_token(request)
     if user_token:
         return user_token, "user"
-    if platform_id:
-        try:
-            token, _base = get_platform_registry().resolve(platform_id)
-            if token:
-                return token, "platform"
-        except Exception:
-            pass
     system_token = os.getenv("TESS_SYSTEM_TOKEN") or None
-    return (system_token or ""), ("system" if system_token else "system")
+    return (system_token or ""), "system"
 
 
 # —— 平台管理接口鉴权（独立于 Tess 自身 X-API-Key，避免普通调用方误改平台凭证）——
@@ -428,7 +414,7 @@ def post_analytics(payload: dict, request: Request) -> dict:
         "report": "Markdown 简报（含 📊/💡/🚀 三段）",
         "context_summary": { "analysis_type", "date_or_month", "errors",
                              "operator_id", "token_mode" }
-            # token_mode: "user"=按运营个人 token 取数; "platform"=平台 token; "system"=全局兜底
+            # token_mode: "user"=按运营个人 token 取数; "system"=全局兜底
       }
     """
     analysis_type = (payload or {}).get("analysis_type")
@@ -458,7 +444,7 @@ def post_analytics(payload: dict, request: Request) -> dict:
     if isinstance(connector, TeensingDataConnector) and not effective_token:
         raise HTTPException(
             status_code=400,
-            detail="生产数据接入需取数凭据：运营 X-Teensing-Token、或平台级 token（X-Platform-Id 对应平台已注册且启用）、或在后端配置 TESS_SYSTEM_TOKEN",
+            detail="生产数据接入需取数凭据：运营 X-Teensing-Token、或在后端配置 TESS_SYSTEM_TOKEN",
         )
     try:
         result = process_data_analysis_query(
@@ -491,9 +477,9 @@ def post_ask(payload: dict, request: Request) -> dict:
       - X-API-Key        : Tess<->saas 共享密钥（网关注入，生产设了 TESS_API_KEY 后必带）
       - X-Teensing-Token : 运营 SaaS access_token（按人取数，最高优先级；Tess 原样转发给 saas_v3.0，
                            按该运营 RBAC 返回数据，各运营各看各的）
-      - X-Platform-Id    : 平台标识；未带运营 token 时按它取该平台 token；
-                           再无则回退全局 TESS_SYSTEM_TOKEN（后端配置，前端不接触）；
-                           生产连接器下三者皆无 -> 400
+      - X-Platform-Id    : 平台标识（落库打标 / 报表隔离 / 按平台选 llm_api_key，与取数无关）；
+                           未带运营 token 时回退全局 TESS_SYSTEM_TOKEN（后端配置，前端不接触）；
+                           生产连接器下两者皆无 -> 400
       - X-Operator-Id    : 可选，审计归因
     深度下钻说明：
       - 路由优先级：① 显式 analysis_type（前端胶囊透传）> ② 问题正则识别实体 id（如
@@ -544,7 +530,7 @@ def post_ask(payload: dict, request: Request) -> dict:
     if isinstance(connector, TeensingDataConnector) and not effective_token:
         raise HTTPException(
             status_code=400,
-            detail="生产数据接入需取数凭据：运营 X-Teensing-Token、或平台级 token（X-Platform-Id 对应平台已注册且启用）、或在后端配置 TESS_SYSTEM_TOKEN",
+            detail="生产数据接入需取数凭据：运营 X-Teensing-Token、或在后端配置 TESS_SYSTEM_TOKEN",
         )
     try:
         result = process_question(
@@ -596,8 +582,8 @@ def diagnose_from_source(payload: dict = None, request: Request = None) -> dict:
     """P5 数据接入：从 Teensing 真实异常数据源拉取最近 N 个异常，逐个诊断。
 
     body: { "limit": 5 }  （默认 5，最多 50）
-    鉴权：按权限取数（优先运营 X-Teensing-Token 按人取数；其次 X-Platform-Id 对应平台 token，
-          缺省回退全局 TESS_SYSTEM_TOKEN）。运营身份（X-Operator-Id）用于 P6 问答审计归因。
+    鉴权：按权限取数（优先运营 X-Teensing-Token 按人取数，缺省回退全局 TESS_SYSTEM_TOKEN）。
+          运营身份（X-Operator-Id）用于 P6 问答审计归因。
     拉取到的原始事件经 normalize_to_context 转成 PRD §4.1 Context 后送编排层；
     处置执行器不受影响（仍走 Mock / 服务端配置）。
     诊断失败时单条降级为 INCONCLUSIVE，不影响其余事件。
@@ -615,7 +601,7 @@ def diagnose_from_source(payload: dict = None, request: Request = None) -> dict:
     if isinstance(connector, TeensingDataConnector) and not effective_token:
         raise HTTPException(
             status_code=400,
-            detail="生产数据接入需取数凭据：运营 X-Teensing-Token、或平台级 token（X-Platform-Id 对应平台已注册且启用）、或在后端配置 TESS_SYSTEM_TOKEN",
+            detail="生产数据接入需取数凭据：运营 X-Teensing-Token、或在后端配置 TESS_SYSTEM_TOKEN",
         )
     raw_events = connector.fetch_recent_anomalies(limit, token=effective_token or None)
     llm = _get_llm_client(platform_id)  # 平台 llm_api_key > 全局 TESS_LLM_API_KEY
@@ -960,8 +946,8 @@ def admin_list_platforms(request: Request) -> dict:
 
     返回：{ count, platforms: [ {id, name, token, llm_api_key, base_url, is_active,
             created_at, updated_at}, ... ] }
-    注意：token / llm_api_key 原样返回（管理端需要查看/复制），但仅管理密钥可见，
-    普通调用方拿不到。
+    注意：llm_api_key 原样返回（管理端需要查看/复制），但仅管理密钥可见，
+    普通调用方拿不到。token 为历史遗留字段（取数平台 token 已废弃，不再用于鉴权）。
     """
     _require_admin(request)
     rows = get_platform_registry().list()
@@ -972,23 +958,23 @@ def admin_list_platforms(request: Request) -> dict:
 def admin_create_platform(payload: dict, request: Request) -> dict:
     """新增一个平台（受 X-Admin-Key 守卫）。
 
-    body: { "id": "facemoji", "name": "Facemoji DSP", "token": "<平台级系统token>",
-            "llm_api_key": "<该平台专用 DeepSeek key，可选>", "base_url": null, "is_active": true }
+    body: { "id": "melodong", "name": "Melodong",
+            "llm_api_key": "<该平台专用 DeepSeek key，可选>", "is_active": true }
       - id：稳定字符串主键，前端在 X-Platform-Id 携带；必填、不可重复。
-      - token：平台级系统 token（各平台共用 base_url 时，仅此处不同）；必填。
       - llm_api_key：可选，该平台专用 LLM（DeepSeek）API key —— Tess 调 LLM 时优先用它，
         用量/账单按平台区分；为空则回退全局 TESS_LLM_API_KEY。
-      - base_url：可选，NULL 则回退全局 TESS_DATA_API_BASE_URL。
+      - token / base_url：历史遗留字段（取数平台 token 已废弃，saas_v3.0 按运营个人
+        token 鉴权），可不填；仅为兼容旧客户端保留。
     """
     _require_admin(request)
     payload = payload or {}
     pid = payload.get("id")
-    token = payload.get("token")
-    if not pid or not token:
-        raise HTTPException(status_code=422, detail="id 与 token 均为必填")
+    if not pid:
+        raise HTTPException(status_code=422, detail="id 为必填")
     try:
         row = get_platform_registry().create(
-            platform_id=pid, name=payload.get("name", ""), token=token,
+            platform_id=pid, name=payload.get("name", ""),
+            token=payload.get("token") or "",
             llm_api_key=payload.get("llm_api_key"),
             base_url=payload.get("base_url"), is_active=bool(payload.get("is_active", True)),
         )
@@ -999,9 +985,10 @@ def admin_create_platform(payload: dict, request: Request) -> dict:
 
 @app.put("/tess/admin/platforms/{platform_id}")
 def admin_update_platform(platform_id: str, payload: dict, request: Request) -> dict:
-    """更新平台（受 X-Admin-Key 守卫）。可改 name / token / llm_api_key / base_url / is_active。
+    """更新平台（受 X-Admin-Key 守卫）。可改 name / llm_api_key / is_active
+    （token / base_url 为历史遗留字段，保留可改仅为兼容）。
 
-    body（部分字段即可）：{ "token": "<新token>", "llm_api_key": "<新DeepSeek key>", "is_active": false }
+    body（部分字段即可）：{ "llm_api_key": "<新DeepSeek key>", "is_active": false }
     """
     _require_admin(request)
     payload = payload or {}

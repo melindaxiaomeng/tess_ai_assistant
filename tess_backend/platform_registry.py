@@ -1,18 +1,21 @@
-"""P9 · 平台凭证注册表（DB 持久化）。
+"""P9 · 平台注册表（DB 持久化）。
 
-多平台场景支撑：每个平台有独立的「平台级系统 token」（各平台共用同一 Teensing
-base_url），后端按请求头 X-Platform-Id 解析出该平台的 token，再去 Teensing 取数；
-所有落库记录（chat_sessions / alerts）都打上 platform_id，以便按平台隔离与出报表。
+多平台场景支撑：X-Platform-Id 把请求归属到具体平台 —— 落库记录（chat_sessions /
+alerts）打 platform_id 隔离报表，Tess 调 LLM 时优先用该平台的 llm_api_key
+（上层平台各自在 DeepSeek 开独立 key，用量/账单按平台区分）。
+
+注意：**取数已不走平台 token**（已废弃）。saas_v3.0 数据接口按运营个人 token
+（X-Teensing-Token）鉴权，未带时回退全局 TESS_SYSTEM_TOKEN；tess_platforms.token
+列仅作为历史遗留保留（旧客户端仍可传，但不参与任何鉴权）。
 
 表 tess_platforms：
-  id          : 稳定字符串主键（如 "facemoji" / "brandb"），前端在 X-Platform-Id 携带
+  id          : 稳定字符串主键（如 "melodong"），前端在 X-Platform-Id 携带
   name        : 展示名（运营可读）
-  token       : 平台级系统 token（Text，不暴露给浏览器），仅服务端用于调 Teensing
-  llm_api_key : 可选，该平台专用的 LLM（DeepSeek）API key —— 上层平台各自在 DeepSeek
-                开独立 key，Tess 调 LLM 时优先用它（用量/账单天然按平台区分），
+  token       : 历史遗留（原平台级取数 token，已废弃，不再用于鉴权）
+  llm_api_key : 可选，该平台专用的 LLM（DeepSeek）API key —— Tess 调 LLM 时优先用它，
                 为空则回退全局 TESS_LLM_API_KEY
-  base_url    : 可选，NULL 则回退全局 TESS_DATA_API_BASE_URL（多平台共用 base_url 时留空）
-  is_active   : 是否启用（禁用后不参与定时诊断，且取数回退全局 token）
+  base_url    : 历史遗留（各平台共用全局 TESS_DATA_API_BASE_URL）
+  is_active   : 是否启用（禁用后不参与定时诊断、不解析 llm_api_key）
   created_at / updated_at
 
 鉴权：平台管理接口（增删改查）由独立的「管理密钥」X-Admin-Key 守卫
@@ -22,7 +25,6 @@ base_url），后端按请求头 X-Platform-Id 解析出该平台的 token，再
 
 from __future__ import annotations
 
-import os
 import time
 from typing import Optional
 
@@ -80,19 +82,18 @@ class PlatformRegistry:
             rows = q.order_by(Platform.id).all()
             return [_to_dict(r) for r in rows]
 
-    def create(self, platform_id: str, name: str, token: str,
+    def create(self, platform_id: str, name: str, token: str = "",
                base_url: Optional[str] = None, is_active: bool = True,
                llm_api_key: Optional[str] = None) -> dict:
         if not platform_id or not str(platform_id).strip():
             raise ValueError("platform_id 不能为空")
-        if not token:
-            raise ValueError("token 不能为空（平台级系统 token 必填）")
         with self.Session() as s:
             if s.get(Platform, platform_id) is not None:
                 raise ValueError(f"platform_id={platform_id!r} 已存在")
             now = _now()
             row = Platform(
-                id=platform_id, name=name or platform_id, token=token,
+                id=platform_id, name=name or platform_id,
+                token=(token or ""),  # 历史遗留字段，取数不再使用
                 llm_api_key=(llm_api_key or None),
                 base_url=base_url, is_active=is_active,
                 created_at=now, updated_at=now,
@@ -125,21 +126,7 @@ class PlatformRegistry:
             s.commit()
             return True
 
-    # —— 取数解析 ——
-    def resolve(self, platform_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-        """按 platform_id 解析出 (token, base_url)。
-
-        返回 (None, None) 的情况：platform_id 为空 / 平台不存在 / 平台已禁用。
-        调用方据此回退到全局 TESS_SYSTEM_TOKEN / TESS_DATA_API_BASE_URL。
-        """
-        if not platform_id:
-            return None, None
-        row = self.get(platform_id)
-        if row is None or not row.is_active:
-            return None, None
-        base = row.base_url or os.getenv("TESS_DATA_API_BASE_URL") or None
-        return row.token, base
-
+    # —— LLM key 解析（取数平台 token 已废弃，saas_v3.0 按运营个人 token 鉴权）——
     def resolve_llm(self, platform_id: Optional[str]) -> Optional[str]:
         """按 platform_id 解析该平台专用的 LLM（DeepSeek）API key。
 
@@ -154,18 +141,17 @@ class PlatformRegistry:
         return row.llm_api_key or None
 
     def active_platforms(self) -> list:
-        """返回所有启用平台的取数配置：[ {id, token, llm_api_key, base_url}, ... ]。
+        """返回所有启用平台：[ {id, llm_api_key}, ... ]。
 
-        供定时诊断遍历：每个平台跑一遍，alert 打上对应 platform_id。
-        base_url 为空则用全局默认；llm_api_key 为空则该平台 LLM 调用回退全局 key。
+        供定时诊断遍历：每个平台跑一遍，alert 打上对应 platform_id、
+        LLM 用各自的 llm_api_key（为空回退全局 key）。
+        取数 token 统一由调用方用全局 TESS_SYSTEM_TOKEN（无运营 token 上下文）。
         """
         out = []
         for r in self.list(only_active=True):
             out.append({
                 "id": r["id"],
-                "token": r["token"],
                 "llm_api_key": r.get("llm_api_key"),
-                "base_url": r["base_url"] or os.getenv("TESS_DATA_API_BASE_URL") or None,
             })
         return out
 

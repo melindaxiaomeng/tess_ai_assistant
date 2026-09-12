@@ -911,8 +911,8 @@ def process_data_analysis_query(
     - connector: TeensingDataConnector 实例（提供 api_get）
     - llm: 实现 complete(system, user, json_mode=False) -> str 的客户端
            注意：BI 简报用 json_mode=False 返回 Markdown 文本
-    - token: 上游 Teensing 取数用的 access_token（平台级 token，缺失时回退
-             TESS_SYSTEM_TOKEN）；决定按哪个平台的数据取数。
+    - token: 上游 saas_v3.0 取数用的 access_token（运营个人 token，缺失时为
+             TESS_SYSTEM_TOKEN 兜底）；按携带者权限决定能看到的数据范围。
     - operator_id / token_mode: 审计字段，原样回显到 context_summary。
     """
     ctx = fetch_bi_analysis_context(connector, analysis_type, token=token, params=params)
@@ -927,7 +927,7 @@ def process_data_analysis_query(
             "date_or_month": ctx.get("date") or ctx.get("report_month") or ctx.get("time_range"),
             "errors": ctx.get("errors", []),
             "operator_id": operator_id,
-            "token_mode": token_mode,  # "user"=按运营个人 token 取数; "platform"=平台 token; "system"=全局兜底
+            "token_mode": token_mode,  # "user"=按运营个人 token 取数; "system"=全局兜底
             "llm_usage": llm_last_usage(llm),  # 本次 LLM 调用用量（计费/成本分析）
         },
     }

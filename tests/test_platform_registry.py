@@ -1,4 +1,4 @@
-"""P9 · 平台凭证注册表单测：CRUD / resolve / active_platforms。
+"""P9 · 平台注册表单测：CRUD / resolve_llm / active_platforms。
 
 不触达网络：纯本地 SQLite（tess_platforms 表由 PlatformRegistry 自行建表）。
 """
@@ -30,9 +30,13 @@ def test_create_duplicate_raises(reg):
         reg.create("p1", "P1", "tok2")
 
 
-def test_create_missing_token_raises(reg):
-    with pytest.raises(ValueError):
-        reg.create("p2", "P2", "")
+def test_create_without_token_ok(reg):
+    """token 为历史遗留字段（取数平台 token 已废弃），允许不填。"""
+    row = reg.create("p2", "P2", "")
+    assert row["token"] == ""
+    # 位置参数也可省（token 默认空串）
+    row2 = reg.create("p3", "P3")
+    assert row2["token"] == ""
 
 
 def test_update_and_delete(reg):
@@ -44,17 +48,6 @@ def test_update_and_delete(reg):
     assert reg.update("nope", token="x") is None
     assert reg.delete("p1") is True
     assert reg.delete("p1") is False
-
-
-def test_resolve_active_vs_disabled(reg):
-    reg.create("active", "A", "tok-a", is_active=True)
-    reg.create("off", "O", "tok-o", is_active=False)
-    tok, base = reg.resolve("active")
-    assert tok == "tok-a"
-    # 禁用 / 不存在 / 空 -> (None, None)
-    assert reg.resolve("off") == (None, None)
-    assert reg.resolve("missing") == (None, None)
-    assert reg.resolve(None) == (None, None)
 
 
 def test_active_platforms_excludes_disabled(reg):
@@ -116,6 +109,6 @@ def test_llm_api_key_lazy_migration(tmp_path):
         c.commit()
 
     r = PlatformRegistry(db)  # __init__ 里 ensure_column 幂等补列
-    assert r.resolve("old") == ("tok-old", None)  # 存量 token 不受影响
+    assert r.get_dict("old")["token"] == "tok-old"  # 存量数据不受影响
     r.update("old", llm_api_key="sk-migrated")
     assert r.resolve_llm("old") == "sk-migrated"

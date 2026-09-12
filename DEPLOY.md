@@ -301,7 +301,7 @@ docker compose up -d --build    # 改代码后重新构建
   - `X-Platform-Id: <平台标识>`（如 `Melodong`；需先经 `/tess/admin/platforms` 注册该平台及其 token）
   - Tess 按 it 从 `tess_platforms` 表取该平台的系统 token，作为 `Authorization: Bearer` 转发给 Teensing。
 - 未带 / 未注册 `X-Platform-Id` 时回退全局 `TESS_SYSTEM_TOKEN`（写在后端 `.env` / compose）。
-- `POST /tess/diagnose-from-source` 在 teensing 模式下要求「平台 token 或全局 token」至少有其一，缺则返回 `400`。
+- `POST /tess/diagnose-from-source` 在 teensing 模式下要求「运营 token（X-Teensing-Token）或全局 token」至少有其一，缺则返回 `400`。
 - 另有兜底环境变量 `TESS_DATA_API_KEY`（服务端固定凭据），仅在无平台注册的特殊场景使用。
 - （原「运营个人 token X-Teensing-Token」口子已下线，后端不再读取该头。）
 
@@ -312,7 +312,7 @@ docker compose up -d --build    # 改代码后重新构建
 
 ### 11.4 调用示例（curl）
 ```bash
-# 按平台 token 拉取并诊断
+# 拉取并诊断（取数用全局 token；platform 仅用于打标与分平台 LLM key）
 curl -X POST http://localhost:8080/tess/diagnose-from-source \
   -H "Content-Type: application/json" \
   -H "X-Operator-Id: alice" \

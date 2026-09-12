@@ -108,10 +108,10 @@ def _resolve_runtime(request):
     """复用 app.py 的 connector/llm/token 装配逻辑（懒加载，避免顶层循环依赖）。
 
     返回 (connector, llm, token, token_mode, operator, platform_id)，
-    token 按「按人 > 按平台 > 全局」三级解析：
-      1) 运营个人 token（X-Teensing-Token，最高，按人 RBAC 取数）
-      2) 平台级 token（X-Platform-Id 对应 tess_platforms 记录）
-      3) 全局 TESS_SYSTEM_TOKEN。
+    token 按「按人 > 全局」两级解析（平台 token 已废弃）：
+      1) 运营个人 token（X-Teensing-Token，按人 RBAC 取数）
+      2) 全局 TESS_SYSTEM_TOKEN。
+    platform_id 不参与取数，仅用于落库打标与 LLM key 解析。
     """
     from .app import (
         _get_data_connector,
@@ -132,7 +132,7 @@ def _resolve_runtime(request):
     if isinstance(connector, TeensingDataConnector) and not effective_token:
         raise HTTPException(
             status_code=400,
-            detail="生产数据接入需取数凭据：运营 X-Teensing-Token、或平台级 token（X-Platform-Id 对应平台已注册且启用）、或在后端配置 TESS_SYSTEM_TOKEN",
+            detail="生产数据接入需取数凭据：运营 X-Teensing-Token、或在后端配置 TESS_SYSTEM_TOKEN",
         )
     return connector, llm, effective_token, token_mode, operator, platform_id
 

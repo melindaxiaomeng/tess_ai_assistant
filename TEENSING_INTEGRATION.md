@@ -422,7 +422,7 @@ Nginx 注入的 `<TESS_API_KEY>` 必须与 Tess 容器启动时的 `TESS_API_KEY
 POST /tess/analytics
 Content-Type: application/json
 X-API-Key: <TESS_API_KEY>            # Tess<->Teensing 共享密钥（网关注入）
-X-Platform-Id: <平台标识>            # 可选：按该平台 token 取数；缺省回退全局系统 token
+X-Platform-Id: <平台标识>            # 可选：落库打标 + 按平台选 LLM key（取数平台 token 已废弃，与鉴权无关）
 X-Operator-Id: <运营ID>             # 可选：仅审计归因
 
 {
@@ -460,7 +460,7 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
     "date_or_month": "2026-08-03",
     "errors": [],
     "operator_id": "anonymous",     // 来自 X-Operator-Id，审计用
-    "token_mode": "platform"        // "platform"=按 X-Platform-Id 平台 token 取数；"system"=全局系统 token
+    "token_mode": "system"          // "user"=按运营个人 token 取数；"system"=全局系统 token 兜底
   }
 }
 ```
@@ -599,7 +599,7 @@ X-Operator-Id: <运营ID>             # 可选：仅审计归因
 POST /tess/ask
 Content-Type: application/json
 X-API-Key: <TESS_API_KEY>            # 同 §10.1，网关注入
-X-Platform-Id: <平台标识>            # 同 §10.1，按平台 token 取数；缺省回退全局系统 token
+X-Platform-Id: <平台标识>            # 同 §10.1：落库打标 + 按平台选 LLM key（与取数鉴权无关）
 X-Operator-Id: <运营ID>             # 可选，审计
 
 # 方式 A：纯自由提问（后端自动判断是否下钻）
