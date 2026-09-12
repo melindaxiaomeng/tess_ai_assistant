@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { TessDiagnosticDrawer } from "./components/TessDiagnosticDrawer";
+import { TessChatDrawer } from "./components/TessChatDrawer";
 import type { TessOutput, TessInput } from "./components/TessDiagnosticDrawer";
 import { SAMPLE_INPUT, MOCK_OUTPUT } from "./sample";
 
@@ -9,6 +10,7 @@ import { SAMPLE_INPUT, MOCK_OUTPUT } from "./sample";
 export default function App() {
   const [backend, setBackend] = useState("https://8.141.113.22:8443");
   const [apiKey, setApiKey] = useState("");
+  const [token, setToken] = useState(""); // X-Teensing-Token：按权限取数（RBAC）
   const [input, setInput] = useState(JSON.stringify(SAMPLE_INPUT, null, 2));
 
   // Drawer 当前展示的数据
@@ -149,6 +151,13 @@ export default function App() {
           onChange={(e) => setApiKey(e.target.value)}
           placeholder="可选（留空=不鉴权）"
         />
+        <label className="text-gray-500">Teensing Token</label>
+        <input
+          className="w-[200px] border border-gray-300 rounded-md px-3 py-1.5 font-mono text-xs"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          placeholder="可选（X-Teensing-Token）"
+        />
         <button
           className="border border-blue-600 text-blue-600 rounded-md px-3 py-1.5 hover:bg-blue-50"
           onClick={healthCheck}
@@ -237,6 +246,16 @@ export default function App() {
             </div>
             <TessDiagnosticDrawer llmOutput={shownOutput} inputData={inputData} />
           </div>
+        </div>
+      </div>
+
+      {/* 多轮问答（chat_id 服务端会话） */}
+      <div className="px-6 pb-6">
+        <h3 className="text-sm font-semibold mb-2">
+          Tess 自然语言问答（多轮 chat_id 会话）
+        </h3>
+        <div className="max-w-2xl">
+          <TessChatDrawer backend={backend} apiKey={apiKey} teensingToken={token} />
         </div>
       </div>
 

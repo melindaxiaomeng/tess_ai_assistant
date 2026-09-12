@@ -103,3 +103,13 @@ class TessDrawer {
   newChat() { this.chat_id = crypto.randomUUID(); }
 }
 ```
+
+---
+
+### 仓库内可运行参考实现
+
+本仓库 `tess-drawer-demo/` 已内置多轮问答抽屉，可直接 `npm install && npm run dev` 跑起来看效果：
+
+- `tess-drawer-demo/src/components/TessChatDrawer.tsx` —— 多轮问答组件（含上面 3 处改动 + `新对话` 按钮 + 消息流累积渲染）。
+- `tess-drawer-demo/src/App.tsx` —— 顶部配置栏新增 `Teensing Token` 输入，底部挂载 `TessChatDrawer`，把 `backend / apiKey / token` 透传下去。
+- 演示：先问“广告主 X 在渠道 Y 上近 7 日营收怎么样？”，再问“它昨天的营收呢？”即可看到 chat_id 自动指代、无需重复实体。
