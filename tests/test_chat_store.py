@@ -30,9 +30,12 @@ class CapturingLLM:
 
     def __init__(self):
         self.calls = []
+        self.last_usage = None
 
     def complete(self, system, user, json_mode=False):
         self.calls.append((system, user))
+        # 模拟 OpenAI 兼容响应的 usage 字段（HttpLLMClient 真实解析，这里桩测落库链路）
+        self.last_usage = {"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140}
         return "（测试用固定回答）"
 
 
@@ -233,6 +236,51 @@ def test_chats_list_endpoint(monkeypatch, tmp_path):
 
 
 # ------------------- 报表导出 / 聚合（P9 运营分析） -------------------
+
+def test_record_turn_usage_roundtrip(store):
+    """record_turn 带 usage -> export_rows 展开 token 列 -> aggregate_stats 汇总。"""
+    cs._STORE = store
+    cs.record_turn("cU", "opU", "问个问题", "答案", {"campaign_id": 123},
+                   analysis_type="campaign_detail", route_source="entity",
+                   usage={"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140})
+    cs.record_turn("cU", "opU", "再问一个", "再答", {},
+                   usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+    rows = store.export_rows()
+    assert len(rows) == 2
+    assert rows[0]["llm_prompt_tokens"] == 100
+    assert rows[0]["llm_completion_tokens"] == 40
+    assert rows[0]["llm_total_tokens"] == 140
+    assert rows[1]["llm_total_tokens"] == 15
+    # 旧数据（无 usage）不应报错
+    store.append("cU", "opU", "user", "旧问题")
+    store.append("cU", "opU", "assistant", "旧答案")
+    rows3 = store.export_rows()
+    assert rows3[2]["llm_total_tokens"] is None
+
+    stats = store.aggregate_stats()
+    lu = stats["llm_usage"]
+    assert lu["turns_with_usage"] == 2
+    assert lu["prompt_tokens"] == 110
+    assert lu["completion_tokens"] == 45
+    assert lu["total_tokens"] == 155
+    assert sum(lu["per_day_total_tokens"].values()) == 155
+
+
+def test_ask_records_llm_usage(monkeypatch, tmp_path):
+    """端到端：/tess/ask 的 LLM usage 进 context_summary 并随会话落库。"""
+    c = _client(monkeypatch, tmp_path)
+    r = c.post("/tess/ask", json={"question": "广告主 1000839 的营收", "chat_id": "sessU"})
+    assert r.status_code == 200
+    assert r.json()["context_summary"]["llm_usage"] == {
+        "prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140,
+    }
+    # 导出与统计均可见
+    rows = c.get("/tess/chats/export?format=json").json()["rows"]
+    assert rows[0]["llm_total_tokens"] == 140
+    stats = c.get("/tess/chats/stats").json()
+    assert stats["llm_usage"]["total_tokens"] == 140
+    assert stats["llm_usage"]["turns_with_usage"] == 1
+
 
 def test_export_rows_and_aggregate(store):
     store.append("cX", "opX", "user", "广告主营收",

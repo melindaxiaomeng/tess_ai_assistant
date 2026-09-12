@@ -51,6 +51,8 @@ from typing import Optional
 import json
 import re
 
+from .tess_agent import llm_last_usage
+
 # ---------------------------------------------------------------------------
 # BI 分析系统提示词（观点先行 / 数据支撑 / 动作导向）
 # ---------------------------------------------------------------------------
@@ -926,6 +928,7 @@ def process_data_analysis_query(
             "errors": ctx.get("errors", []),
             "operator_id": operator_id,
             "token_mode": token_mode,  # "platform"=按平台 token 取数; "system"=全局系统 token
+            "llm_usage": llm_last_usage(llm),  # 本次 LLM 调用用量（计费/成本分析）
         },
     }
 
@@ -1440,6 +1443,7 @@ def process_question(
         "errors": ctx.get("errors", []),
         "operator_id": operator_id,
         "token_mode": token_mode,
+        "llm_usage": llm_last_usage(llm),  # 本次 LLM 调用用量（计费/成本分析）
         **summary_extra,
     }
     return {

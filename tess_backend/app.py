@@ -535,6 +535,7 @@ def post_ask(payload: dict, request: Request) -> dict:
             analysis_type=cs.get("analysis_type"),
             route_source=cs.get("route_source"),
             platform_id=platform_id or "default",
+            usage=cs.get("llm_usage"),
         )
     # P6 审计：记录「谁问了什么 -> Tess 答了什么」
     AUDIT.log_query(
@@ -548,6 +549,7 @@ def post_ask(payload: dict, request: Request) -> dict:
             "token_mode": token_mode,
             "analysis_type": cs.get("analysis_type"),
             "route_source": cs.get("route_source"),
+            "llm_usage": cs.get("llm_usage"),
         },
     )
     return result
@@ -1283,7 +1285,8 @@ def export_chats(request: Request, format: str = "json"):
 
     - format=json（默认）：返回 { count, rows:[{chat_id, operator_id, question, answer,
       ts, analysis_type, route_source, campaign_id, advertiser_id, publisher_id,
-      package_name, owner_user_id}] }
+      package_name, owner_user_id, llm_prompt_tokens, llm_completion_tokens,
+      llm_total_tokens}] }（llm_* 为该轮 LLM 用量，旧数据为 null）
     - format=csv：扁平 CSV（同名列）直接下载，可用 Excel / BI 打开
     """
     operator = _operator_id(request)
@@ -1296,7 +1299,8 @@ def export_chats(request: Request, format: str = "json"):
         buf = io.StringIO()
         fields = ["chat_id", "operator_id", "platform_id", "question", "answer", "ts",
                   "analysis_type", "route_source", "campaign_id", "advertiser_id",
-                  "publisher_id", "package_name", "owner_user_id"]
+                  "publisher_id", "package_name", "owner_user_id",
+                  "llm_prompt_tokens", "llm_completion_tokens", "llm_total_tokens"]
         writer = csv.DictWriter(buf, fieldnames=fields)
         writer.writeheader()
         for r in rows:

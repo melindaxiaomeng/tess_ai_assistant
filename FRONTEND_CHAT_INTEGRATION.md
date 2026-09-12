@@ -121,13 +121,14 @@ messages.push({ role: "assistant", content: resp.answer }); // 注意取 resp.an
       "answer":"### 诊断结论...", "ts":"2026-09-12T08:00:00Z",
       "analysis_type":"advertiser_deepdive", "route_source":"entity",
       "campaign_id":null, "advertiser_id":1000839, "publisher_id":null,
-      "package_name":null, "owner_user_id":null }
+      "package_name":null, "owner_user_id":null,
+      "llm_prompt_tokens":100, "llm_completion_tokens":40, "llm_total_tokens":140 }
   ]
 }
 ```
 - `format=csv`：同字段的扁平 CSV 下载（文件名 `tess_chats.csv`），`question` / `answer` 若含换行会被 csv 模块正确包裹。
 
-字段说明：`analysis_type` 区分「单维下钻类型 / cross_dimension / null(纯问答兜底)」，是做「问题类型分布」分析的关键维度；`route_source`（`explicit|entity|inferred`）区分问题是怎么被路由的。
+字段说明：`analysis_type` 区分「单维下钻类型 / cross_dimension / null(纯问答兜底)」，是做「问题类型分布」分析的关键维度；`route_source`（`explicit|entity|inferred`）区分问题是怎么被路由的；`llm_*_tokens` 为该轮 LLM 用量（来自 LLM 响应的 usage 字段，供成本核算；旧数据 / 未记录时为 `null`）。
 
 ### 6.2 `GET /tess/chats/stats`
 后端算好的聚合指标，前端可直接渲染成报表看板：
@@ -139,7 +140,10 @@ messages.push({ role: "assistant", content: resp.answer }); // 注意取 resp.an
   "per_operator":   [{"operator_id":"opX","count":40}],
   "analysis_type_distribution": {"advertiser_deepdive":20,"cross_dimension":8,"campaign_detail":12,"None":18},
   "route_source_distribution":   {"entity":40,"explicit":6,"inferred":2,"None":10},
-  "daily_buckets": {"2026-09-10":15,"2026-09-11":23,"2026-09-12":20}
+  "daily_buckets": {"2026-09-10":15,"2026-09-11":23,"2026-09-12":20},
+  "llm_usage": { "turns_with_usage":58, "prompt_tokens":12000, "completion_tokens":5000,
+                 "total_tokens":17000, "per_day_total_tokens":{"2026-09-12":17000},
+                 "per_platform_total_tokens":{"Melodong":17000} }
 }
 ```
 - `top_questions`：高频问题原文（优化话术 / 预设胶囊的线索）
@@ -147,6 +151,7 @@ messages.push({ role: "assistant", content: resp.answer }); // 注意取 resp.an
 - `per_operator`：各运营提问量（活跃度 / 培训重点）
 - `analysis_type_distribution`：**单维 vs 交叉维度 vs 纯问答** 占比（判断要不要强化某类下钻）
 - `daily_buckets`：提问按天分布
+- `llm_usage`：LLM 用量汇总（总/输入/输出 token、按天、按平台），可乘以模型单价直接核算成本
 
 ### 6.3 验证（部署后）
 ```bash

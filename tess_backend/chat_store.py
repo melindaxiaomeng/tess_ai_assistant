@@ -207,6 +207,7 @@ class ChatStore:
                 elif m.get("role") == "assistant" and pending_q is not None:
                     meta = pending_q.get("meta") or {}
                     ents = meta.get("entities") or {}
+                    usage = meta.get("usage") or {}
                     out.append({
                         "chat_id": row.chat_id,
                         "operator_id": row.operator_id,
@@ -221,6 +222,9 @@ class ChatStore:
                         "publisher_id": ents.get("publisher_id"),
                         "package_name": ents.get("package_name"),
                         "owner_user_id": ents.get("owner_user_id"),
+                        "llm_prompt_tokens": usage.get("prompt_tokens"),
+                        "llm_completion_tokens": usage.get("completion_tokens"),
+                        "llm_total_tokens": usage.get("total_tokens"),
                     })
                     pending_q = None
         return out
@@ -231,7 +235,7 @@ class ChatStore:
 
         含：会话数 / 轮数 / Top 问题 / Top 实体 / 各运营提问量 /
         分析类型分布（单维各类型 + cross_dimension + None=QA）/ 路由来源分布 /
-        按天分桶 / 各平台分布（per_platform）。
+        按天分桶 / 各平台分布（per_platform）/ LLM 用量汇总（llm_usage）。
         operator_id / platform_id 给定则叠加过滤。
         """
         from collections import Counter
@@ -249,6 +253,20 @@ class ChatStore:
         at_counter = Counter(str(r["analysis_type"]) for r in rows)
         rs_counter = Counter(str(r["route_source"]) for r in rows)
         day_counter = Counter((r["ts"] or "")[:10] for r in rows)
+        # LLM 用量汇总（仅统计有 usage 记录的轮；旧数据 / Mock 无 usage 则跳过）
+        usage_days: Counter = Counter()
+        usage_platforms: Counter = Counter()
+        p_total = c_total = t_total = 0
+        usage_turns = 0
+        for r in rows:
+            if r.get("llm_total_tokens") is None:
+                continue
+            usage_turns += 1
+            p_total += r.get("llm_prompt_tokens") or 0
+            c_total += r.get("llm_completion_tokens") or 0
+            t_total += r.get("llm_total_tokens") or 0
+            usage_days[(r["ts"] or "")[:10]] += r.get("llm_total_tokens") or 0
+            usage_platforms[r["platform_id"]] += r.get("llm_total_tokens") or 0
         return {
             "total_sessions": len({r["chat_id"] for r in rows}),
             "total_turns": len(rows),
@@ -259,6 +277,14 @@ class ChatStore:
             "analysis_type_distribution": dict(at_counter),
             "route_source_distribution": dict(rs_counter),
             "daily_buckets": dict(sorted(day_counter.items())),
+            "llm_usage": {
+                "turns_with_usage": usage_turns,
+                "prompt_tokens": p_total,
+                "completion_tokens": c_total,
+                "total_tokens": t_total,
+                "per_day_total_tokens": dict(sorted(usage_days.items())),
+                "per_platform_total_tokens": dict(usage_platforms),
+            },
         }
 
 
@@ -286,19 +312,26 @@ def load_history(chat_id: str):
 
 def record_turn(chat_id: str, operator_id: str, question: str, answer: str,
                 entities: Optional[dict], analysis_type: Optional[str] = None,
-                route_source: Optional[str] = None, platform_id: str = "default") -> None:
+                route_source: Optional[str] = None, platform_id: str = "default",
+                usage: Optional[dict] = None) -> None:
     """把一轮问答写回会话；chat_id 为空则不写（单轮模式）。
 
     每条 user 消息的 meta 额外记录 analysis_type / route_source，
     供运营分析「问题类型分布（单维/cross/QA）」使用（见 /tess/chats/export|stats）。
     platform_id：分平台标识，写入会话行与本轮消息，便于按平台隔离/报表。
+    usage：本轮 LLM 用量 {"prompt_tokens","completion_tokens","total_tokens"}，
+    来自 LLM 响应的 usage 字段，供成本/用量分析；缺省不记。
     """
     if not chat_id:
         return
     store = get_chat_store()
-    store.append(chat_id, operator_id, "user", question, meta={
+    meta = {
         "entities": entities or {},
         "analysis_type": analysis_type,
         "route_source": route_source,
-    }, platform_id=platform_id or "default")
+    }
+    if usage:
+        meta["usage"] = usage
+    store.append(chat_id, operator_id, "user", question, meta=meta,
+                 platform_id=platform_id or "default")
     store.append(chat_id, operator_id, "assistant", answer, platform_id=platform_id or "default")

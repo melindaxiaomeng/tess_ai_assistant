@@ -106,6 +106,7 @@ class MockLLMClient:
         self._responses: List[dict] = list(responses)
         self._idx = 0
         self.calls = 0
+        self.last_usage = None  # Mock 不产生真实 usage；测试可手工赋值
 
     def complete(self, system: str, user: str) -> str:
         self.calls += 1
@@ -133,6 +134,7 @@ class HttpLLMClient:
         self.model = model
         self.timeout = timeout
         self.json_mode = json_mode
+        self.last_usage = None  # 最近一次 complete() 的用量（prompt/completion/total tokens）
 
     def complete(self, system: str, user: str, json_mode: Optional[bool] = None) -> str:
         if not self.api_key:
@@ -167,7 +169,29 @@ class HttpLLMClient:
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "ignore")
             raise RuntimeError(f"LLM HTTP {e.code}: {detail[:500]}") from e
+        # 用量统计（OpenAI 兼容响应的 usage 字段）：供每轮问答落库计费/成本分析
+        u = data.get("usage") or {}
+        self.last_usage = {
+            "prompt_tokens": u.get("prompt_tokens"),
+            "completion_tokens": u.get("completion_tokens"),
+            "total_tokens": u.get("total_tokens"),
+        }
         return data["choices"][0]["message"]["content"]
+
+
+def llm_last_usage(llm) -> Optional[dict]:
+    """取 LLM 客户端最近一次调用的用量；无该属性（自定义客户端/旧 Mock）则 None。
+
+    返回 {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}。
+    """
+    usage = getattr(llm, "last_usage", None)
+    if isinstance(usage, dict):
+        return {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+        }
+    return None
 
 
 # ---------------------------------------------------------------------------

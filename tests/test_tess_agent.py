@@ -3,7 +3,37 @@
 import json
 
 from tess_backend.contracts import STATUS_DIAGNOSED, STATUS_DIAGNOSED_SUSPECT, STATUS_INCONCLUSIVE
-from tess_backend.tess_agent import MockLLMClient, TessAgent, SYSTEM_PROMPT, _build_user_prompt
+from tess_backend.tess_agent import (
+    MockLLMClient, TessAgent, SYSTEM_PROMPT, HttpLLMClient, llm_last_usage,
+    _build_user_prompt,
+)
+
+
+def test_http_llm_client_captures_usage(monkeypatch):
+    """HttpLLMClient 应解析 OpenAI 兼容响应的 usage 字段到 last_usage。"""
+    import urllib.request
+
+    class FakeResp:
+        def read(self):
+            return json.dumps({
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+            }).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: FakeResp())
+    client = HttpLLMClient("https://api.example.com", "sk-test", "m")
+    assert client.complete("sys", "user") == "ok"
+    assert client.last_usage == {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+    # llm_last_usage 归一化取值
+    assert llm_last_usage(client) == client.last_usage
+    # 无 last_usage 属性的客户端（如 Duck-typed）不报错
+    assert llm_last_usage(object()) is None
 
 
 # ---------------------------------------------------------------------------

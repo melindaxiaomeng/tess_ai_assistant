@@ -191,6 +191,7 @@ def dispatch_tool(tool_name: str, args: dict, request=None) -> dict:
                 analysis_type=cs.get("analysis_type"),
                 route_source=cs.get("route_source"),
                 platform_id=platform_id or "default",
+                usage=cs.get("llm_usage"),
             )
         return result
 
