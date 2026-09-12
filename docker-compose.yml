@@ -28,11 +28,14 @@ services:
       TESS_SYSTEM_TOKEN: "${TESS_SYSTEM_TOKEN:-}"
       # 实时 KPI 异常判定阈值（默认 0.0 = 任何「今日<昨日」的下跌都判异常；分档见附录）
       TESS_REALTIME_DROP_THRESHOLD: "${TESS_REALTIME_DROP_THRESHOLD:-0.3}"
-      # P7 预警存储：由 TESS_DATABASE_URL 决定后端。
-      #   - 留空            → 代码回退 SQLite（纯本地零依赖开发）
+      # P7 预警存储 + 多轮会话历史：由 TESS_DATABASE_URL 决定后端。
+      #   - 留空（默认）    → sqlite:////data/tess_alerts.db（落在持久卷 tess-data，容器重建不丢；含告警库与 chat_id 多轮历史）
       #   - ...@host.docker.internal:5432/tess → 生产用宿主原生 PG（容器经网关连，推荐）
       #   - ...@db:5432/tess → 本仓库自带 db 服务（需 `docker compose --profile db up -d`）
-      TESS_DATABASE_URL: "${TESS_DATABASE_URL}"
+      # 注意：务必指向 /data 卷内路径，否则 SQLite 文件在容器工作目录，重建即丢。
+      TESS_DATABASE_URL: "${TESS_DATABASE_URL:-sqlite:////data/tess_alerts.db}"
+      # 多轮会话保留轮数（1 轮=一问一答），默认 10 轮，超出裁剪最老记录，防 token 膨胀
+      TESS_CHAT_HISTORY_LIMIT: "${TESS_CHAT_HISTORY_LIMIT:-10}"
       # 开发/演示造数开关：仅 TESS_DEV_SEED=1 时 POST /tess/dev/seed-demo 可用；
       # 生产默认 0（关闭），避免演示数据误入生产库或被 API Key 刷库。
       TESS_DEV_SEED: "${TESS_DEV_SEED:-0}"
