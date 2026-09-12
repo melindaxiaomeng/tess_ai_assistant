@@ -194,3 +194,59 @@ class TessDrawer {
 - `tess-drawer-demo/src/components/TessChatDrawer.tsx` —— 多轮问答组件（含上面 3 处改动 + `新对话` 按钮 + 消息流累积渲染）。
 - `tess-drawer-demo/src/App.tsx` —— 顶部配置栏新增 `Teensing Token` 输入，底部挂载 `TessChatDrawer`，把 `backend / apiKey / token` 透传下去。
 - 演示：先问“广告主 X 在渠道 Y 上近 7 日营收怎么样？”，再问“它昨天的营收呢？”即可看到 chat_id 自动指代、无需重复实体。
+
+---
+
+## 8. 多平台（P9）对接要点
+
+> 多个平台（各自独立的 Teensing 租户 token，共用同一 base_url）共用同一套 Tess 后端。
+> 每个平台用**不同的平台级系统 token**取数，且所有落库（对话 / 预警）都会打上 `platform_id`，
+> 以便按平台隔离、分平台出报表。
+
+### 8.1 前端所有请求加一个 `X-Platform-Id` 头
+
+在 §3 的 headers 里再加一行即可（与 `X-Operator-Id` / `X-Teensing-Token` 同级）：
+
+```js
+headers: {
+  "Content-Type": "application/json",
+  "X-API-Key": KEY,            // 对外接口鉴权
+  "X-Teensing-Token": TOKEN,   // 运营 RBAC（若有；否则回退平台级 token）
+  "X-Operator-Id": userId,     // 谁问的（审计）
+  "X-Platform-Id": platformId, // ← 新增：平台标识（如 "facemoji" / "brandb"）
+}
+```
+
+- 后端按 `X-Platform-Id` 解析出该平台的系统 token 去 Teensing 取数；
+  未带则按 `X-Teensing-Token` → 全局 `TESS_SYSTEM_TOKEN` 回退（向后兼容旧前端）。
+- 多轮 `POST /tess/ask` 带 `X-Platform-Id` 时，本轮问答会被打上该 `platform_id`，
+  后续 `GET /tess/chats` / `/tess/chats/export` / `/tess/chats/stats` 也支持 `?platform=` 过滤。
+- 预警拉取 `GET /tess/alerts` / `/tess/realtime-kpi/alerts` 同样支持 `?platform=` 或头过滤，
+  只返回该平台告警。
+
+### 8.2 平台管理接口（管理端用，独立密钥 `X-Admin-Key`）
+
+不是给前端调用方用的，是给运维在后台增删改平台凭证的。受 `TESS_ADMIN_API_KEY` 守卫
+（未设置时整体禁用 403）。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/tess/admin/platforms` | 列出全部平台（含 token、base_url、启用状态） |
+| POST | `/tess/admin/platforms` | 新增：body `{ id, name, token, base_url?, is_active? }` |
+| PUT | `/tess/admin/platforms/{id}` | 改：body 任意子集 `{ name, token, base_url, is_active }` |
+| DELETE | `/tess/admin/platforms/{id}` | 删（历史记录保留原 platform_id，仅停该平台后续定时诊断） |
+
+```bash
+# 新增一个平台（token 由平台提供，各平台不同、共用 base_url 时只填 token）
+curl -s -X POST "https://<host>/tess/admin/platforms" \
+  -H "X-Admin-Key: $TESS_ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"facemoji","name":"Facemoji DSP","token":"<平台级系统token>","is_active":true}'
+
+# 只跑某平台的一次诊断（即时验证）
+curl -s -X POST "https://<host>/tess/cron/run" \
+  -H "X-API-Key: $TESS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"platform":"facemoji","limit":20}'
+```
+

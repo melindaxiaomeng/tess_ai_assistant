@@ -48,6 +48,9 @@ services:
       TESS_DATA_API_BASE_URL: "${TESS_DATA_API_BASE_URL}"
       # Teensing 数据 API 兜底 Token（多数场景留空，由调用方经 X-Teensing-Token 透传）
       TESS_DATA_API_KEY: "${TESS_DATA_API_KEY}"
+      # P9 平台管理密钥：专管 /tess/admin/platforms 增删改查，与对外 X-API-Key 隔离。
+      # 留空=平台管理接口禁用（403）。生产必填，调用方请求头带 X-Admin-Key。
+      TESS_ADMIN_API_KEY: "${TESS_ADMIN_API_KEY:-}"
     volumes:
       - tess-data:/data
     # 让容器内 host.docker.internal 解析到宿主网关（生产用宿主原生 PG 时必填，

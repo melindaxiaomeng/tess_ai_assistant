@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # 默认后端：本地 SQLite 文件（零依赖）。生产请通过 TESS_DATABASE_URL 切到 Postgres。
@@ -22,6 +22,23 @@ DEFAULT_URL = os.getenv("TESS_DATABASE_URL", "sqlite:///tess_alerts.db")
 
 # 所有 Tess 存储模型共享的声明基类；新增表只需 class X(Base): __tablename__=...
 Base = declarative_base()
+
+
+def _resolve_url(db_url: Optional[str]) -> str:
+    """把构造参数归一为 SQLAlchemy URL（各存储模块统一调用，避免裸路径歧义）。
+
+    - None        -> 取 TESS_DATABASE_URL 环境变量；再无则回退默认本地 SQLite 文件。
+    - 含 "://"    -> 视为完整 URL（sqlite:///... 或 postgresql+psycopg://...），原样返回。
+    - 其它（裸路径）-> 视为 SQLite 文件路径，补全为 sqlite:///<绝对路径>。
+    """
+    if db_url is None:
+        env = os.getenv("TESS_DATABASE_URL")
+        if env:
+            return env
+        return "sqlite:///" + os.path.abspath("tess_alerts.db")
+    if "://" in db_url:
+        return db_url
+    return "sqlite:///" + os.path.abspath(db_url)
 
 
 def make_engine(url: str = DEFAULT_URL):
@@ -51,3 +68,18 @@ def make_session_factory(engine):
 def init_all(engine) -> None:
     """按已注册模型建表（幂等）。AlertStore 等模块初始化时调用。"""
     Base.metadata.create_all(engine)
+
+
+def ensure_column(engine, table: str, column: str, coltype: str) -> None:
+    """幂等加列（兼容 sqlite / Postgres）。
+
+    用于给已存在的表追加新列（如分平台 platform_id），避免破坏性迁移。
+    列已存在则静默跳过；coltype 需自带默认值（如 "VARCHAR(64) DEFAULT 'default'"）。
+    """
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"))
+            conn.commit()
+    except Exception:
+        # sqlite 列已存在会抛 duplicate column；postgres 同理，这里统一静默跳过
+        pass

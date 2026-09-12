@@ -105,12 +105,18 @@ def resolve_analyze_params(args: dict) -> tuple:
 
 
 def _resolve_runtime(request):
-    """复用 app.py 的 connector/llm/token 装配逻辑（懒加载，避免顶层循环依赖）。"""
+    """复用 app.py 的 connector/llm/token 装配逻辑（懒加载，避免顶层循环依赖）。
+
+    返回 (connector, llm, token, token_mode, operator, platform_id)，
+    token 与 platform_id 按 P9 平台规则解析：
+      1) 运营 X-Teensing-Token（最高） 2) 平台级 token（X-Platform-Id） 3) 全局 TESS_SYSTEM_TOKEN。
+    """
     from .app import (
         _get_data_connector,
         _get_llm_client,
-        _teensing_token,
         _operator_id,
+        _platform_id,
+        _resolve_access_token,
         TeensingDataConnector,
     )
     from fastapi import HTTPException
@@ -118,16 +124,14 @@ def _resolve_runtime(request):
     connector = _get_data_connector()
     llm = _get_llm_client()
     operator = _operator_id(request) if request is not None else "anonymous"
-    user_token = _teensing_token(request) if request is not None else ""
-    system_token = os.getenv("TESS_SYSTEM_TOKEN") or None
-    effective_token = user_token or system_token
-    token_mode = "user" if user_token else "system"
+    platform_id = _platform_id(request) if request is not None else None
+    effective_token, token_mode = _resolve_access_token(request, platform_id)
     if isinstance(connector, TeensingDataConnector) and not effective_token:
         raise HTTPException(
             status_code=400,
-            detail="生产数据接入需在前端请求头携带 X-Teensing-Token（运营 SaaS access_token）",
+            detail="生产数据接入需携带取数凭据：运营 X-Teensing-Token、或平台级 token（X-Platform-Id 对应）、或 TESS_SYSTEM_TOKEN",
         )
-    return connector, llm, effective_token, token_mode, operator
+    return connector, llm, effective_token, token_mode, operator, platform_id
 
 
 def dispatch_tool(tool_name: str, args: dict, request=None) -> dict:
@@ -144,7 +148,7 @@ def dispatch_tool(tool_name: str, args: dict, request=None) -> dict:
 
     if tool_name == "tess_analyze":
         analysis_type, params = resolve_analyze_params(args)
-        connector, llm, token, token_mode, operator = _resolve_runtime(request)
+        connector, llm, token, token_mode, operator, platform_id = _resolve_runtime(request)
         return process_data_analysis_query(
             analysis_type, connector, llm,
             token=token, params=params,
@@ -163,7 +167,7 @@ def dispatch_tool(tool_name: str, args: dict, request=None) -> dict:
             from .chat_store import load_history
 
             history_text, history_entities = load_history(chat_id)
-        connector, llm, token, token_mode, operator = _resolve_runtime(request)
+        connector, llm, token, token_mode, operator, platform_id = _resolve_runtime(request)
         result = process_question(
             str(question), connector, llm,
             token=token, params=params,
@@ -186,6 +190,7 @@ def dispatch_tool(tool_name: str, args: dict, request=None) -> dict:
                 _ents,
                 analysis_type=cs.get("analysis_type"),
                 route_source=cs.get("route_source"),
+                platform_id=platform_id or "default",
             )
         return result
 
@@ -206,11 +211,13 @@ def dispatch_tool(tool_name: str, args: dict, request=None) -> dict:
             return get_realtime_kpi_alerts(
                 limit=limit, min_severity=min_sev,
                 min_revenue=min_rev, include_acked=include_acked,
+                request=request,
             )
         source = None if scope == "all" else scope
         return get_alerts(
             limit=limit, source=source, min_severity=min_sev,
             min_revenue=min_rev, include_acked=include_acked,
+            request=request,
         )
 
     raise HTTPException(status_code=400, detail=f"未知 tool: {tool_name}")

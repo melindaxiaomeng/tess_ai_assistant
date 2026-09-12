@@ -299,3 +299,48 @@ def test_export_and_stats_endpoints(monkeypatch, tmp_path):
     assert sbody["total_sessions"] == 1
     assert sbody["total_turns"] == 2
     assert sbody["analysis_type_distribution"].get("advertiser_deepdive") == 2
+
+
+# ------------------- P9 分平台隔离 -------------------
+
+def test_platform_filtering_unit(store):
+    store.append("cP1", "op", "user", "q1", platform_id="facemoji")
+    store.append("cP1", "op", "assistant", "a1", platform_id="facemoji")
+    store.append("cP2", "op", "user", "q2", platform_id="brandb")
+    # 列表按平台隔离
+    fm = store.list_sessions(operator_id="op", platform_id="facemoji")
+    assert len(fm) == 1 and fm[0]["chat_id"] == "cP1"
+    bb = store.list_sessions(operator_id="op", platform_id="brandb")
+    assert len(bb) == 1 and bb[0]["chat_id"] == "cP2"
+    # 不带平台过滤 -> 全部
+    allp = store.list_sessions(operator_id="op")
+    assert len(allp) == 2
+
+
+def test_export_and_stats_platform_filter(store):
+    store.append("cX", "op", "user", "q", platform_id="facemoji",
+                 meta={"entities": {"campaign_id": 1}, "analysis_type": "campaign_detail",
+                       "route_source": "entity"})
+    store.append("cX", "op", "assistant", "a", platform_id="facemoji")
+    store.append("cY", "op", "user", "q2", platform_id="brandb",
+                 meta={"entities": {}, "analysis_type": None, "route_source": None})
+    store.append("cY", "op", "assistant", "a2", platform_id="brandb")
+    fm = store.export_rows(platform_id="facemoji")
+    assert len(fm) == 1 and fm[0]["platform_id"] == "facemoji"
+    bb = store.export_rows(platform_id="brandb")
+    assert len(bb) == 1 and bb[0]["platform_id"] == "brandb"
+    stats = store.aggregate_stats(platform_id="facemoji")
+    assert stats["total_turns"] == 1
+    assert stats["per_platform"][0]["platform_id"] == "facemoji"
+
+
+def test_ask_tags_platform_via_header(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    r = c.post("/tess/ask", json={"question": "广告主 1000839 的营收", "chat_id": "sessP"},
+               headers={"X-Platform-Id": "facemoji"})
+    assert r.status_code == 200
+    # 带平台头过滤到该平台会话
+    fm = c.get("/tess/chats", headers={"X-Platform-Id": "facemoji"})
+    assert fm.json()["count"] == 1
+    # 默认（无平台头）也能看到全部
+    assert c.get("/tess/chats").json()["count"] == 1

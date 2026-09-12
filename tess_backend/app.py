@@ -13,6 +13,7 @@ import hmac
 import os
 import re
 import time
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,6 +46,7 @@ from .tools_adapter import dispatch_tool, load_tool_schemas
 from .gaid_vault import VAULT, RedactFilter
 from .audit_log import QueryLogStore
 from .alerts_store import AlertStore
+from .platform_registry import get_platform_registry
 from .dev_seed import DEMO_EVENT_IDS
 
 app = FastAPI(title="Tess Diagnose API", version="2.3.0")
@@ -124,20 +126,59 @@ def _get_data_connector():
     return _DATA_CONNECTOR
 
 
-def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None) -> list:
-    """P7 定时预警：用共享服务 token 拉异常 → 诊断 → 存预警库。
+def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None,
+                           platform_id: Optional[str] = None) -> list:
+    """P7 定时预警：按平台分别拉异常 → 诊断 → 存预警库（每条告警打 platform_id）。
 
     数据来源（两轮，统一进同一批预警）：
     (1) 异常预警 + 涨跌榜（/overview/ranking/*）→ 归一化 → 诊断（source="anomaly-warning"）
     (2) 实时 KPI 小时级曲线（/overview/realtime-kpi）→ 提取骤降异常点 → 诊断（source="realtime-kpi"）
 
-    token：优先 TESS_SYSTEM_TOKEN，回退 TESS_DATA_API_KEY（共享服务 token，不按人过滤）。
-    返回本轮诊断结果列表（同 /tess/diagnose-from-source 的 results 形状，meta 含 source 标签）。
+    platform_id 指定时只跑该平台；为 None 时遍历所有启用平台；
+    若未注册任何平台，回退到全局 TESS_SYSTEM_TOKEN（platform_id="default"，旧行为）。
+    token：优先平台 token（按平台 id 从 tess_platforms 取），回退 TESS_SYSTEM_TOKEN。
+    各平台共用同一 Teensing base_url（仅 token 不同），故单 connector 复用。
+    返回本轮所有平台汇总诊断结果列表（meta 含 source 标签）。
     """
     connector = connector or _get_data_connector()
     llm = llm or _get_llm_client()
-    token = os.getenv("TESS_SYSTEM_TOKEN") or None
     policy = load_policy()
+
+    # 构造待跑平台清单：(platform_id, token)
+    targets: list = []
+    if platform_id:
+        tok, _base = _resolve_platform_token(platform_id)
+        targets.append((platform_id, tok or os.getenv("TESS_SYSTEM_TOKEN") or ""))
+    else:
+        try:
+            plats = get_platform_registry().active_platforms()
+        except Exception:
+            plats = []
+        if plats:
+            for p in plats:
+                targets.append((p["id"], p["token"] or os.getenv("TESS_SYSTEM_TOKEN") or ""))
+        else:
+            targets.append(("default", os.getenv("TESS_SYSTEM_TOKEN") or ""))
+
+    all_results: list = []
+    for pid, token in targets:
+        results = _diagnose_one_platform(connector, llm, token, pid, limit, policy)
+        if results:
+            ALERTS.save_batch(results, platform_id=pid)
+        all_results.extend(results)
+    return all_results
+
+
+def _resolve_platform_token(platform_id: str) -> tuple:
+    """取某平台的 (token, base_url)；平台不存在/禁用/异常时回退全局（返回 None）。"""
+    try:
+        return get_platform_registry().resolve(platform_id)
+    except Exception:
+        return None, None
+
+
+def _diagnose_one_platform(connector, llm, token, platform_id: str, limit: int, policy) -> list:
+    """对单个平台跑完整诊断两轮，返回结果列表（不落库；由调用方按 platform_id 落库）。"""
     results: list = []
 
     # (1) 异常预警 + 涨跌榜
@@ -155,12 +196,12 @@ def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None) -> list:
                     publisher_id=raw.get("publisher_id"),
                 )
             except Exception as e:
-                logger.warning("拉取 campaign %s 历史趋势失败: %s", cid, e)
+                logger.warning("平台 %s 拉取 campaign %s 历史趋势失败: %s", platform_id, cid, e)
         # 营收门槛降噪 + 小投放猝死豁免：低营收且无断崖式下跌则跳过，不进诊断
         if not should_diagnose(raw, history_baseline):
             logger.info(
-                "campaign %s 营收 %.2f 低于门槛且无断崖式下跌，跳过诊断",
-                cid, _num(raw.get("revenue")),
+                "平台 %s campaign %s 营收 %.2f 低于门槛且无断崖式下跌，跳过诊断",
+                platform_id, cid, _num(raw.get("revenue")),
             )
             continue
         if history_baseline is not None:
@@ -200,9 +241,8 @@ def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None) -> list:
                 }
             )
     except Exception as e:  # realtime 拉取/解析失败不应拖垮整批预警
-        logger.warning("realtime-kpi 拉取或分析失败，本轮跳过实时异常检测: %s", e)
+        logger.warning("平台 %s realtime-kpi 拉取或分析失败，本轮跳过实时异常检测: %s", platform_id, e)
 
-    ALERTS.save_batch(results)
     return results
 
 
@@ -232,6 +272,57 @@ def _operator_id(request: Request) -> str:
 def _teensing_token(request: Request) -> str:
     """从请求头取运营 SaaS access_token（X-Teensing-Token），用于按权限拉数据；缺省空串。"""
     return request.headers.get("X-Teensing-Token", "") or ""
+
+
+def _platform_id(request: Request) -> Optional[str]:
+    """取平台标识：优先请求头 X-Platform-Id，其次查询参数 ?platform=；缺省 None。
+
+    用于把一次请求归属到具体平台（分平台 token 解析 + 落库打标 + 报表隔离）。
+    """
+    pid = request.headers.get("X-Platform-Id", "") or ""
+    if not pid and getattr(request, "query_params", None):
+        pid = request.query_params.get("platform", "") or ""
+    return pid.strip() or None
+
+
+def _resolve_access_token(request: Optional[Request], platform_id: Optional[str] = None) -> tuple:
+    """解析本次调 Teensing 取数用的 token 与模式。
+
+    优先级：
+      1) 运营 X-Teensing-Token（按人 RBAC，最高）
+      2) 平台级 token（按 X-Platform-Id 从 tess_platforms 取，仅 token 不同、共用 base_url）
+      3) 全局 TESS_SYSTEM_TOKEN（兜底，无按人/按平台过滤，仅内部/定时任务）
+
+    返回 (effective_token:str, token_mode:str)，token_mode ∈ {user, platform, system}。
+    """
+    user_token = _teensing_token(request) if request else ""
+    if user_token:
+        return user_token, "user"
+    if platform_id:
+        try:
+            token, _base = get_platform_registry().resolve(platform_id)
+            if token:
+                return token, "platform"
+        except Exception:
+            pass
+    system_token = os.getenv("TESS_SYSTEM_TOKEN") or None
+    return (system_token or ""), ("system" if system_token else "system")
+
+
+# —— 平台管理接口鉴权（独立于 Tess 自身 X-API-Key，避免普通调用方误改平台凭证）——
+_ADMIN_API_KEY = os.getenv("TESS_ADMIN_API_KEY", "")
+
+
+def _require_admin(request: Request) -> None:
+    """平台 CRUD 管理密钥校验：X-Admin-Key 必须等于 TESS_ADMIN_API_KEY。
+
+    TESS_ADMIN_API_KEY 未设置时管理接口整体禁用（403），避免误开。
+    """
+    if not _ADMIN_API_KEY:
+        raise HTTPException(status_code=403, detail="平台管理接口未启用（请设置 TESS_ADMIN_API_KEY）")
+    provided = request.headers.get("X-Admin-Key", "") or ""
+    if not provided or not hmac.compare_digest(provided, _ADMIN_API_KEY):
+        raise HTTPException(status_code=403, detail="缺少或错误的 X-Admin-Key")
 
 
 @app.post("/tess/diagnose")
@@ -335,16 +426,14 @@ def post_analytics(payload: dict, request: Request) -> dict:
     #   缺失时回退到 TESS_SYSTEM_TOKEN（系统级，仅限内部/定时任务等无终端用户场景）。
     #   token 原样透传给 Teensing，由 Teensing 按该用户的 RBAC/数据权限返回数据 ——
     #   用户看不到其无权访问的 Campaign/广告主/营收。
+    platform_id = _platform_id(request)
     operator = _operator_id(request) if request else "anonymous"
-    user_token = _teensing_token(request) if request else ""
-    system_token = os.getenv("TESS_SYSTEM_TOKEN") or None
-    effective_token = user_token or system_token
-    token_mode = "user" if user_token else "system"
+    effective_token, token_mode = _resolve_access_token(request, platform_id)
     # 生产（Teensing 真实连接器）下没有任何 token 则无法按权限取数 -> 400
     if isinstance(connector, TeensingDataConnector) and not effective_token:
         raise HTTPException(
             status_code=400,
-            detail="生产数据接入需在前端请求头携带 X-Teensing-Token（运营 SaaS access_token）",
+            detail="生产数据接入需携带取数凭据：运营 X-Teensing-Token、或平台级 token（X-Platform-Id 对应）、或 TESS_SYSTEM_TOKEN",
         )
     try:
         result = process_data_analysis_query(
@@ -421,15 +510,13 @@ def post_ask(payload: dict, request: Request) -> dict:
     except (RuntimeError, ValueError) as e:
         raise HTTPException(status_code=503, detail=f"Tess 未配置 Teensing 数据源：{e}")
     llm = _get_llm_client()
+    platform_id = _platform_id(request)
     operator = _operator_id(request) if request else "anonymous"
-    user_token = _teensing_token(request) if request else ""
-    system_token = os.getenv("TESS_SYSTEM_TOKEN") or None
-    effective_token = user_token or system_token
-    token_mode = "user" if user_token else "system"
+    effective_token, token_mode = _resolve_access_token(request, platform_id)
     if isinstance(connector, TeensingDataConnector) and not effective_token:
         raise HTTPException(
             status_code=400,
-            detail="生产数据接入需在前端请求头携带 X-Teensing-Token（运营 SaaS access_token）",
+            detail="生产数据接入需携带取数凭据：运营 X-Teensing-Token、或平台级 token（X-Platform-Id 对应）、或 TESS_SYSTEM_TOKEN",
         )
     try:
         result = process_question(
@@ -455,6 +542,7 @@ def post_ask(payload: dict, request: Request) -> dict:
             _ents,
             analysis_type=cs.get("analysis_type"),
             route_source=cs.get("route_source"),
+            platform_id=platform_id or "default",
         )
     # P6 审计：记录「谁问了什么 -> Tess 答了什么」
     AUDIT.log_query(
@@ -635,7 +723,8 @@ def _extract_campaign_publisher(item: dict) -> dict:
 
 @app.get("/tess/alerts")
 def get_alerts(limit: int = 50, source: str = None, min_severity: str = None,
-               min_revenue: float = None, include_acked: bool = True) -> dict:
+               min_revenue: float = None, include_acked: bool = True,
+               request: Request = None) -> dict:
     """P7 定时预警拉取接口：Teensing / SaaS 后端可轮询此接口获取每小时诊断结果。
 
     返回最近 limit 条预警（含 run_time / event_id / status / confidence / source / diagnosis / ack*）。
@@ -643,10 +732,13 @@ def get_alerts(limit: int = 50, source: str = None, min_severity: str = None,
     min_severity 过滤：?min_severity=MEDIUM 只看 >= MEDIUM 的告警（LOW/MEDIUM/HIGH）。
     min_revenue 过滤：?min_revenue=20 只看营收 >= 20 USD 的告警（贴合 'Rev>20 才显示'；
         营收未知的记录在设定 min_revenue 时一律排除）。
+    platform 过滤：?platform=facemoji 或请求头 X-Platform-Id，只看该平台告警（分平台隔离）。
     include_acked：默认 True（含已确认项）；置 false 则只返回「运营尚未确认」的告警。
     受全局 X-API-Key 守卫（若生产已开启）。共享 token 模式：全局可读，不按人过滤。
     """
-    rows = ALERTS.recent(limit=limit, source=source or None, include_acked=include_acked)
+    platform = _platform_id(request) if request else None
+    rows = ALERTS.recent(limit=limit, source=source or None, include_acked=include_acked,
+                         platform=platform)
     rows = _filter_by_min_severity(rows, min_severity)
     rows = _filter_by_min_revenue(rows, min_revenue)
     rows = [_extract_campaign_publisher(r) for r in rows]
@@ -656,7 +748,8 @@ def get_alerts(limit: int = 50, source: str = None, min_severity: str = None,
 @app.get("/tess/realtime-kpi/alerts")
 def get_realtime_kpi_alerts(limit: int = 50, min_severity: str = None,
                             min_revenue: float = None, since_as_of: str = None,
-                            include_acked: bool = False) -> dict:
+                            include_acked: bool = False,
+                            request: Request = None) -> dict:
     """Teensing 专用拉取接口：返回最近一轮对 realtime-kpi 的诊断结果批次。
 
     与通用 /tess/alerts 的区别：只针对 realtime-kpi 来源，且返回「最近一次整批」
@@ -687,13 +780,16 @@ def get_realtime_kpi_alerts(limit: int = 50, min_severity: str = None,
 
     鉴权：受全局 X-API-Key 守卫（生产设 TESS_API_KEY 后，Teensing 请求头带
     X-API-Key: <共享密钥> 即可）。共享 token 模式：全局可读，不按人过滤。
+    platform 过滤：?platform=facemoji 或请求头 X-Platform-Id，只看该平台告警（分平台隔离）。
     """
+    platform = _platform_id(request) if request else None
     if since_as_of:
         items = ALERTS.query_since(since_as_of, source="realtime-kpi", limit=limit,
-                                   include_acked=include_acked)
+                                   include_acked=include_acked, platform=platform)
         as_of = items[-1]["run_time"] if items else None
     else:
-        batch = ALERTS.latest_batch(source="realtime-kpi", limit=limit, include_acked=include_acked)
+        batch = ALERTS.latest_batch(source="realtime-kpi", limit=limit, include_acked=include_acked,
+                                    platform=platform)
         items = batch["alerts"]
         as_of = batch["run_time"]
 
@@ -812,16 +908,84 @@ def dev_clear_demo(payload: dict = None) -> dict:
 
 
 @app.post("/tess/cron/run")
-def cron_run(payload: dict = None) -> dict:
+def cron_run(payload: dict = None, request: Request = None) -> dict:
     """P7 手动触发一次定时诊断（便于立即验证，不必等下一个整点）。
 
-    body: { "limit": 20 }
-    结果同时写入预警库（GET /tess/alerts 可拉取）。
+    body: { "limit": 20, "platform": "facemoji" }
+      - 不传 platform：遍历所有启用平台各跑一遍（每平台告警打对应 platform_id）。
+      - 传 platform：只跑该平台（便于单独对某平台即时验证）。
+    结果同时写入预警库（GET /tess/alerts 可拉取，按 ?platform= 过滤）。
     """
     payload = payload or {}
     limit = int(payload.get("limit", os.getenv("TESS_SCHEDULE_LIMIT", "20")))
-    results = run_scheduled_diagnosis(limit)
-    return {"count": len(results), "results": results}
+    platform = payload.get("platform") or (_platform_id(request) if request else None)
+    results = run_scheduled_diagnosis(limit, platform_id=platform)
+    return {"count": len(results), "platform": platform or "all", "results": results}
+
+
+# —— P9 平台管理接口（独立管理密钥 X-Admin-Key 守卫）——
+@app.get("/tess/admin/platforms")
+def admin_list_platforms(request: Request) -> dict:
+    """列出全部平台凭证（仅管理端用，受 X-Admin-Key 守卫）。
+
+    返回：{ count, platforms: [ {id, name, token, base_url, is_active, created_at, updated_at}, ... ] }
+    注意：token 原样返回（管理端需要查看/复制），但仅管理密钥可见，普通调用方拿不到。
+    """
+    _require_admin(request)
+    rows = get_platform_registry().list()
+    return {"count": len(rows), "platforms": rows}
+
+
+@app.post("/tess/admin/platforms")
+def admin_create_platform(payload: dict, request: Request) -> dict:
+    """新增一个平台（受 X-Admin-Key 守卫）。
+
+    body: { "id": "facemoji", "name": "Facemoji DSP", "token": "<平台级系统token>",
+            "base_url": null, "is_active": true }
+      - id：稳定字符串主键，前端在 X-Platform-Id 携带；必填、不可重复。
+      - token：平台级系统 token（各平台共用 base_url 时，仅此处不同）；必填。
+      - base_url：可选，NULL 则回退全局 TESS_DATA_API_BASE_URL。
+    """
+    _require_admin(request)
+    payload = payload or {}
+    pid = payload.get("id")
+    token = payload.get("token")
+    if not pid or not token:
+        raise HTTPException(status_code=422, detail="id 与 token 均为必填")
+    try:
+        row = get_platform_registry().create(
+            platform_id=pid, name=payload.get("name", ""), token=token,
+            base_url=payload.get("base_url"), is_active=bool(payload.get("is_active", True)),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"ok": True, "platform": row}
+
+
+@app.put("/tess/admin/platforms/{platform_id}")
+def admin_update_platform(platform_id: str, payload: dict, request: Request) -> dict:
+    """更新平台（受 X-Admin-Key 守卫）。可改 name / token / base_url / is_active。
+
+    body（部分字段即可）：{ "token": "<新token>", "is_active": false }
+    """
+    _require_admin(request)
+    payload = payload or {}
+    row = get_platform_registry().update(platform_id, **payload)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"未找到平台 {platform_id}")
+    return {"ok": True, "platform": row}
+
+
+@app.delete("/tess/admin/platforms/{platform_id}")
+def admin_delete_platform(platform_id: str, request: Request) -> dict:
+    """删除平台（受 X-Admin-Key 守卫）。注意：已落库的 chat_sessions / alerts 的
+    platform_id 不会因此被改（历史记录保留原归属），仅停止该平台后续参与定时诊断。
+    """
+    _require_admin(request)
+    ok = get_platform_registry().delete(platform_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"未找到平台 {platform_id}")
+    return {"ok": True, "deleted": platform_id}
 
 
 @app.post("/tess/gaid/resolve")
@@ -1116,7 +1280,8 @@ def list_chats(request: Request, limit: int = 100) -> dict:
     前端可据此渲染历史会话侧边栏，点击某条后调用 GET /tess/chat/{chat_id} 取完整消息恢复。
     """
     operator = _operator_id(request)
-    sessions = get_chat_store().list_sessions(operator_id=operator, limit=limit)
+    platform = _platform_id(request)
+    sessions = get_chat_store().list_sessions(operator_id=operator, platform_id=platform, limit=limit)
     return {"sessions": sessions, "count": len(sessions)}
 
 
@@ -1130,13 +1295,14 @@ def export_chats(request: Request, format: str = "json"):
     - format=csv：扁平 CSV（同名列）直接下载，可用 Excel / BI 打开
     """
     operator = _operator_id(request)
-    rows = get_chat_store().export_rows(operator_id=operator)
+    platform = _platform_id(request)
+    rows = get_chat_store().export_rows(operator_id=operator, platform_id=platform)
     if format == "csv":
         import csv
         import io
 
         buf = io.StringIO()
-        fields = ["chat_id", "operator_id", "question", "answer", "ts",
+        fields = ["chat_id", "operator_id", "platform_id", "question", "answer", "ts",
                   "analysis_type", "route_source", "campaign_id", "advertiser_id",
                   "publisher_id", "package_name", "owner_user_id"]
         writer = csv.DictWriter(buf, fieldnames=fields)
@@ -1160,7 +1326,8 @@ def chat_stats(request: Request):
     daily_buckets —— 前端可据此渲染「问题热点 / 实体热度 / 各运营活跃度」报表看板。
     """
     operator = _operator_id(request)
-    return get_chat_store().aggregate_stats(operator_id=operator)
+    platform = _platform_id(request)
+    return get_chat_store().aggregate_stats(operator_id=operator, platform_id=platform)
 
 
 @app.post("/tess/tool")

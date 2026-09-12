@@ -156,3 +156,45 @@ def test_query_since_incremental(tmp_path):
     assert newer[0]["event_id"] == "B2"
     # 无更新：空列表
     assert store.query_since("2026-07-30 13:00:00", source="realtime-kpi") == []
+
+
+# ------------------- P9 分平台标识 + 去重键含 platform_id -------------------
+
+def test_platform_tagging_and_filter(tmp_path):
+    store = AlertStore(str(tmp_path / "pf.db"))
+    store.save_batch(
+        [{"event_id": "F1", "diagnosis": {"status": "DIAGNOSED"}, "meta": {"source": "anomaly-warning"}}],
+        platform_id="facemoji", run_time="2026-07-30 12:00:00",
+    )
+    store.save_batch(
+        [{"event_id": "B1", "diagnosis": {"status": "DIAGNOSED"}, "meta": {"source": "anomaly-warning"}}],
+        platform_id="brandb", run_time="2026-07-30 12:00:00",
+    )
+    fm = store.recent(platform="facemoji")
+    assert len(fm) == 1 and fm[0]["platform_id"] == "facemoji"
+    bb = store.recent(platform="brandb")
+    assert len(bb) == 1 and bb[0]["platform_id"] == "brandb"
+    # 不去重跨平台：不同平台各保留
+    assert len(store.recent()) == 2
+
+
+def test_dedup_key_includes_platform(tmp_path):
+    """同一 event_id 在不同平台应各留一条；同一平台重复出现则原地更新（不新增）。"""
+    store = AlertStore(str(tmp_path / "pf2.db"))
+    store.save_batch(
+        [{"event_id": "D1", "diagnosis": {"status": "DIAGNOSED"}, "meta": {"source": "anomaly-warning"}}],
+        platform_id="facemoji", run_time="2026-07-30 12:00:00",
+    )
+    store.save_batch(
+        [{"event_id": "D1", "diagnosis": {"status": "INCONCLUSIVE"}, "meta": {"source": "anomaly-warning"}}],
+        platform_id="facemoji", run_time="2026-07-30 13:00:00",
+    )
+    # 不同平台同名 event_id -> 新增一条
+    store.save_batch(
+        [{"event_id": "D1", "diagnosis": {"status": "DIAGNOSED"}, "meta": {"source": "anomaly-warning"}}],
+        platform_id="brandb", run_time="2026-07-30 13:00:00",
+    )
+    fm = store.recent(platform="facemoji")
+    assert len(fm) == 1
+    assert fm[0]["status"] == "INCONCLUSIVE"  # 被第二次更新覆盖
+    assert len(store.recent()) == 2  # 两平台各一条

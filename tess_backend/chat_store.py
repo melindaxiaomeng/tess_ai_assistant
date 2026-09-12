@@ -19,7 +19,7 @@ from typing import Optional
 from sqlalchemy import JSON, String, desc
 from sqlalchemy.orm import mapped_column
 
-from .db import Base, make_engine, make_session_factory, init_all
+from .db import Base, make_engine, make_session_factory, init_all, ensure_column
 
 # 历史保留轮数（每轮 = 一问一答）；超出则仅保留最近 N 轮。可用环境变量覆盖。
 DEFAULT_HISTORY_LIMIT = int(os.getenv("TESS_CHAT_HISTORY_LIMIT", "10"))
@@ -38,12 +38,17 @@ def _resolve_url(db_url: Optional[str]) -> str:
 
 
 class ChatSession(Base):
-    """会话表：以 chat_id 为主键，messages 用 JSON 落地（兼容 sqlite/Postgres）。"""
+    """会话表：以 chat_id 为主键，messages 用 JSON 落地（兼容 sqlite/Postgres）。
+
+    platform_id：分平台标识（对应请求头 X-Platform-Id），用于按平台隔离与报表；
+    缺省 "default"（未带平台头或平台不存在时的兜底）。
+    """
 
     __tablename__ = "chat_sessions"
 
     chat_id = mapped_column(String, primary_key=True)
     operator_id = mapped_column(String, index=True, default="anonymous")
+    platform_id = mapped_column(String, index=True, default="default")
     messages = mapped_column(JSON, default=list)  # list[{role, content, ts, meta?}]
     created_at = mapped_column(String, default=lambda: _now())
     updated_at = mapped_column(String, default=lambda: _now())
@@ -66,10 +71,17 @@ class ChatStore:
         self.engine = make_engine(self.url)
         self.Session = make_session_factory(self.engine)
         init_all(self.engine)  # 幂等建表
+        ensure_column(self.engine, "chat_sessions", "platform_id",
+                      "VARCHAR(64) DEFAULT 'default'")
 
     def append(self, chat_id: str, operator_id: str, role: str, content: str,
-               meta: Optional[dict] = None, limit: int = DEFAULT_HISTORY_LIMIT) -> None:
-        """追加一条消息；会话不存在则创建；超出 limit 条（=limit 轮）则裁剪尾部。"""
+               meta: Optional[dict] = None, limit: int = DEFAULT_HISTORY_LIMIT,
+               platform_id: str = "default") -> None:
+        """追加一条消息；会话不存在则创建；超出 limit 条（=limit 轮）则裁剪尾部。
+
+        platform_id：分平台标识，首次创建时写入会话行，之后若该请求带了平台头也一并回写，
+        保证会话始终归属到最近的平台上下文。
+        """
         with self.Session() as s:
             sess = s.get(ChatSession, chat_id)
             now = _now()
@@ -79,6 +91,7 @@ class ChatStore:
             if sess is None:
                 sess = ChatSession(
                     chat_id=chat_id, operator_id=operator_id or "anonymous",
+                    platform_id=platform_id or "default",
                     messages=[msg], created_at=now, updated_at=now,
                 )
                 s.add(sess)
@@ -89,6 +102,8 @@ class ChatStore:
                 sess.updated_at = now
                 if operator_id:
                     sess.operator_id = operator_id
+                if platform_id:
+                    sess.platform_id = platform_id
             s.commit()
 
     def get_messages(self, chat_id: str, limit: Optional[int] = None) -> list:
@@ -119,16 +134,19 @@ class ChatStore:
             s.commit()
             return True
 
-    def list_sessions(self, operator_id: Optional[str] = None, limit: int = 100) -> list:
-        """列出会话摘要（按 updated_at 倒序）；operator_id 给定则按运营隔离。
+    def list_sessions(self, operator_id: Optional[str] = None,
+                      platform_id: Optional[str] = None, limit: int = 100) -> list:
+        """列出会话摘要（按 updated_at 倒序）；operator_id / platform_id 给定则叠加过滤。
 
-        返回字段：chat_id / operator_id / title(首条 user 问题) / message_count /
-        created_at / updated_at —— 供前端历史会话侧边栏渲染。
+        返回字段：chat_id / operator_id / platform_id / title(首条 user 问题) /
+        message_count / created_at / updated_at —— 供前端历史会话侧边栏渲染。
         """
         with self.Session() as s:
             q = s.query(ChatSession)
             if operator_id:
                 q = q.filter(ChatSession.operator_id == operator_id)
+            if platform_id:
+                q = q.filter(ChatSession.platform_id == platform_id)
             q = q.order_by(ChatSession.updated_at.desc())
             rows = q.limit(limit).all()
             out = []
@@ -144,6 +162,7 @@ class ChatStore:
                 out.append({
                     "chat_id": row.chat_id,
                     "operator_id": row.operator_id,
+                    "platform_id": row.platform_id,
                     "title": title,
                     "message_count": len(msgs),
                     "created_at": row.created_at,
@@ -161,19 +180,22 @@ class ChatStore:
             lines.append(f"{who}：{m.get('content', '')}")
         return "\n".join(lines)
 
-    def export_rows(self, operator_id: Optional[str] = None) -> list:
+    def export_rows(self, operator_id: Optional[str] = None,
+                    platform_id: Optional[str] = None) -> list:
         """导出全量「轮」记录（按轮合并 user+assistant），供运营报表 / BI 拉取。
 
         返回 list[dict]，字段：
-          chat_id / operator_id / question / answer / ts（该轮提问时间）/
+          chat_id / operator_id / platform_id / question / answer / ts（该轮提问时间）/
           analysis_type / route_source / campaign_id / advertiser_id /
           publisher_id / package_name / owner_user_id
-        operator_id 给定则按运营隔离。
+        operator_id / platform_id 给定则叠加过滤。
         """
         with self.Session() as s:
             q = s.query(ChatSession)
             if operator_id:
                 q = q.filter(ChatSession.operator_id == operator_id)
+            if platform_id:
+                q = q.filter(ChatSession.platform_id == platform_id)
             rows = q.all()
         out = []
         for row in rows:
@@ -188,6 +210,7 @@ class ChatStore:
                     out.append({
                         "chat_id": row.chat_id,
                         "operator_id": row.operator_id,
+                        "platform_id": row.platform_id,
                         "question": pending_q.get("content", ""),
                         "answer": m.get("content", ""),
                         "ts": pending_q.get("ts"),
@@ -202,15 +225,18 @@ class ChatStore:
                     pending_q = None
         return out
 
-    def aggregate_stats(self, operator_id: Optional[str] = None) -> dict:
+    def aggregate_stats(self, operator_id: Optional[str] = None,
+                        platform_id: Optional[str] = None) -> dict:
         """聚合运营分析指标，供 /tess/chats/stats 报表看板。
 
         含：会话数 / 轮数 / Top 问题 / Top 实体 / 各运营提问量 /
-        分析类型分布（单维各类型 + cross_dimension + None=QA）/ 路由来源分布 / 按天分桶。
+        分析类型分布（单维各类型 + cross_dimension + None=QA）/ 路由来源分布 /
+        按天分桶 / 各平台分布（per_platform）。
+        operator_id / platform_id 给定则叠加过滤。
         """
         from collections import Counter
 
-        rows = self.export_rows(operator_id)
+        rows = self.export_rows(operator_id, platform_id)
         q_counter = Counter(r["question"] for r in rows)
         ent_counter: Counter = Counter()
         for r in rows:
@@ -219,6 +245,7 @@ class ChatStore:
                 if v is not None:
                     ent_counter[f"{k}={v}"] += 1
         op_counter = Counter(r["operator_id"] for r in rows)
+        pf_counter = Counter(r["platform_id"] for r in rows)
         at_counter = Counter(str(r["analysis_type"]) for r in rows)
         rs_counter = Counter(str(r["route_source"]) for r in rows)
         day_counter = Counter((r["ts"] or "")[:10] for r in rows)
@@ -228,6 +255,7 @@ class ChatStore:
             "top_questions": [{"question": q, "count": c} for q, c in q_counter.most_common(20)],
             "top_entities": [{"entity": e, "count": c} for e, c in ent_counter.most_common(20)],
             "per_operator": [{"operator_id": o, "count": c} for o, c in op_counter.most_common(50)],
+            "per_platform": [{"platform_id": p, "count": c} for p, c in pf_counter.most_common(50)],
             "analysis_type_distribution": dict(at_counter),
             "route_source_distribution": dict(rs_counter),
             "daily_buckets": dict(sorted(day_counter.items())),
@@ -258,11 +286,12 @@ def load_history(chat_id: str):
 
 def record_turn(chat_id: str, operator_id: str, question: str, answer: str,
                 entities: Optional[dict], analysis_type: Optional[str] = None,
-                route_source: Optional[str] = None) -> None:
+                route_source: Optional[str] = None, platform_id: str = "default") -> None:
     """把一轮问答写回会话；chat_id 为空则不写（单轮模式）。
 
     每条 user 消息的 meta 额外记录 analysis_type / route_source，
     供运营分析「问题类型分布（单维/cross/QA）」使用（见 /tess/chats/export|stats）。
+    platform_id：分平台标识，写入会话行与本轮消息，便于按平台隔离/报表。
     """
     if not chat_id:
         return
@@ -271,5 +300,5 @@ def record_turn(chat_id: str, operator_id: str, question: str, answer: str,
         "entities": entities or {},
         "analysis_type": analysis_type,
         "route_source": route_source,
-    })
-    store.append(chat_id, operator_id, "assistant", answer)
+    }, platform_id=platform_id or "default")
+    store.append(chat_id, operator_id, "assistant", answer, platform_id=platform_id or "default")

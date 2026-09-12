@@ -22,7 +22,7 @@ from typing import Optional
 from sqlalchemy import Float, Integer, JSON, String, Text, func, select
 from sqlalchemy.orm import mapped_column
 
-from .db import Base, make_engine, make_session_factory, init_all
+from .db import Base, make_engine, make_session_factory, init_all, ensure_column
 
 DEFAULT_PATH = os.getenv("TESS_ALERTS_DB", "tess_alerts.db")
 
@@ -34,13 +34,18 @@ ACK_RESOLUTIONS = ("acknowledged", "resolved", "false_positive")
 
 
 class Alert(Base):
-    """预警表（与旧 alerts 表 schema 对齐，diagnosis / anomaly_metadata 用 JSON 落地）。"""
+    """预警表（与旧 alerts 表 schema 对齐，diagnosis / anomaly_metadata 用 JSON 落地）。
+
+    platform_id：分平台标识（对应请求头 X-Platform-Id），用于按平台隔离与报表；
+    缺省 "default"。
+    """
 
     __tablename__ = "alerts"
 
     id = mapped_column(Integer, primary_key=True, autoincrement=True)
     run_time = mapped_column(String, nullable=False, index=True)   # 批次时间（同批次相同）
     event_id = mapped_column(String, index=True)                  # 异常实体标识
+    platform_id = mapped_column(String, index=True, default="default")
     status = mapped_column(String)                                # DIAGNOSED / INCONCLUSIVE ...
     confidence = mapped_column(Float)                             # 诊断置信度
     source = mapped_column(String, index=True)                    # anomaly-warning | realtime-kpi
@@ -80,6 +85,8 @@ class AlertStore:
         self.engine = make_engine(self.url)
         self.Session = make_session_factory(self.engine)
         init_all(self.engine)  # 幂等建表（Postgres 新建；sqlite 已存在则跳过）
+        ensure_column(self.engine, "alerts", "platform_id",
+                      "VARCHAR(64) DEFAULT 'default'")
 
     @staticmethod
     def _normalize_result(r: dict) -> dict:
@@ -109,6 +116,7 @@ class AlertStore:
             "id": a.id,
             "run_time": a.run_time,
             "event_id": a.event_id,
+            "platform_id": a.platform_id,
             "status": a.status,
             "confidence": a.confidence,
             "source": a.source,
@@ -121,18 +129,22 @@ class AlertStore:
             "ack_note": a.ack_note,
         }
 
-    def save_batch(self, results: list, run_time: Optional[str] = None) -> int:
+    def save_batch(self, results: list, run_time: Optional[str] = None,
+                   platform_id: str = "default") -> int:
         """把一轮诊断的结果列表写入预警库。
 
         幂等写入（核心去重，配合 recent() 读侧去重构成 A+B 双保险）：
-        同一 (event_id, source) 的记录若已存在，则**原地更新**最新一条
+        同一 (event_id, source, platform_id) 的记录若已存在，则**原地更新**最新一条
         （run_time / status / confidence / diagnosis / anomaly_metadata），
         不再追加新行。这样：
           - 持续性异常（如计划暂停、预算耗尽）每小时重检也不会让表无限增长；
-          - 触发端短时间连发（如 2 分钟内 3 次 cron）会被折叠成一条「当前状态」。
+          - 触发端短时间连发（如 2 分钟内 3 次 cron）会被折叠成一条「当前状态」；
+          - 不同平台的同名 event_id 互不覆盖（platform_id 参与去重键）。
 
         event_id 为空或为占位符 "UNKNOWN" 时无法安全去重，退化为纯插入
         （保持旧行为，避免把多个无 id 的异常误合并成一条）。
+
+        platform_id：分平台标识，随每条告警落库，供按平台隔离/报表。
 
         返回本轮**新增**的行数（已存在的按更新计，不计入）。
         """
@@ -148,7 +160,8 @@ class AlertStore:
                 if event_id and event_id != "UNKNOWN":
                     existing = s.execute(
                         select(Alert)
-                        .where(Alert.event_id == event_id, Alert.source == source)
+                        .where(Alert.event_id == event_id, Alert.source == source,
+                               Alert.platform_id == platform_id)
                         .order_by(Alert.id.desc())
                         .limit(1)
                     ).scalars().first()
@@ -158,11 +171,13 @@ class AlertStore:
                         existing.confidence = diag.get("confidence")
                         existing.diagnosis = diag
                         existing.anomaly_metadata = n["anomaly_metadata"]
+                        existing.platform_id = platform_id
                         continue
                 s.add(
                     Alert(
                         run_time=run_time,
                         event_id=event_id,
+                        platform_id=platform_id,
                         status=diag.get("status"),
                         confidence=diag.get("confidence"),
                         source=source,
@@ -174,27 +189,32 @@ class AlertStore:
             s.commit()
         return written
 
-    def recent(self, limit: int = 50, source: Optional[str] = None, include_acked: bool = True) -> list:
-        """按时间倒序返回最近 limit 条预警；source 非空时按来源过滤。
+    def recent(self, limit: int = 50, source: Optional[str] = None, include_acked: bool = True,
+                platform: Optional[str] = None) -> list:
+        """按时间倒序返回最近 limit 条预警；source / platform 非空时按来源/平台过滤。
 
         同一 event_id 仅保留**最新一条**（id 最大者），消除「同一次/跨批次重复写
         入」带来的重复行（见 save_batch 的幂等写入）。这是异常告警列表的去重视图，
         不影响底层存储。
 
         include_acked=False 时仅返回「未确认」项（默认 True=含已确认，向后兼容）。
+        platform 给定时只返回该平台的告警（分平台隔离）。
         """
         with self.Session() as s:
-            # 每个 (event_id, source) 取最新一行（id 最大），再总体取最近 limit 个。
-            # 注意按 (event_id, source) 联合去重：同一 event_id 若出现在不同 source
-            # （如演示/真实混用）也应各保留一条，不能跨 source 误合并。
+            # 每个 (event_id, source, platform_id) 取最新一行（id 最大），再总体取最近 limit 个。
+            # 联合去重键含 platform_id：同一 event_id 若出现在不同 source 或不同平台，
+            # 都应各保留一条，不能跨平台/跨 source 误合并。
             subq = select(
-                Alert.event_id, Alert.source, func.max(Alert.id).label("max_id")
+                Alert.event_id, Alert.source, Alert.platform_id,
+                func.max(Alert.id).label("max_id")
             )
             if source:
                 subq = subq.where(Alert.source == source)
+            if platform:
+                subq = subq.where(Alert.platform_id == platform)
             if not include_acked:
                 subq = subq.where(Alert.acked_at.is_(None))
-            subq = subq.group_by(Alert.event_id, Alert.source).subquery()
+            subq = subq.group_by(Alert.event_id, Alert.source, Alert.platform_id).subquery()
             q = (
                 select(Alert)
                 .join(subq, Alert.id == subq.c.max_id)
@@ -211,8 +231,9 @@ class AlertStore:
                 select(Alert.run_time).distinct().order_by(Alert.run_time.desc()).limit(1)
             ).scalar_one_or_none()
 
-    def latest_batch(self, source: Optional[str] = None, limit: int = 50, include_acked: bool = True) -> dict:
-        """返回最近一次诊断批次（run_time）的结果；可选按来源过滤。
+    def latest_batch(self, source: Optional[str] = None, limit: int = 50, include_acked: bool = True,
+                     platform: Optional[str] = None) -> dict:
+        """返回最近一次诊断批次（run_time）的结果；可选按来源/平台过滤。
 
         供 Teensing 轮询拉取：拿到的就是「上一轮整批结果」，不会跨批次错乱。
         无数据时 run_time=None、items=[]。
@@ -224,6 +245,8 @@ class AlertStore:
             q = select(Alert).where(Alert.run_time == run_time)
             if source:
                 q = q.where(Alert.source == source)
+            if platform:
+                q = q.where(Alert.platform_id == platform)
             if not include_acked:
                 q = q.where(Alert.acked_at.is_(None))
             q = q.order_by(Alert.id.desc()).limit(limit)
@@ -231,16 +254,20 @@ class AlertStore:
         return {"run_time": run_time, "count": len(out), "alerts": out}
 
     def query_since(self, since_run_time: str, source: Optional[str] = None,
-                    limit: int = 200, include_acked: bool = True) -> list:
+                    limit: int = 200, include_acked: bool = True,
+                    platform: Optional[str] = None) -> list:
         """增量游标：返回 run_time 严格大于 since_run_time 的所有告警（可能跨多批）。
 
         Teensing 传上次拉取拿到的 as_of，即只拿到「更新批次」中的新增告警，
         不用每次重传整批历史，也无需客户端再比对去重。
+        platform 给定时只返回该平台的告警（分平台隔离）。
         """
         with self.Session() as s:
             q = select(Alert).where(Alert.run_time > since_run_time)
             if source:
                 q = q.where(Alert.source == source)
+            if platform:
+                q = q.where(Alert.platform_id == platform)
             if not include_acked:
                 q = q.where(Alert.acked_at.is_(None))
             q = q.order_by(Alert.run_time.asc(), Alert.id.asc()).limit(limit)
