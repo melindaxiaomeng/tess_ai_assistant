@@ -157,13 +157,31 @@ def dispatch_tool(tool_name: str, args: dict, request=None) -> dict:
             raise HTTPException(status_code=400, detail="缺少 question 字段或为空")
         analysis_type = args.get("analysis_type")
         params = {k: args[k] for k in _ENTITY_KEYS if args.get(k) is not None}
+        chat_id = args.get("chat_id")
+        history_text, history_entities = (None, None)
+        if chat_id:
+            from .chat_store import load_history
+
+            history_text, history_entities = load_history(chat_id)
         connector, llm, token, token_mode, operator = _resolve_runtime(request)
-        return process_question(
+        result = process_question(
             str(question), connector, llm,
             token=token, params=params,
             operator_id=operator, token_mode=token_mode,
             analysis_type=analysis_type,
+            history=history_text, history_entities=history_entities,
         )
+        if chat_id:
+            from .chat_store import record_turn
+            from .analytics import extract_entities, resolve_entities
+
+            try:
+                _ents = extract_entities(str(question), params)
+                _ents = resolve_entities(_ents, connector, token)
+            except Exception:
+                _ents = {}
+            record_turn(chat_id, operator, str(question), result.get("answer", ""), _ents)
+        return result
 
     if tool_name == "tess_fetch_warning":
         from .app import get_alerts, get_realtime_kpi_alerts

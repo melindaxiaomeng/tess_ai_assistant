@@ -1318,6 +1318,8 @@ def process_question(
     operator_id: str = "anonymous",
     token_mode: str = "system",
     analysis_type: Optional[str] = None,
+    history: Optional[str] = None,
+    history_entities: Optional[dict] = None,
 ) -> dict:
     """端到端执行一次自然语言问答，支持深度下钻。
 
@@ -1335,6 +1337,8 @@ def process_question(
     - connector / llm / token：与 analytics 同源（token 决定按谁的数据权限取数）
     - 返回 answer（Markdown），并附 result / data 别名以兼容调用方 .answer/.result/.data 取值
     - context_summary 在走深度上下文时额外回显 analysis_type / route_source（explicit|entity|inferred）/ date_or_month
+    - history / history_entities：多轮会话上下文（由 chat_store 提供）。history 为已格式化的历史对话文本，
+      注入 LLM 提示以消解「它/这个」指代；history_entities 为上一轮解析出的实体，仅在本轮无任何显式实体时回退沿用。
     """
     # —— 1. 决定用哪套上下文 ——
     route_source = None
@@ -1345,6 +1349,13 @@ def process_question(
         ents = extract_entities(question, params)
         ents = resolve_entities(ents, connector, token)  # 名称/代号 -> 可下钻 id
         params = params or {}  # 确保后续 {**params, ...} 字典展开安全（process_question 默认 params=None）
+        # —— 多轮指代消解：本轮完全未显式抽取到任何实体时，回退沿用上一轮解析出的实体 ——
+        # 仅「填充」不「覆盖」：若本轮已带实体则以其为准，避免误改写用户显式意图或误触发 cross_dimension。
+        if history_entities:
+            if not any(ents.get(k) for k in ("campaign_id", "advertiser_id", "publisher_id", "package_name", "owner_user_id")):
+                for _k in ("campaign_id", "advertiser_id", "publisher_id", "package_name", "owner_user_id", "owner_role", "owner_name"):
+                    if not ents.get(_k) and history_entities.get(_k):
+                        ents[_k] = history_entities[_k]
         # 统计命中的维度个数；≥2 个 -> 交叉维度联合下钻（其余单维维持原分支）
         present = []
         if ents.get("campaign_id"):
@@ -1415,6 +1426,13 @@ def process_question(
             "请基于上方上下文作答；若上下文无法支撑，明确告知数据不足。"
         )
         summary_extra = {}
+
+    # —— 多轮上下文注入：帮助 LLM 理解「它 / 这个 / 昨天那个」等指代 ——
+    if history:
+        user_prompt = (
+            "【历史对话（多轮上下文，仅用于理解指代，不要当作本次问题本身）】\n"
+            f"{history}\n\n"
+        ) + user_prompt
 
     answer = llm.complete(ASK_SYSTEM_PROMPT, user_prompt, json_mode=False)
     context_summary = {

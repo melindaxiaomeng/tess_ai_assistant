@@ -1,0 +1,198 @@
+"""P8 · 多轮会话存储 + process_question 多轮指代消解 单测。
+
+不触达真实 LLM / Teensing：LLM 用捕获 prompt 的 FakeLLM，connector 用返回空 JSON 的 FakeConnector。
+LLM 客户端与 /tess/ask、/tess/tool 接线通过 FastAPI TestClient 验证。
+"""
+
+import os
+import sys
+import tempfile
+
+import pytest
+
+# 让测试可直接 import tess_backend（与既有 test_api.py 同约定）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from tess_backend import analytics
+from tess_backend import chat_store as cs
+from tess_backend.chat_store import ChatStore, get_chat_store
+
+
+class FakeConnector:
+    """仅实现 _safe_api_get 所需的 api_get，返回空结果，避免依赖真实 /report。"""
+
+    def api_get(self, path, params=None, token=None):
+        return {}
+
+
+class CapturingLLM:
+    """捕获完整 (system, user) 调用，便于断言历史上下文是否注入。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def complete(self, system, user, json_mode=False):
+        self.calls.append((system, user))
+        return "（测试用固定回答）"
+
+
+@pytest.fixture
+def store(tmp_path):
+    """每个测试用独立临时 SQLite，避免污染默认库文件。"""
+    s = ChatStore(str(tmp_path / "chat.db"))
+    cs._STORE = s
+    yield s
+    cs._STORE = None
+
+
+# ----------------------------- ChatStore 基础 -----------------------------
+
+def test_append_and_get_messages(store):
+    store.append("c1", "op1", "user", "你好")
+    store.append("c1", "op1", "assistant", "你好，有什么可以帮你？")
+    msgs = store.get_messages("c1")
+    assert len(msgs) == 2
+    assert msgs[0]["role"] == "user" and msgs[0]["content"] == "你好"
+    assert msgs[1]["role"] == "assistant"
+
+
+def test_get_messages_missing_session(store):
+    assert store.get_messages("nope") == []
+
+
+def test_prune_to_limit(store):
+    # 限制 4 条（=2 轮），写入 6 条后应只保留最近 4 条
+    for i in range(6):
+        store.append("c2", "op", "user" if i % 2 == 0 else "assistant", f"m{i}", limit=4)
+    msgs = store.get_messages("c2")
+    assert len(msgs) == 4
+    assert msgs[0]["content"] == "m2"  # 仅保留 m2..m5
+
+
+def test_get_last_user_entities(store):
+    store.append("c3", "op", "user", "广告主1000839的营收", meta={"entities": {"advertiser_id": 1000839}})
+    store.append("c3", "op", "assistant", "营收如下")
+    assert store.get_last_user_entities("c3") == {"advertiser_id": 1000839}
+
+
+def test_get_last_user_entities_empty(store):
+    assert store.get_last_user_entities("missing") is None
+
+
+def test_delete(store):
+    store.append("c4", "op", "user", "x")
+    assert store.delete("c4") is True
+    assert store.delete("c4") is False
+    assert store.get_messages("c4") == []
+
+
+def test_format_history():
+    msgs = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    text = ChatStore.format_history(msgs, turns=2)
+    assert "用户：q1" in text and "Tess：a1" in text and "用户：q2" in text
+    # turns=1 仅保留最近一轮
+    text1 = ChatStore.format_history(msgs, turns=1)
+    assert "q1" not in text1 and "q2" in text1
+
+
+def test_load_history_and_record_turn(store):
+    cs.record_turn("c5", "op", "广告主1000839营收", "回答", {"advertiser_id": 1000839})
+    assert cs.record_turn("", "op", "q", "a", {}) is None  # 空 chat_id 不写
+    text, ents = cs.load_history("c5")
+    assert ents == {"advertiser_id": 1000839}
+    assert "广告主1000839营收" in text
+
+
+# ------------------- process_question 多轮指代消解 -------------------
+
+def test_history_injected_into_prompt():
+    llm = CapturingLLM()
+    hist = "用户：广告主 1000839 的营收\nTess：营收是 100"
+    analytics.process_question("什么是 CTIT", FakeConnector(), llm, history=hist)
+    assert llm.calls, "应当调用了一次 LLM"
+    user_prompt = llm.calls[0][1]
+    assert "历史对话" in user_prompt and "广告主 1000839" in user_prompt
+
+
+def test_carry_forward_entity_when_no_explicit_entity():
+    llm = CapturingLLM()
+    # 本轮无任何实体，但上一轮解析出 campaign_id=5845554 -> 应回退到 campaign_detail
+    res = analytics.process_question(
+        "它昨天的营收怎么样", FakeConnector(), llm,
+        history_entities={"campaign_id": 5845554},
+    )
+    cs_dict = res["context_summary"]
+    assert cs_dict.get("analysis_type") == "campaign_detail"
+    assert cs_dict.get("route_source") == "entity"
+
+
+def test_no_carry_forward_when_explicit_entity_present():
+    llm = CapturingLLM()
+    # 本轮已显式带 advertiser_id -> 不被 history 的 campaign_id 覆盖，也不误触 cross
+    res = analytics.process_question(
+        "广告主 1000839 的营收", FakeConnector(), llm,
+        params={"advertiser_id": 1000839},
+        history_entities={"campaign_id": 5845554},
+    )
+    cs_dict = res["context_summary"]
+    assert cs_dict.get("analysis_type") == "advertiser_deepdive"
+    assert cs_dict.get("route_source") == "entity"
+
+
+def test_no_history_stays_single_turn():
+    llm = CapturingLLM()
+    # 既无实体也无历史 -> 浅层兜底，不应有 analysis_type / route_source
+    res = analytics.process_question("今天大盘怎么样", FakeConnector(), llm)
+    cs_dict = res["context_summary"]
+    assert "analysis_type" not in cs_dict
+    assert "route_source" not in cs_dict
+    assert "历史对话" not in llm.calls[0][1]
+
+
+# ------------------- HTTP 接线（/tess/ask 多轮 + 会话端点） -------------------
+
+def _client(monkeypatch, tmp_path):
+    import tess_backend.app as app_module
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(app_module, "_get_llm_client", lambda: CapturingLLM())
+    monkeypatch.setattr(app_module, "_DATA_CONNECTOR", FakeConnector())
+    cs._STORE = ChatStore(str(tmp_path / "http_chat.db"))
+    return TestClient(app_module.app)
+
+
+def test_ask_multi_turn_records_and_carries(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    # 第一轮：带 advertiser_id
+    r1 = c.post("/tess/ask", json={"question": "广告主 1000839 的营收", "chat_id": "sess1"})
+    assert r1.status_code == 200
+    # 第二轮：无实体追问 -> 应回退沿用 advertiser_id
+    r2 = c.post("/tess/ask", json={"question": "它昨天的利润怎么样", "chat_id": "sess1"})
+    assert r2.status_code == 200
+    assert r2.json()["context_summary"]["analysis_type"] == "advertiser_deepdive"
+    assert r2.json()["context_summary"]["route_source"] == "entity"
+    # 历史已落库（2 问 2 答）
+    hist = c.get("/tess/chat/sess1").json()
+    assert hist["count"] == 4
+
+
+def test_ask_single_turn_no_store(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    r = c.post("/tess/ask", json={"question": "什么是 CTIT"})
+    assert r.status_code == 200
+    # 未传 chat_id -> 不应建立任何会话
+    assert c.get("/tess/chat/nonexistent").json()["count"] == 0
+
+
+def test_chat_delete_endpoint(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    c.post("/tess/ask", json={"question": "q", "chat_id": "sessD"})
+    assert c.get("/tess/chat/sessD").json()["count"] == 2
+    d = c.delete("/tess/chat/sessD")
+    assert d.json()["deleted"] is True
+    assert c.get("/tess/chat/sessD").json()["count"] == 0

@@ -32,6 +32,7 @@
         "type": "object",
         "properties": {
           "question": {"type": "string", "description": "自然语言问题，如「广告主 1000839 在渠道 1000684 上近 7 日营收怎么样」「什么是 CTIT」。"},
+          "chat_id": {"type": "string", "description": "可选：多轮会话 ID。首次由调用方生成并原样带回即可开启多轮指代消解（如「它昨天的营收」「这个 campaign 的 CTIT」）；留空则单轮。"},
           "analysis_type": {
             "type": "string",
             "enum": ["daily_summary", "scaling_opportunity", "finance_check", "account_overview", "publisher_deepdive", "scaling_capacity", "campaign_detail", "advertiser_deepdive", "traffic_policy_check", "kpi_compare", "campaign_ranking", "pkg_deepdive", "owner_performance", "cross_dimension"]

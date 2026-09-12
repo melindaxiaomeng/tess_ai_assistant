@@ -39,6 +39,8 @@ from .data_connector import (
     _num,
 )
 from .analytics import process_data_analysis_query, process_question
+from .analytics import extract_entities, resolve_entities
+from .chat_store import load_history, record_turn, get_chat_store
 from .tools_adapter import dispatch_tool, load_tool_schemas
 from .gaid_vault import VAULT, RedactFilter
 from .audit_log import QueryLogStore
@@ -366,7 +368,7 @@ def post_ask(payload: dict, request: Request) -> dict:
     请求体：
       {
         "question": "自然语言问题（如：昨天营收为什么跌了？哪些 Campaign 最赚钱？）",
-        "history": []        # 预留多轮上下文，当前版本未启用
+        "chat_id": "可选，多轮会话 ID；首次由前端生成并原样带回即可开启多轮指代消解；留空则单轮",
         "analysis_type": "campaign_detail" | ...   # 可选：显式深度下钻类型（前端胶囊透传，支持 14 种含 cross_dimension）
         "params": { "report_month": "2026-08" }  # 可选：随 analysis_type 透传（如财务对账月份）
         # 实体下钻可选参数（也可放在 params 里）：campaign_id / advertiser_id / publisher_id
@@ -409,6 +411,11 @@ def post_ask(payload: dict, request: Request) -> dict:
     for _k in ("campaign_id", "advertiser_id", "publisher_id"):
         if (payload or {}).get(_k) is not None:
             params[_k] = (payload or {}).get(_k)
+    # —— 多轮会话：chat_id 存在则加载历史上下文并回退上一轮实体 ——
+    chat_id = (payload or {}).get("chat_id")
+    history_text, history_entities = (None, None)
+    if chat_id:
+        history_text, history_entities = load_history(chat_id)
     try:
         connector = get_data_connector()
     except (RuntimeError, ValueError) as e:
@@ -429,11 +436,20 @@ def post_ask(payload: dict, request: Request) -> dict:
             question, connector, llm,
             token=effective_token, operator_id=operator, token_mode=token_mode,
             analysis_type=analysis_type, params=params,
+            history=history_text, history_entities=history_entities,
         )
     except Exception as e:  # 数据 API / LLM 异常都不应泄露堆栈
         raise HTTPException(
             status_code=502, detail=f"问答执行失败：{type(e).__name__}: {e}"
         )
+    # —— 多轮会话落库：把本轮问答写回（chat_id 为空则单轮，不写）——
+    if chat_id:
+        try:
+            _ents = extract_entities(question, params)
+            _ents = resolve_entities(_ents, connector, effective_token)
+        except Exception:
+            _ents = {}
+        record_turn(chat_id, operator, question, result.get("answer", ""), _ents)
     # P6 审计：记录「谁问了什么 -> Tess 答了什么」
     cs = result.get("context_summary", {})
     AUDIT.log_query(
@@ -1071,6 +1087,20 @@ def list_tools() -> dict:
     POST /tess/tool 在服务端完成，杜绝裸暴露细粒度 API。
     """
     return {"tools": load_tool_schemas()}
+
+
+@app.get("/tess/chat/{chat_id}")
+def get_chat(chat_id: str) -> dict:
+    """读取某会话的多轮历史（受全局 X-API-Key 守卫，若生产已开启）。"""
+    msgs = get_chat_store().get_messages(chat_id)
+    return {"chat_id": chat_id, "messages": msgs, "count": len(msgs)}
+
+
+@app.delete("/tess/chat/{chat_id}")
+def delete_chat(chat_id: str) -> dict:
+    """清空某会话的历史（受全局 X-API-Key 守卫，若生产已开启）。"""
+    deleted = get_chat_store().delete(chat_id)
+    return {"chat_id": chat_id, "deleted": deleted}
 
 
 @app.post("/tess/tool")
