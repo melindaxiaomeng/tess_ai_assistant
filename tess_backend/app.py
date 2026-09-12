@@ -284,15 +284,27 @@ def _platform_id(request: Request) -> Optional[str]:
     return pid.strip() or None
 
 
+def _teensing_token(request: Optional[Request]) -> str:
+    """从请求头取运营 SaaS access_token（X-Teensing-Token），用于按权限拉数据；缺省空串。"""
+    if not request:
+        return ""
+    return request.headers.get("X-Teensing-Token", "") or ""
+
+
 def _resolve_access_token(request: Optional[Request], platform_id: Optional[str] = None) -> tuple:
-    """解析本次调 Teensing 取数用的 token 与模式。
+    """解析本次调 saas_v3.0 数据接口用的 token 与模式。
 
     优先级：
-      1) 平台级 token（按 X-Platform-Id 从 tess_platforms 取，仅 token 不同、共用 base_url）
-      2) 全局 TESS_SYSTEM_TOKEN（兜底，写在后端 .env / compose，前端不接触）
+      1) 运营个人 token（X-Teensing-Token：前端逐请求带当前登录运营的 access_token，
+         saas_v3.0 按该运营的 RBAC/数据权限返回数据 —— 各运营各看各的）
+      2) 平台级 token（按 X-Platform-Id 从 tess_platforms 取，仅 token 不同、共用 base_url）
+      3) 全局 TESS_SYSTEM_TOKEN（兜底，写在后端 .env / compose，前端不接触）
 
-    返回 (effective_token:str, token_mode:str)，token_mode ∈ {platform, system}。
+    返回 (effective_token:str, token_mode:str)，token_mode ∈ {user, platform, system}。
     """
+    user_token = _teensing_token(request)
+    if user_token:
+        return user_token, "user"
     if platform_id:
         try:
             token, _base = get_platform_registry().resolve(platform_id)
@@ -386,10 +398,12 @@ def post_analytics(payload: dict, request: Request) -> dict:
         # 实体下钻可选参数：campaign_id / advertiser_id / publisher_id（如 campaign_detail 需 campaign_id）
         #   pkg_deepdive 需 package_name（包名，如 com.xxx.yyy）；owner_performance 需 owner_user_id（负责人）
       }
-    请求头（鉴权与按平台取数）：
-      - X-API-Key        : Tess 与 Teensing 之间的共享密钥（网关注入，生产设了 TESS_API_KEY 后必带）
-      - X-Platform-Id    : 平台标识；后端按它从 tess_platforms 取该平台的 token 调 Teensing。
-                            未带/未注册则回退全局 TESS_SYSTEM_TOKEN（写在后端配置，前端不接触 token）。
+    请求头（鉴权与按权限取数）：
+      - X-API-Key        : Tess 与 saas 之间的共享密钥（网关注入，生产设了 TESS_API_KEY 后必带）
+      - X-Teensing-Token : 运营 SaaS access_token（**按人取数，最高优先级**）：
+                            前端逐请求带当前登录运营的 token，Tess 原样转发给 saas_v3.0 数据接口，
+                            按该运营 RBAC/数据权限返回数据 —— 各运营各看各的。
+      - X-Platform-Id    : 平台标识；未带运营 token 时按它从 tess_platforms 取该平台的 token。
       - X-Operator-Id    : 可选，运营身份，仅用于审计归因（回显到 context_summary.operator_id）
     返回：
       {
@@ -397,7 +411,7 @@ def post_analytics(payload: dict, request: Request) -> dict:
         "report": "Markdown 简报（含 📊/💡/🚀 三段）",
         "context_summary": { "analysis_type", "date_or_month", "errors",
                              "operator_id", "token_mode" }
-            # token_mode: "platform"=按 X-Platform-Id 平台 token 取数; "system"=全局系统 token
+            # token_mode: "user"=按运营个人 token 取数; "platform"=平台 token; "system"=全局兜底
       }
     """
     analysis_type = (payload or {}).get("analysis_type")
@@ -415,17 +429,18 @@ def post_analytics(payload: dict, request: Request) -> dict:
     except (RuntimeError, ValueError) as e:
         raise HTTPException(status_code=503, detail=f"Tess 未配置 Teensing 数据源：{e}")
     llm = _get_llm_client()
-    # 按平台取数（核心）：
-    #   优先按 X-Platform-Id 从 tess_platforms 取该平台的 token；
-    #   缺失时回退到全局 TESS_SYSTEM_TOKEN（写死后端配置，前端不传任何 token）。
+    # 按访问者权限取数（核心）：
+    #   优先用运营个人 token（X-Teensing-Token，按人 RBAC，各看各的）；
+    #   未带则按 X-Platform-Id 从 tess_platforms 取该平台的 token；
+    #   再缺失时回退到全局 TESS_SYSTEM_TOKEN（写死后端配置，前端不接触）。
     platform_id = _platform_id(request)
     operator = _operator_id(request) if request else "anonymous"
     effective_token, token_mode = _resolve_access_token(request, platform_id)
-    # 生产（Teensing 真实连接器）下没有任何 token 则无法取数 -> 400
+    # 生产（真实连接器）下没有任何 token 则无法按权限取数 -> 400
     if isinstance(connector, TeensingDataConnector) and not effective_token:
         raise HTTPException(
             status_code=400,
-            detail="生产数据接入需取数凭据：平台级 token（X-Platform-Id 对应平台已注册且启用）、或在后端配置 TESS_SYSTEM_TOKEN",
+            detail="生产数据接入需取数凭据：运营 X-Teensing-Token、或平台级 token（X-Platform-Id 对应平台已注册且启用）、或在后端配置 TESS_SYSTEM_TOKEN",
         )
     try:
         result = process_data_analysis_query(
@@ -454,11 +469,13 @@ def post_ask(payload: dict, request: Request) -> dict:
         "params": { "report_month": "2026-08" }  # 可选：随 analysis_type 透传（如财务对账月份）
         # 实体下钻可选参数（也可放在 params 里）：campaign_id / advertiser_id / publisher_id
       }
-    请求头（鉴权与按平台取数，同 /tess/analytics）：
-      - X-API-Key        : Tess<->Teensing 共享密钥（网关注入，生产设了 TESS_API_KEY 后必带）
-      - X-Platform-Id    : 平台标识；后端按它取该平台 token 调 Teensing；
-                           未带/未注册回退全局 TESS_SYSTEM_TOKEN（后端配置，前端不传 token）；
-                           生产 Teensing 连接器下两者皆无 -> 400
+    请求头（鉴权与按权限取数，同 /tess/analytics）：
+      - X-API-Key        : Tess<->saas 共享密钥（网关注入，生产设了 TESS_API_KEY 后必带）
+      - X-Teensing-Token : 运营 SaaS access_token（按人取数，最高优先级；Tess 原样转发给 saas_v3.0，
+                           按该运营 RBAC 返回数据，各运营各看各的）
+      - X-Platform-Id    : 平台标识；未带运营 token 时按它取该平台 token；
+                           再无则回退全局 TESS_SYSTEM_TOKEN（后端配置，前端不接触）；
+                           生产连接器下三者皆无 -> 400
       - X-Operator-Id    : 可选，审计归因
     深度下钻说明：
       - 路由优先级：① 显式 analysis_type（前端胶囊透传）> ② 问题正则识别实体 id（如
@@ -508,7 +525,7 @@ def post_ask(payload: dict, request: Request) -> dict:
     if isinstance(connector, TeensingDataConnector) and not effective_token:
         raise HTTPException(
             status_code=400,
-            detail="生产数据接入需取数凭据：平台级 token（X-Platform-Id 对应平台已注册且启用）、或在后端配置 TESS_SYSTEM_TOKEN",
+            detail="生产数据接入需取数凭据：运营 X-Teensing-Token、或平台级 token（X-Platform-Id 对应平台已注册且启用）、或在后端配置 TESS_SYSTEM_TOKEN",
         )
     try:
         result = process_question(
@@ -560,8 +577,8 @@ def diagnose_from_source(payload: dict = None, request: Request = None) -> dict:
     """P5 数据接入：从 Teensing 真实异常数据源拉取最近 N 个异常，逐个诊断。
 
     body: { "limit": 5 }  （默认 5，最多 50）
-    鉴权：按平台取数（X-Platform-Id 对应平台 token，缺省回退全局 TESS_SYSTEM_TOKEN，
-          均由后端配置/注册，前端不传 token）。运营身份（X-Operator-Id）用于 P6 问答审计归因。
+    鉴权：按权限取数（优先运营 X-Teensing-Token 按人取数；其次 X-Platform-Id 对应平台 token，
+          缺省回退全局 TESS_SYSTEM_TOKEN）。运营身份（X-Operator-Id）用于 P6 问答审计归因。
     拉取到的原始事件经 normalize_to_context 转成 PRD §4.1 Context 后送编排层；
     处置执行器不受影响（仍走 Mock / 服务端配置）。
     诊断失败时单条降级为 INCONCLUSIVE，不影响其余事件。
@@ -575,11 +592,11 @@ def diagnose_from_source(payload: dict = None, request: Request = None) -> dict:
         connector = _get_data_connector()
     except Exception as e:  # 接入层未配置（如 teensing 缺 base_url）
         raise HTTPException(status_code=503, detail=f"数据接入层初始化失败：{e}")
-    # 生产（teensing）模式必须有平台 token 或全局系统 token，否则无法取数
+    # 生产模式必须有运营/平台/全局任一 token，否则无法取数
     if isinstance(connector, TeensingDataConnector) and not effective_token:
         raise HTTPException(
             status_code=400,
-            detail="生产数据接入需取数凭据：平台级 token（X-Platform-Id 对应平台已注册且启用）、或在后端配置 TESS_SYSTEM_TOKEN",
+            detail="生产数据接入需取数凭据：运营 X-Teensing-Token、或平台级 token（X-Platform-Id 对应平台已注册且启用）、或在后端配置 TESS_SYSTEM_TOKEN",
         )
     raw_events = connector.fetch_recent_anomalies(limit, token=effective_token or None)
     llm = _get_llm_client()

@@ -34,7 +34,8 @@ await fetch("/tess/ask", {
   headers: {
     "Content-Type": "application/json",
     "X-API-Key": "YOUR_KEY",        // 生产必带（TESS_API_KEY 设了之后）
-    "X-Platform-Id": platformId,    // 平台标识（如 "Melodong"）；后端按它取该平台 token
+    "X-Teensing-Token": userToken,  // ★ 当前登录运营的 saas access_token（按人取数，最高优先级）
+    "X-Platform-Id": platformId,    // 平台标识（如 "Melodong"）；未带运营 token 时按它取平台 token
     "X-Operator-Id": userId,        // 可选，审计归因
   },
   body: JSON.stringify({
@@ -181,7 +182,7 @@ class TessDrawer {
   async ask(q) {
     const resp = await fetch("/tess/ask", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-API-Key": KEY, "X-Platform-Id": PID },
+      headers: { "Content-Type": "application/json", "X-API-Key": KEY, "X-Teensing-Token": TOKEN, "X-Platform-Id": PID },
       body: JSON.stringify({ question: q, chat_id: this.chat_id }),
     }).then(r => r.json());
     return resp.answer;          // 渲染这个
@@ -208,22 +209,24 @@ class TessDrawer {
 > 每个平台用**不同的平台级系统 token**取数，且所有落库（对话 / 预警）都会打上 `platform_id`，
 > 以便按平台隔离、分平台出报表。
 
-### 8.1 前端所有请求加一个 `X-Platform-Id` 头
+### 8.1 前端请求头（按人 > 按平台，两级取数）
 
-在 §3 的 headers 里加一行即可（与 `X-Operator-Id` 同级；**前端不传任何 token**）：
+在 §3 的 headers 基础上（与 `X-Operator-Id` 同级）：
 
 ```js
 headers: {
   "Content-Type": "application/json",
-  "X-API-Key": KEY,            // 对外接口鉴权
+  "X-API-Key": KEY,            // 对外接口鉴权（网关注入）
+  "X-Teensing-Token": userToken, // ★ 当前登录运营的 saas access_token（按人取数，最高优先级）
   "X-Operator-Id": userId,     // 谁问的（审计）
-  "X-Platform-Id": platformId, // ← 平台标识（如 "Melodong"），与注册 id 逐字符一致
+  "X-Platform-Id": platformId, // 平台标识（如 "Melodong"），与注册 id 逐字符一致
 }
 ```
 
-- 后端按 `X-Platform-Id` 从 `tess_platforms` 表解析出该平台的系统 token 去 Teensing 取数；
-  未带/未注册则回退全局 `TESS_SYSTEM_TOKEN`（写在后端 `.env` / compose，前端不接触任何 token）。
-  注意：**不要传 `X-Teensing-Token`**——该「运营个人 token」口子已下线，后端不再读取。
+- **优先级**：`X-Teensing-Token`（运营个人 token，Tess 原样转发给 saas_v3.0 数据接口，
+  按该运营 RBAC/数据权限返回数据，各运营各看各的）> 平台级 token（`X-Platform-Id`
+  从 `tess_platforms` 表解析）> 全局 `TESS_SYSTEM_TOKEN`（后端 `.env` / compose）。
+- 带 `X-Teensing-Token` 时 `token_mode` 为 `"user"`；带平台头时为 `"platform"`；兜底 `"system"`。
 - 多轮 `POST /tess/ask` 带 `X-Platform-Id` 时，本轮问答会被打上该 `platform_id`，
   后续 `GET /tess/chats` / `/tess/chats/export` / `/tess/chats/stats` 也支持 `?platform=` 过滤。
 - 预警拉取 `GET /tess/alerts` / `/tess/realtime-kpi/alerts` 同样支持 `?platform=` 或头过滤，

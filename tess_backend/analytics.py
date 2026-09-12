@@ -927,7 +927,7 @@ def process_data_analysis_query(
             "date_or_month": ctx.get("date") or ctx.get("report_month") or ctx.get("time_range"),
             "errors": ctx.get("errors", []),
             "operator_id": operator_id,
-            "token_mode": token_mode,  # "platform"=按平台 token 取数; "system"=全局系统 token
+            "token_mode": token_mode,  # "user"=按运营个人 token 取数; "platform"=平台 token; "system"=全局兜底
             "llm_usage": llm_last_usage(llm),  # 本次 LLM 调用用量（计费/成本分析）
         },
     }

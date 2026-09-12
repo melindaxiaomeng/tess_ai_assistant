@@ -426,6 +426,35 @@ def test_teensing_diagnose_uses_global_token(client, monkeypatch):
     assert captured["token"] == "SYS_TOKEN_FOR_TEST"
 
 
+def test_operator_token_takes_priority_over_all(client, monkeypatch):
+    """运营个人 token（X-Teensing-Token）应压过平台 token 与全局 TESS_SYSTEM_TOKEN。"""
+    captured = {}
+
+    def fake_fetch(self, limit, token=None):
+        captured["token"] = token
+        return []
+
+    monkeypatch.setattr(
+        app_module, "_DATA_CONNECTOR",
+        TeensingDataConnector(base_url="https://saas.example.com/api/v1"),
+    )
+    monkeypatch.setattr(
+        TeensingDataConnector, "fetch_recent_anomalies", fake_fetch
+    )
+    monkeypatch.setenv("TESS_SYSTEM_TOKEN", "SYS_TOKEN_FOR_TEST")
+    resp = client.post(
+        "/tess/diagnose-from-source",
+        json={"limit": 2},
+        headers={
+            "X-Operator-Id": "alice",
+            "X-Teensing-Token": "ALICE_PERSONAL_TOKEN",
+            "X-Platform-Id": "Melodong",
+        },
+    )
+    assert resp.status_code == 200
+    assert captured["token"] == "ALICE_PERSONAL_TOKEN"  # 个人 token > 平台/全局
+
+
 def test_audit_log_records_per_operator(client):
     """/tess/diagnose 应把问答写入审计，并按 X-Operator-Id 归因。"""
     from tess_backend.app import AUDIT
