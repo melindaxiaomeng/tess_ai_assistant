@@ -16,7 +16,7 @@ import os
 import time
 from typing import Optional
 
-from sqlalchemy import JSON, String
+from sqlalchemy import JSON, String, desc
 from sqlalchemy.orm import mapped_column
 
 from .db import Base, make_engine, make_session_factory, init_all
@@ -118,6 +118,38 @@ class ChatStore:
             s.delete(sess)
             s.commit()
             return True
+
+    def list_sessions(self, operator_id: Optional[str] = None, limit: int = 100) -> list:
+        """列出会话摘要（按 updated_at 倒序）；operator_id 给定则按运营隔离。
+
+        返回字段：chat_id / operator_id / title(首条 user 问题) / message_count /
+        created_at / updated_at —— 供前端历史会话侧边栏渲染。
+        """
+        with self.Session() as s:
+            q = s.query(ChatSession)
+            if operator_id:
+                q = q.filter(ChatSession.operator_id == operator_id)
+            q = q.order_by(ChatSession.updated_at.desc())
+            rows = q.limit(limit).all()
+            out = []
+            for row in rows:
+                msgs = row.messages or []
+                title = ""
+                for m in msgs:
+                    if m.get("role") == "user":
+                        title = m.get("content", "")
+                        break
+                if not title and msgs:
+                    title = msgs[0].get("content", "")
+                out.append({
+                    "chat_id": row.chat_id,
+                    "operator_id": row.operator_id,
+                    "title": title,
+                    "message_count": len(msgs),
+                    "created_at": row.created_at,
+                    "updated_at": row.updated_at,
+                })
+            return out
 
     @staticmethod
     def format_history(messages: list, turns: int = 6) -> str:

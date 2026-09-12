@@ -71,12 +71,39 @@ messages.push({ role: "assistant", content: resp.answer }); // 注意取 resp.an
 
 **实体回退说明**：若本轮问题没有显式实体（如"它昨天的营收"），服务端会自动沿用上一轮解析出的 `campaign_id` / `advertiser_id` 等，前端**无需补实体**，只要保证 `chat_id` 不变。
 
-## 5. 历史管理端点（可选）
+## 5. 历史会话端点（可选）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/tess/chat/{chat_id}` | 读服务端历史 → `{ chat_id, messages:[...], count }`，用于刷新/恢复抽屉 |
+| GET | `/tess/chats` | **列出当前运营的全部历史会话**（侧边栏用）→ 见下 |
+| GET | `/tess/chat/{chat_id}` | 读单个会话完整历史 → `{ chat_id, messages:[...], count }`，用于点击历史项后恢复抽屉 |
 | DELETE | `/tess/chat/{chat_id}` | 清空该会话（"清空对话"按钮） |
+
+### 5.1 `GET /tess/chats` 返回结构（历史会话列表）
+受 `X-API-Key` 守卫；按请求头 `X-Operator-Id` 隔离（不传则归到 `anonymous` 桶）。
+
+```json
+{
+  "count": 2,
+  "sessions": [
+    {
+      "chat_id": "sess-1",
+      "operator_id": "opX",
+      "title": "广告主 1000839 近 7 日营收",   // 取首条 user 问题，可直接作侧边栏标题
+      "message_count": 4,
+      "created_at": "2026-09-12T08:00:00Z",
+      "updated_at": "2026-09-12T08:05:00Z"
+    }
+  ]
+}
+```
+
+### 5.2 历史侧边栏接法（3 步）
+1. 抽屉打开时 `GET /tess/chats` 拉列表 → 渲染成侧边栏（标题用 `title`，副信息用 `updated_at` + `message_count`）。
+2. 点击某条 → 拿它的 `chat_id` 调 `GET /tess/chat/{chat_id}` 取 `messages[]`，把 `role`+`content` 灌进当前 `messages` 数组渲染，并把抽屉的 `chat_id` 设为该项（后续追问沿用，**自动继承该会话的实体指代**）。
+3. "新对话"按钮：生成新 `chat_id` 并清空 `messages`（与列表脱钩）。
+
+> 注意：当前前端策略是"抽屉打开期间恒定 chat_id、关闭/刷新换新 id"，所以每个抽屉打开会落一条新会话；历史列表会逐条累积，点击即可恢复任意一条。若想"重开抽屉接着聊上次的"，把当前 `chat_id` 存 `localStorage` 即可（无需新接口）。
 
 ## 6. 注意事项
 

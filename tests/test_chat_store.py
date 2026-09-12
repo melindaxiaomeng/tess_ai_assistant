@@ -196,3 +196,37 @@ def test_chat_delete_endpoint(monkeypatch, tmp_path):
     d = c.delete("/tess/chat/sessD")
     assert d.json()["deleted"] is True
     assert c.get("/tess/chat/sessD").json()["count"] == 0
+
+
+def test_list_sessions_unit(store):
+    store.append("cA", "opX", "user", "广告主1000839的营收")
+    store.append("cA", "opX", "assistant", "营收如下")
+    store.append("cB", "opX", "user", "campaign 5845554 的 CTIT")
+    store.append("cC", "opY", "user", "别的运营的问题")
+    all_x = store.list_sessions(operator_id="opX")
+    assert len(all_x) == 2
+    by_id = {s["chat_id"]: s for s in all_x}
+    # title 取首条 user 问题；message_count 正确
+    assert by_id["cA"]["title"] == "广告主1000839的营收"
+    assert by_id["cA"]["message_count"] == 2
+    assert by_id["cB"]["title"] == "campaign 5845554 的 CTIT"
+    assert by_id["cB"]["message_count"] == 1
+    # operator 隔离：opY 只看自己的
+    all_y = store.list_sessions(operator_id="opY")
+    assert len(all_y) == 1 and all_y[0]["chat_id"] == "cC"
+
+
+def test_chats_list_endpoint(monkeypatch, tmp_path):
+    c = _client(monkeypatch, tmp_path)
+    c.post("/tess/ask", json={"question": "广告主 1000839 的营收", "chat_id": "sessL1"})
+    c.post("/tess/ask", json={"question": "它昨天的利润", "chat_id": "sessL1"})
+    c.post("/tess/ask", json={"question": "另一个会话", "chat_id": "sessL2"})
+    r = c.get("/tess/chats")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 2
+    ids = {s["chat_id"] for s in body["sessions"]}
+    assert ids == {"sessL1", "sessL2"}
+    s1 = next(s for s in body["sessions"] if s["chat_id"] == "sessL1")
+    assert s1["title"] == "广告主 1000839 的营收"
+    assert s1["message_count"] == 4

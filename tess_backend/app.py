@@ -1103,6 +1103,18 @@ def delete_chat(chat_id: str) -> dict:
     return {"chat_id": chat_id, "deleted": deleted}
 
 
+@app.get("/tess/chats")
+def list_chats(request: Request, limit: int = 100) -> dict:
+    """列出当前运营的历史会话（受 X-API-Key 守卫；按 X-Operator-Id 隔离）。
+
+    返回 { sessions: [{chat_id, operator_id, title, message_count, created_at, updated_at}], count }。
+    前端可据此渲染历史会话侧边栏，点击某条后调用 GET /tess/chat/{chat_id} 取完整消息恢复。
+    """
+    operator = _operator_id(request)
+    sessions = get_chat_store().list_sessions(operator_id=operator, limit=limit)
+    return {"sessions": sessions, "count": len(sessions)}
+
+
 @app.post("/tess/tool")
 def call_tool(payload: dict, request: Request) -> dict:
     """LLM Tool Calling 宽工具统一入口：由 LLM 的 tool_call 触发。
