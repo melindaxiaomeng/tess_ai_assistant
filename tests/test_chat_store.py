@@ -266,6 +266,51 @@ def test_record_turn_usage_roundtrip(store):
     assert sum(lu["per_day_total_tokens"].values()) == 155
 
 
+def test_operator_query_param_scopes_history(monkeypatch, tmp_path):
+    """?operator= 是历史查询类端点的运营过滤开关，缺省仍按 X-Operator-Id 隔离。
+
+    运维后台（saas_paid 代理）没有运营身份可带，不带头就会被当成 anonymous
+    —— 若没有 __all__ 这个显式开关，后台永远只能看到 anonymous 一人的数据。
+    同时保证普通客户端不带 operator 时行为不变（仍只看见自己的）。
+    """
+    c = _client(monkeypatch, tmp_path)
+    hdr_admin = {"X-Operator-Id": "admin"}
+    hdr_bob = {"X-Operator-Id": "bob"}
+    c.post("/tess/ask", json={"question": "admin 的问题", "chat_id": "sA"}, headers=hdr_admin)
+    c.post("/tess/ask", json={"question": "bob 的问题", "chat_id": "sB"}, headers=hdr_bob)
+    # 匿名（后台代理不带头的现状）
+    c.post("/tess/ask", json={"question": "匿名的问题", "chat_id": "sX"})
+
+    # ① 不传 operator：按 header 隔离，各自只看自己的
+    assert c.get("/tess/chats", headers=hdr_admin).json()["count"] == 1
+    assert c.get("/tess/chats", headers=hdr_bob).json()["count"] == 1
+    # 不带任何头 = anonymous 桶，这是后台代理的旧行为（Bug 现场）
+    assert c.get("/tess/chats").json()["count"] == 1
+
+    # ② operator=__all__：解除过滤，三个运营的会话都回来
+    body = c.get("/tess/chats?operator=__all__").json()
+    assert body["count"] == 3
+    assert {s["operator_id"] for s in body["sessions"]} == {"admin", "bob", "anonymous"}
+
+    # ③ operator=<具体值>：指定某人（与带谁的头无关）
+    ids = {s["chat_id"] for s in c.get("/tess/chats?operator=admin").json()["sessions"]}
+    assert ids == {"sA"}
+    ids = {s["chat_id"] for s in c.get("/tess/chats?operator=bob", headers=hdr_admin).json()["sessions"]}
+    assert ids == {"sB"}
+
+    # ④ 导出与统计同步生效：
+    #    per_operator 不带 __all__ 时永远只有 anonymous 一项（Bug 现场）
+    rows = c.get("/tess/chats/export?format=json&operator=__all__").json()["rows"]
+    assert len(rows) == 3
+    assert len(c.get("/tess/chats/export?format=json").json()["rows"]) == 1
+
+    stats = c.get("/tess/chats/stats?operator=__all__").json()
+    assert stats["total_sessions"] == 3
+    assert len(stats["per_operator"]) == 3
+    only_anon = c.get("/tess/chats/stats").json()
+    assert [o["operator_id"] for o in only_anon["per_operator"]] == ["anonymous"]
+
+
 def test_ask_records_llm_usage(monkeypatch, tmp_path):
     """端到端：/tess/ask 的 LLM usage 进 context_summary 并随会话落库。"""
     c = _client(monkeypatch, tmp_path)

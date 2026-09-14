@@ -284,6 +284,33 @@ def _operator_id(request: Request) -> str:
     return request.headers.get("X-Operator-Id", "anonymous") or "anonymous"
 
 
+# 「全部运营」哨兵值：?operator= 传这些值之一表示不加运营过滤。
+# 取多值是给代理层宽容度（写成 all / * / __all__ 都能生效）。
+_ALL_OPERATORS = {"__all__", "all", "*"}
+
+
+def _operator_filter(request: Request) -> Optional[str]:
+    """历史查询类端点（/chats、/chats/export、/chats/stats）的运营过滤值。
+
+    返回 None = 不加过滤（全部运营）；返回字符串 = 只取该运营。
+
+    取值优先级：查询参数 `?operator=` > 请求头 `X-Operator-Id`。
+      - `?operator=__all__` / `all` / `*`  → None（全部运营）
+      - `?operator=alice`                → "alice"
+      - 不传该参数                        → 沿用 X-Operator-Id（缺省 anonymous）
+
+    ⚠️ 为什么需要这个显式开关：这些端点默认「按 header 里的运营隔离」，
+    不带头就会被当成 anonymous —— 也就是**只能看到 anonymous 一个人的数据**。
+    运维后台（saas_paid 代理）要的是「该客户全员汇总」，它没有运营身份可带，
+    所以必须能显式声明「我不过滤」。而普通客户端不带 operator 参数，行为不变。
+    """
+    raw = request.query_params.get("operator")
+    if raw is not None and str(raw).strip():
+        v = str(raw).strip()
+        return None if v in _ALL_OPERATORS else v
+    return _operator_id(request)
+
+
 def _platform_id(request: Request) -> Optional[str]:
     """取平台标识：优先请求头 X-Platform-Id，其次查询参数 ?platform=；缺省 None。
 
@@ -1397,8 +1424,12 @@ def list_chats(request: Request, limit: int = 100) -> dict:
 
     返回 { sessions: [{chat_id, operator_id, title, message_count, created_at, updated_at}], count }。
     前端可据此渲染历史会话侧边栏，点击某条后调用 GET /tess/chat/{chat_id} 取完整消息恢复。
+
+    运营隔离：**默认按调用者的 X-Operator-Id 过滤**（各运营只看自己的历史）。
+    运维后台要拉全员时用 `?operator=__all__` 解除过滤，指定某人用 `?operator=alice`
+    （详见 _operator_filter）。
     """
-    operator = _operator_id(request)
+    operator = _operator_filter(request)
     platform = _platform_id(request)
     sessions = get_chat_store().list_sessions(operator_id=operator, platform_id=platform, limit=limit)
     return {"sessions": sessions, "count": len(sessions)}
@@ -1413,8 +1444,11 @@ def export_chats(request: Request, format: str = "json"):
       package_name, owner_user_id, llm_prompt_tokens, llm_completion_tokens,
       llm_total_tokens}] }（llm_* 为该轮 LLM 用量，旧数据为 null）
     - format=csv：扁平 CSV（同名列）直接下载，可用 Excel / BI 打开
+
+    运营隔离同 /tess/chats：`?operator=__all__` 拉全员，`?operator=alice` 指定某人，
+    不传按调用者 X-Operator-Id 过滤。
     """
-    operator = _operator_id(request)
+    operator = _operator_filter(request)
     platform = _platform_id(request)
     rows = get_chat_store().export_rows(operator_id=operator, platform_id=platform)
     if format == "csv":
@@ -1443,10 +1477,15 @@ def chat_stats(request: Request):
     """聚合运营分析指标（受 X-API-Key 守卫；按 X-Operator-Id 隔离）。
 
     返回：total_sessions / total_turns / top_questions / top_entities /
-    per_operator / analysis_type_distribution / route_source_distribution /
-    daily_buckets —— 前端可据此渲染「问题热点 / 实体热度 / 各运营活跃度」报表看板。
+    per_operator / per_platform / analysis_type_distribution /
+    route_source_distribution / daily_buckets / llm_usage
+    —— 前端可据此渲染「问题热点 / 实体热度 / 各运营活跃度」报表看板。
+
+    运营隔离同 /tess/chats：`?operator=__all__` 统计全员，`?operator=alice` 指定某人，
+    不传按调用者 X-Operator-Id 过滤。运维后台要「运营人数 / 排行」必须传 __all__，
+    否则 per_operator 永远只有 anonymous 一项。
     """
-    operator = _operator_id(request)
+    operator = _operator_filter(request)
     platform = _platform_id(request)
     return get_chat_store().aggregate_stats(operator_id=operator, platform_id=platform)
 
