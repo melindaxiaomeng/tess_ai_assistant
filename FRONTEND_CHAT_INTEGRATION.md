@@ -83,6 +83,14 @@ messages.push({ role: "assistant", content: resp.answer }); // 注意取 resp.an
 ### 5.1 `GET /tess/chats` 返回结构（历史会话列表）
 受 `X-API-Key` 守卫；按请求头 `X-Operator-Id` 隔离（不传则归到 `anonymous` 桶）。
 
+> **运营过滤开关 `?operator=`**（`/tess/chats`、`/tess/chats/export`、`/tess/chats/stats` 通用）：
+> - 不传 → 按 `X-Operator-Id` 头过滤（客户端默认行为：各运营只看自己的）
+> - `?operator=__all__`（或 `all` / `*`）→ **不过滤，返回全部运营**（运维后台拉全员汇总用）
+> - `?operator=alice` → 只取该运营
+>
+> ⚠️ 为什么必须有这个显式开关：不带头会被当成 `anonymous`，而不是「全部」。
+> 服务端代理（自己没有运营身份）若直接不注入头，就只能拿到 anonymous 一人的数据。
+
 ```json
 {
   "count": 2,
@@ -108,7 +116,7 @@ messages.push({ role: "assistant", content: resp.answer }); // 注意取 resp.an
 
 ## 6. 运营分析报表接口（出报表用）
 
-> 这两个接口用于**把大家问的问题 / 回答 / 实体 / 谁问的 / 何时**导出来做优化分析。受 `X-API-Key` 守卫；按 `X-Operator-Id` 隔离（不传则只看 `anonymous` 桶）。
+> 这两个接口用于**把大家问的问题 / 回答 / 实体 / 谁问的 / 何时**导出来做优化分析。受 `X-API-Key` 守卫；按 `X-Operator-Id` 隔离（不传则只看 `anonymous` 桶）；用 `?operator=__all__` 可取全部运营（见 §5.1 的运营过滤开关）。
 
 ### 6.1 `GET /tess/chats/export?format=json|csv`
 导出全量「轮」记录（每轮 = 一问一答合并成一行），可直接拉进 Excel / BI。
