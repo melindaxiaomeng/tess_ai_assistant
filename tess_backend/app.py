@@ -13,6 +13,7 @@ import hmac
 import os
 import re
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -46,7 +47,7 @@ from .tools_adapter import dispatch_tool, load_tool_schemas
 from .gaid_vault import VAULT, RedactFilter
 from .audit_log import QueryLogStore
 from .alerts_store import AlertStore
-from .platform_registry import get_platform_registry
+from .platform_registry import get_platform_registry, format_expiry
 from .dev_seed import DEMO_EVENT_IDS
 
 app = FastAPI(title="Tess Diagnose API", version="2.3.0")
@@ -993,23 +994,38 @@ def get_entitlement(request: Request) -> dict:
     平台标识来源：请求头 X-Platform-Id，或查询参数 ?platform=。
     返回：
       {
-        "platform_id": "Melodong",
-        "ai_enabled": true,          # 是否可用（未到期 + 平台启用）
-        "expired": false,            # 是否已过期
-        "expires_at": "2026-09-30",  # 到期时间（null = 永久有效）
-        "days_left": 18,             # 剩余天数（永久有效时为 null）
-        "reason": "ok"               # ok | no_expiry | expired | disabled
-                                     # | unregistered | no_platform
+        "platform_id": "melodong",
+        "ai_enabled": true,                    # 是否可用（未到期 + 平台启用）
+        "expired": false,                      # 是否已过期
+        "expires_at": "2026-09-30",            # 库里原值（null = 永久有效）
+        "days_left": 18,                       # 剩余天数（永久有效时为 null）
+        "reason": "ok",                        # ok | no_expiry | expired | disabled
+                                               # | unregistered | no_platform
+        // 下面是「能直接显示」的时间/日期字段（服务端算好，前端不用管时区和
+        // 「纯日期算当天零点还是当天结束」这类坑）。无到期时间时全为 null：
+        "expires_at_utc": "2026-09-30T15:59:59Z",
+        "expires_at_display": "2026-09-30 23:59:59",   # 展示时区，直接显示这个
+        "expires_date": "2026-09-30",                  # 只要日期时用
+        "expires_time": "23:59:59",                    # 只要时间时用
+        "expires_at_ts": 1780214399,                   # Unix 秒，算倒计时用
+        "timezone": "Asia/Shanghai",                   # 上面这些按哪个时区显示
+        "server_time": "2026-09-14T03:04:05Z"          # 服务器现在时间，对齐客户端时钟
       }
+    展示时区默认 Asia/Shanghai，可用环境变量 TESS_DISPLAY_TZ 覆盖。
+
     前端用法：启动时拉一次；`ai_enabled === false` 就把 AI 入口隐藏或显示
     「已到期，请联系续费」。**到期只影响新建提问**，历史会话/导出仍可访问。
     缓存建议：客户端不要长缓存（续费后要尽快生效），建议 ≤60s 或每次进页面重拉。
     """
     platform_id = _platform_id(request)
     try:
-        return get_platform_registry().entitlement(platform_id)
+        ent = dict(get_platform_registry().entitlement(platform_id))
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"授权信息读取失败：{type(e).__name__}: {e}")
+    # 补上前端可直接显示的时间/日期字段（见 platform_registry.format_expiry）
+    ent.update(format_expiry(ent.get("expires_at")))
+    ent["server_time"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return ent
 
 
 # —— P9 平台管理接口（独立管理密钥 X-Admin-Key 守卫）——

@@ -237,6 +237,30 @@ def test_entitlement_endpoint_states(ent_client):
     assert c.get("/tess/entitlement").json()["reason"] == "no_platform"
 
 
+def test_entitlement_returns_display_fields(ent_client):
+    """entitlement 返回前端可直接显示的时间/日期字段。
+
+    关键语义：库里存 "2999-01-01" 这种纯日期时，按**展示时区当天 23:59:59** 算，
+    所以原样回显还是 2999-01-01 23:59:59 —— 不能因为 UTC+8 变成 3000-01-02。
+    """
+    c, reg = ent_client
+    reg.create("disp_p", "Disp", expires_at="2999-01-01")
+    d = c.get("/tess/entitlement", headers={"X-Platform-Id": "disp_p"}).json()
+    assert d["expires_date"] == "2999-01-01"
+    assert d["expires_time"] == "23:59:59"
+    assert d["expires_at_display"] == "2999-01-01 23:59:59"
+    assert d["expires_at_utc"].endswith("Z")
+    assert isinstance(d["expires_at_ts"], int) and d["expires_at_ts"] > 0
+    assert d["timezone"] == "Asia/Shanghai"
+    assert d["server_time"].endswith("Z")
+
+    # 永久有效（没设到期）：时间字段全为 null，但不报错
+    reg.create("perm2", "Perm2")
+    d2 = c.get("/tess/entitlement", headers={"X-Platform-Id": "perm2"}).json()
+    assert d2["reason"] == "no_expiry"
+    assert d2["expires_at_display"] is None and d2["expires_at_ts"] is None
+
+
 def test_ask_blocked_when_expired(ent_client):
     """到期后新建提问 -> 403，错误体带机器可读 code。"""
     c, reg = ent_client

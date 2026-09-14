@@ -31,8 +31,9 @@ alerts）打 platform_id 隔离报表，Tess 调 LLM 时优先用该平台的 ll
 from __future__ import annotations
 
 import math
+import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import Boolean, String, Text, select
@@ -221,9 +222,12 @@ def _normalize_expires(v: Optional[str]) -> Optional[str]:
 def _parse_expires(s: Optional[str]) -> Optional[datetime]:
     """把库里存的到期时间解析成带时区的 datetime；解析不了返回 None（视为不过期）。
 
-    支持 "2026-09-30"（纯日期，按当天 23:59:59 UTC 结束）与
-    "2026-09-30T23:59:59Z" / "2026-09-30T23:59:59+08:00"（带时间）。
-    无时区信息的一律按 UTC 解释。
+    支持 "2026-09-30"（纯日期）与 "2026-09-30T23:59:59Z" / "2026-09-30T23:59:59+08:00"
+    （带时间）。
+
+    纯日期按**展示时区的当天 23:59:59** 算（默认 Asia/Shanghai），不是 UTC —— 否则运营
+    在后台填「2026-09-30」，前端按北京时间一显示就变成「2026-10-01 07:59:59」，凭空多
+    一天。带时间但没写时区的串仍按 UTC 解释（那是一个明确的时刻）。
     """
     if not s or not str(s).strip():
         return None
@@ -238,8 +242,57 @@ def _parse_expires(s: Optional[str]) -> Optional[datetime]:
     if date_only:
         dt = dt.replace(hour=23, minute=59, second=59)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        tz, _ = _display_tz() if date_only else (timezone.utc, "UTC")
+        dt = dt.replace(tzinfo=tz)
     return dt
+
+
+def _display_tz():
+    """展示时区：默认 Asia/Shanghai（运营填的到期日按北京时间看），可用
+    TESS_DISPLAY_TZ 覆盖；宿主没装 tzdata 时退回固定 +08:00，不抛异常。"""
+    name = os.getenv("TESS_DISPLAY_TZ", "Asia/Shanghai")
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name), name
+    except Exception:
+        return timezone(timedelta(hours=8)), "UTC+08:00"
+
+
+def format_expiry(expires_raw: Optional[str]) -> dict:
+    """把库里的 expires_at 原值展开成「前端能直接显示」的一组时间/日期字段。
+
+    前端没必要自己解析 "2026-09-30" 到底是当天零点还是当天结束、也不用关心时区，
+    这里一次性算好。没有到期时间（永久有效）时除 timezone 外全为 None。
+
+    返回：
+      expires_at_utc      规范化 UTC 串，如 "2026-09-30T15:59:59Z"
+      expires_at_display  展示时区的 "YYYY-MM-DD HH:MM:SS"（前端直接显示这个）
+      expires_date        "YYYY-MM-DD"
+      expires_time        "HH:MM:SS"
+      expires_at_ts       Unix 秒（前端算倒计时/比较大小用）
+      timezone            展示时区名，如 "Asia/Shanghai"
+    """
+    tz, tzname = _display_tz()
+    out = {
+        "expires_at_utc": None,
+        "expires_at_display": None,
+        "expires_date": None,
+        "expires_time": None,
+        "expires_at_ts": None,
+        "timezone": tzname,
+    }
+    exp = _parse_expires(expires_raw)
+    if exp is None:
+        return out
+    local = exp.astimezone(tz)
+    out.update({
+        "expires_at_utc": exp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "expires_at_display": local.strftime("%Y-%m-%d %H:%M:%S"),
+        "expires_date": local.strftime("%Y-%m-%d"),
+        "expires_time": local.strftime("%H:%M:%S"),
+        "expires_at_ts": int(exp.timestamp()),
+    })
+    return out
 
 
 def _to_dict(row: Platform) -> dict:
