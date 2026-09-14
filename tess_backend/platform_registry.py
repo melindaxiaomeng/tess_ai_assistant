@@ -16,6 +16,11 @@ alerts）打 platform_id 隔离报表，Tess 调 LLM 时优先用该平台的 ll
                 为空则回退全局 TESS_LLM_API_KEY
   base_url    : 历史遗留（各平台共用全局 TESS_DATA_API_BASE_URL）
   is_active   : 是否启用（禁用后不参与定时诊断、不解析 llm_api_key）
+  expires_at  : 可选，「AI 对话框」付费授权的到期时间（ISO 字符串，如 "2026-09-30" 或
+                "2026-09-30T23:59:59Z"）。为空 = 永久有效。
+                到期后：/tess/ask、/tess/analytics、/tess/tool 一律 403（只禁新提问）；
+                历史读取路径（/tess/chats、/tess/chat/{id}、/tess/chats/export、
+                /tess/chats/stats）不受影响，运营仍可回看/导出既有问答。
   created_at / updated_at
 
 鉴权：平台管理接口（增删改查）由独立的「管理密钥」X-Admin-Key 守卫
@@ -25,7 +30,9 @@ alerts）打 platform_id 隔离报表，Tess 调 LLM 时优先用该平台的 ll
 
 from __future__ import annotations
 
+import math
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import Boolean, String, Text, select
@@ -45,6 +52,8 @@ class Platform(Base):
     llm_api_key = mapped_column(Text, nullable=True, default=None)
     base_url = mapped_column(String, nullable=True, default=None)
     is_active = mapped_column(Boolean, default=True)
+    # AI 对话框付费授权到期时间（ISO 串，可空 = 永久有效）
+    expires_at = mapped_column(String, nullable=True, default=None)
     created_at = mapped_column(String, default=lambda: _now())
     updated_at = mapped_column(String, default=lambda: _now())
 
@@ -63,6 +72,8 @@ class PlatformRegistry:
         init_all(self.engine)
         # 幂等加列：已上线的旧库（无 llm_api_key）自动补列，不破坏存量数据
         ensure_column(self.engine, "tess_platforms", "llm_api_key", "TEXT")
+        # 幂等加列：AI 付费授权到期时间（旧库补列，默认 NULL = 永久有效）
+        ensure_column(self.engine, "tess_platforms", "expires_at", "TEXT")
 
     # —— 基础读写 ——
     def get(self, platform_id: str) -> Optional[Platform]:
@@ -84,7 +95,8 @@ class PlatformRegistry:
 
     def create(self, platform_id: str, name: str, token: str = "",
                base_url: Optional[str] = None, is_active: bool = True,
-               llm_api_key: Optional[str] = None) -> dict:
+               llm_api_key: Optional[str] = None,
+               expires_at: Optional[str] = None) -> dict:
         if not platform_id or not str(platform_id).strip():
             raise ValueError("platform_id 不能为空")
         with self.Session() as s:
@@ -96,6 +108,7 @@ class PlatformRegistry:
                 token=(token or ""),  # 历史遗留字段，取数不再使用
                 llm_api_key=(llm_api_key or None),
                 base_url=base_url, is_active=is_active,
+                expires_at=_normalize_expires(expires_at),
                 created_at=now, updated_at=now,
             )
             s.add(row)
@@ -105,6 +118,10 @@ class PlatformRegistry:
     def update(self, platform_id: str, **fields) -> Optional[dict]:
         allowed = {"name", "token", "llm_api_key", "base_url", "is_active"}
         updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+        # expires_at 单独处理：允许显式清空（传 None / "" / "null" => 永久有效），
+        # 这一点与其它字段「不传即不改」的语义不同，因为「取消到期」是常见操作。
+        if "expires_at" in fields:
+            updates["expires_at"] = _normalize_expires(fields.get("expires_at"))
         if not updates:
             return None
         with self.Session() as s:
@@ -155,6 +172,75 @@ class PlatformRegistry:
             })
         return out
 
+    # —— AI 对话框付费授权（按平台维度的到期时间）——
+    def entitlement(self, platform_id: Optional[str]) -> dict:
+        """计算某平台的「AI 问答授权」状态。
+
+        判定顺序（只有「已注册 + 启用 + 未过期」才算可用）：
+          - platform_id 为空      -> 放行（无平台上下文，如全局调用；不误伤）
+          - 平台未注册            -> 放行（保持历史行为，避免品牌未登记就锁死）
+          - 平台 is_active=False  -> 拒绝（reason=disabled）
+          - expires_at 为空       -> 放行（永久有效）
+          - expires_at < 现在     -> 拒绝（reason=expired）
+        返回 dict：{platform_id, ai_enabled, expired, expires_at, days_left, reason}
+        """
+        if not platform_id:
+            return {"platform_id": None, "ai_enabled": True, "expired": False,
+                    "expires_at": None, "days_left": None, "reason": "no_platform"}
+        row = self.get(platform_id)
+        if row is None:
+            return {"platform_id": platform_id, "ai_enabled": True, "expired": False,
+                    "expires_at": None, "days_left": None, "reason": "unregistered"}
+        expires_raw = getattr(row, "expires_at", None)
+        if not row.is_active:
+            return {"platform_id": platform_id, "ai_enabled": False, "expired": False,
+                    "expires_at": expires_raw, "days_left": None, "reason": "disabled"}
+        exp = _parse_expires(expires_raw)
+        if exp is None:
+            return {"platform_id": platform_id, "ai_enabled": True, "expired": False,
+                    "expires_at": None, "days_left": None, "reason": "no_expiry"}
+        now = datetime.now(timezone.utc)
+        if now > exp:
+            return {"platform_id": platform_id, "ai_enabled": False, "expired": True,
+                    "expires_at": expires_raw, "days_left": 0, "reason": "expired"}
+        days_left = max(0, math.ceil((exp - now).total_seconds() / 86400))
+        return {"platform_id": platform_id, "ai_enabled": True, "expired": False,
+                "expires_at": expires_raw, "days_left": days_left, "reason": "ok"}
+
+
+def _normalize_expires(v: Optional[str]) -> Optional[str]:
+    """入库前归一到期时间：去空白；空串 / "null" / None 一律存 None（= 永久有效）。"""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s or s.lower() in ("null", "none"):
+        return None
+    return s
+
+
+def _parse_expires(s: Optional[str]) -> Optional[datetime]:
+    """把库里存的到期时间解析成带时区的 datetime；解析不了返回 None（视为不过期）。
+
+    支持 "2026-09-30"（纯日期，按当天 23:59:59 UTC 结束）与
+    "2026-09-30T23:59:59Z" / "2026-09-30T23:59:59+08:00"（带时间）。
+    无时区信息的一律按 UTC 解释。
+    """
+    if not s or not str(s).strip():
+        return None
+    raw = str(s).strip()
+    date_only = "T" not in raw and " " not in raw
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if date_only:
+        dt = dt.replace(hour=23, minute=59, second=59)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
 
 def _to_dict(row: Platform) -> dict:
     return {
@@ -164,6 +250,7 @@ def _to_dict(row: Platform) -> dict:
         "llm_api_key": row.llm_api_key,
         "base_url": row.base_url,
         "is_active": row.is_active,
+        "expires_at": getattr(row, "expires_at", None),
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }

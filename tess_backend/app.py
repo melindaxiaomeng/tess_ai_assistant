@@ -335,6 +335,50 @@ def _require_admin(request: Request) -> None:
         raise HTTPException(status_code=403, detail="缺少或错误的 X-Admin-Key")
 
 
+# —— AI 对话框付费授权闸门（按平台维度的到期时间，见 platform_registry.entitlement）——
+def _require_ai_entitlement(request: Request) -> dict:
+    """只拦「新建提问」类入口：/tess/ask、/tess/analytics、/tess/tool。
+
+    **历史读取路径不经过这里**（/tess/chats、/tess/chat/{id}、/tess/chats/export、
+    /tess/chats/stats），所以平台到期后运营仍可回看 / 导出既有问答 —— 满足
+    「到期只禁新提问，不锁历史」。
+
+    判定（委托 PlatformRegistry.entitlement）：
+      - 未带 X-Platform-Id / ?platform=  -> 放行（无平台上下文，全局兜底路径，不误伤）
+      - 平台未注册                        -> 放行（避免品牌还没登记就被锁死）
+      - 平台 is_active=False              -> 403 PLATFORM_DISABLED
+      - expires_at 已过                   -> 403 AI_EXPIRED
+      - 未设 expires_at / 未到期          -> 放行
+
+    到期错误体带机器可读 code，前端据此弹「已到期，请联系续费」：
+      { "detail": { "code": "AI_EXPIRED", "message": "...", "platform_id": "...",
+                    "expires_at": "...", "days_left": 0 } }
+    """
+    platform_id = _platform_id(request)
+    try:
+        ent = get_platform_registry().entitlement(platform_id)
+    except Exception:
+        # 授权库异常不应阻断正常问答（宁可放过，避免误伤生产）
+        return {"platform_id": platform_id, "ai_enabled": True, "reason": "registry_error"}
+
+    if ent.get("ai_enabled"):
+        return ent
+
+    if ent.get("reason") == "disabled":
+        raise HTTPException(status_code=403, detail={
+            "code": "PLATFORM_DISABLED",
+            "message": f"平台「{platform_id}」已停用，暂不可使用 AI 问答。",
+            "platform_id": platform_id,
+        })
+    raise HTTPException(status_code=403, detail={
+        "code": "AI_EXPIRED",
+        "message": f"AI 功能已于 {ent.get('expires_at')} 到期，请联系我们续费后继续使用。",
+        "platform_id": platform_id,
+        "expires_at": ent.get("expires_at"),
+        "days_left": 0,
+    })
+
+
 @app.post("/tess/diagnose")
 def diagnose(payload: dict, request: Request) -> dict:
     """接收异常上下文 Input，返回 Gatekeeper 归一化后的归因结果。
@@ -417,6 +461,7 @@ def post_analytics(payload: dict, request: Request) -> dict:
             # token_mode: "user"=按运营个人 token 取数; "system"=全局兜底
       }
     """
+    _require_ai_entitlement(request)  # 付费授权闸门：到期/停用 -> 403
     analysis_type = (payload or {}).get("analysis_type")
     if analysis_type not in SUPPORTED:
         raise HTTPException(
@@ -499,6 +544,7 @@ def post_ask(payload: dict, request: Request) -> dict:
         }
       }
     """
+    _require_ai_entitlement(request)  # 付费授权闸门：到期/停用 -> 403
     question = (payload or {}).get("question")
     if not question or not str(question).strip():
         raise HTTPException(status_code=400, detail="缺少 question 字段或为空")
@@ -939,15 +985,43 @@ def cron_run(payload: dict = None, request: Request = None) -> dict:
     return {"count": len(results), "platform": platform or "all", "results": results}
 
 
+# —— AI 付费授权状态查询（客户端启动时调用，判断「AI 对话框」是否可用）——
+@app.get("/tess/entitlement")
+def get_entitlement(request: Request) -> dict:
+    """查询当前平台的 AI 问答授权状态（公开只读，受全局 X-API-Key 守卫）。
+
+    平台标识来源：请求头 X-Platform-Id，或查询参数 ?platform=。
+    返回：
+      {
+        "platform_id": "Melodong",
+        "ai_enabled": true,          # 是否可用（未到期 + 平台启用）
+        "expired": false,            # 是否已过期
+        "expires_at": "2026-09-30",  # 到期时间（null = 永久有效）
+        "days_left": 18,             # 剩余天数（永久有效时为 null）
+        "reason": "ok"               # ok | no_expiry | expired | disabled
+                                     # | unregistered | no_platform
+      }
+    前端用法：启动时拉一次；`ai_enabled === false` 就把 AI 入口隐藏或显示
+    「已到期，请联系续费」。**到期只影响新建提问**，历史会话/导出仍可访问。
+    缓存建议：客户端不要长缓存（续费后要尽快生效），建议 ≤60s 或每次进页面重拉。
+    """
+    platform_id = _platform_id(request)
+    try:
+        return get_platform_registry().entitlement(platform_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"授权信息读取失败：{type(e).__name__}: {e}")
+
+
 # —— P9 平台管理接口（独立管理密钥 X-Admin-Key 守卫）——
 @app.get("/tess/admin/platforms")
 def admin_list_platforms(request: Request) -> dict:
     """列出全部平台凭证（仅管理端用，受 X-Admin-Key 守卫）。
 
     返回：{ count, platforms: [ {id, name, token, llm_api_key, base_url, is_active,
-            created_at, updated_at}, ... ] }
+            expires_at, created_at, updated_at}, ... ] }
     注意：llm_api_key 原样返回（管理端需要查看/复制），但仅管理密钥可见，
     普通调用方拿不到。token 为历史遗留字段（取数平台 token 已废弃，不再用于鉴权）。
+    expires_at 为 AI 对话框付费授权到期时间（null = 永久有效）。
     """
     _require_admin(request)
     rows = get_platform_registry().list()
@@ -959,10 +1033,13 @@ def admin_create_platform(payload: dict, request: Request) -> dict:
     """新增一个平台（受 X-Admin-Key 守卫）。
 
     body: { "id": "melodong", "name": "Melodong",
-            "llm_api_key": "<该平台专用 DeepSeek key，可选>", "is_active": true }
+            "llm_api_key": "<该平台专用 DeepSeek key，可选>", "is_active": true,
+            "expires_at": "2026-09-30" }   # 可选：AI 授权到期时间，不填 = 永久有效
       - id：稳定字符串主键，前端在 X-Platform-Id 携带；必填、不可重复。
       - llm_api_key：可选，该平台专用 LLM（DeepSeek）API key —— Tess 调 LLM 时优先用它，
         用量/账单按平台区分；为空则回退全局 TESS_LLM_API_KEY。
+      - expires_at：可选，AI 对话框付费授权到期时间。支持 "YYYY-MM-DD"（当天 23:59:59
+        UTC 结束）或带时间的 ISO 串；留空/不填 = 永久有效。
       - token / base_url：历史遗留字段（取数平台 token 已废弃，saas_v3.0 按运营个人
         token 鉴权），可不填；仅为兼容旧客户端保留。
     """
@@ -977,6 +1054,7 @@ def admin_create_platform(payload: dict, request: Request) -> dict:
             token=payload.get("token") or "",
             llm_api_key=payload.get("llm_api_key"),
             base_url=payload.get("base_url"), is_active=bool(payload.get("is_active", True)),
+            expires_at=payload.get("expires_at"),
         )
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -985,10 +1063,13 @@ def admin_create_platform(payload: dict, request: Request) -> dict:
 
 @app.put("/tess/admin/platforms/{platform_id}")
 def admin_update_platform(platform_id: str, payload: dict, request: Request) -> dict:
-    """更新平台（受 X-Admin-Key 守卫）。可改 name / llm_api_key / is_active
+    """更新平台（受 X-Admin-Key 守卫）。可改 name / llm_api_key / is_active / expires_at
     （token / base_url 为历史遗留字段，保留可改仅为兼容）。
 
-    body（部分字段即可）：{ "llm_api_key": "<新DeepSeek key>", "is_active": false }
+    body（部分字段即可）：{ "llm_api_key": "<新DeepSeek key>", "is_active": false,
+                            "expires_at": "2026-12-31" }
+    expires_at 支持显式清空（传 null / ""）：传了但为空 = 取消到期（永久有效），
+    这与其它字段「不传即不改」的语义不同。
     """
     _require_admin(request)
     payload = payload or {}
@@ -1365,6 +1446,7 @@ def call_tool(payload: dict, request: Request) -> dict:
     鉴权 / 按平台取数同 /tess/analytics、/tess/ask（X-API-Key + X-Platform-Id）。
     后端依据 arguments 强约束路由到确定性引擎，不应出现静默错数或幻觉。
     """
+    _require_ai_entitlement(request)  # 付费授权闸门：到期/停用 -> 403
     tool = (payload or {}).get("tool")
     if tool not in ("tess_analyze", "tess_ask", "tess_fetch_warning"):
         raise HTTPException(status_code=400, detail=f"不支持的 tool={tool!r}")

@@ -197,3 +197,106 @@ def test_run_diagnosis_tags_platform(client, monkeypatch, tmp_path):
     # 不带 platform_id -> 回退 default 平台
     app_module.run_scheduled_diagnosis(limit=5, connector=FakeConnector(), llm=CapturingLLM())
     assert len(store.recent(platform="default")) >= 1
+
+
+# ------------------- AI 付费授权（按平台维度的到期时间） -------------------
+
+@pytest.fixture
+def ent_client(monkeypatch, tmp_path):
+    """带独立平台库的 client：便于断言「到期 -> 403 / 历史可读」等授权行为。"""
+    from tess_backend.platform_registry import PlatformRegistry
+
+    reg = PlatformRegistry(str(tmp_path / "ent.db"))
+    monkeypatch.setattr(app_module, "get_platform_registry", lambda: reg)
+    monkeypatch.setattr(app_module, "_get_llm_client", lambda *a, **k: CapturingLLM())
+    monkeypatch.setattr(app_module, "_DATA_CONNECTOR", FakeConnector())
+    cs._STORE = ChatStore(str(tmp_path / "ent_chat.db"))
+    monkeypatch.setattr(app_module, "_ADMIN_API_KEY", "test-admin")
+    return TestClient(app_module.app), reg
+
+
+def test_entitlement_endpoint_states(ent_client):
+    """GET /tess/entitlement 覆盖各授权状态。"""
+    c, reg = ent_client
+    reg.create("future_p", "Future", expires_at="2999-01-01")
+    reg.create("past_p", "Past", expires_at="2020-01-01")
+    reg.create("perm_p", "Perm")
+    reg.create("off_p", "Off", is_active=False)
+
+    r = c.get("/tess/entitlement", headers={"X-Platform-Id": "future_p"})
+    assert r.status_code == 200
+    assert r.json()["ai_enabled"] is True and r.json()["expired"] is False
+    assert r.json()["reason"] == "ok" and r.json()["days_left"] > 0
+
+    assert c.get("/tess/entitlement", headers={"X-Platform-Id": "past_p"}).json()["reason"] == "expired"
+    # ?platform= 与请求头等效
+    assert c.get("/tess/entitlement?platform=perm_p").json()["reason"] == "no_expiry"
+    assert c.get("/tess/entitlement", headers={"X-Platform-Id": "off_p"}).json()["reason"] == "disabled"
+    # 未注册 / 未带平台 -> 放行，不误伤
+    assert c.get("/tess/entitlement", headers={"X-Platform-Id": "nope"}).json()["reason"] == "unregistered"
+    assert c.get("/tess/entitlement").json()["reason"] == "no_platform"
+
+
+def test_ask_blocked_when_expired(ent_client):
+    """到期后新建提问 -> 403，错误体带机器可读 code。"""
+    c, reg = ent_client
+    reg.create("past_p", "Past", expires_at="2020-01-01")
+    r = c.post("/tess/ask", json={"question": "昨天营收如何"},
+               headers={"X-Platform-Id": "past_p"})
+    assert r.status_code == 403
+    detail = r.json()["detail"]
+    assert detail["code"] == "AI_EXPIRED"
+    assert detail["platform_id"] == "past_p"
+    assert detail["expires_at"] == "2020-01-01"
+
+
+def test_analytics_and_tool_blocked_when_expired(ent_client):
+    """/tess/analytics、/tess/tool 同为「提问」入口，一并拦截。"""
+    c, reg = ent_client
+    reg.create("past_p", "Past", expires_at="2020-01-01")
+    h = {"X-Platform-Id": "past_p"}
+    assert c.post("/tess/analytics", json={"analysis_type": "daily_summary"}, headers=h).status_code == 403
+    assert c.post("/tess/tool", json={"tool": "tess_ask", "arguments": {"question": "x"}}, headers=h).status_code == 403
+
+
+def test_ask_allowed_before_expiry(ent_client):
+    """未到期的平台仍可正常提问。"""
+    c, reg = ent_client
+    reg.create("future_p", "Future", expires_at="2999-01-01")
+    r = c.post("/tess/ask", json={"question": "什么是 CTIT"},
+               headers={"X-Platform-Id": "future_p"})
+    assert r.status_code == 200
+
+
+def test_expired_platform_can_still_read_history(ent_client):
+    """核心契约：到期只禁新提问，历史读取路径一律放行（运营可回看/导出）。"""
+    c, reg = ent_client
+    reg.create("past_p", "Past", expires_at="2020-01-01")
+    h = {"X-Platform-Id": "past_p"}
+    assert c.get("/tess/chats", headers=h).status_code == 200
+    assert c.get("/tess/chats/export", headers=h).status_code == 200
+    assert c.get("/tess/chats/stats", headers=h).status_code == 200
+    assert c.get("/tess/chat/whatever", headers=h).status_code == 200
+
+
+def test_admin_platforms_expires_at_roundtrip(client):
+    """admin 接口可写入 / 更新 / 清空平台到期时间。"""
+    h = {"X-Admin-Key": "test-admin"}
+    created = client.post(
+        "/tess/admin/platforms",
+        json={"id": "exp1", "name": "Exp", "expires_at": "2026-12-31"},
+        headers=h,
+    )
+    assert created.status_code == 200
+    assert created.json()["platform"]["expires_at"] == "2026-12-31"
+    # 列表带出
+    listed = client.get("/tess/admin/platforms", headers=h).json()["platforms"]
+    by_id = {p["id"]: p for p in listed}
+    assert by_id["exp1"]["expires_at"] == "2026-12-31"
+    # 改到期时间
+    upd = client.put("/tess/admin/platforms/exp1", json={"expires_at": "2027-06-30"}, headers=h)
+    assert upd.json()["platform"]["expires_at"] == "2027-06-30"
+    # 显式传 null -> 清空（永久有效）
+    cleared = client.put("/tess/admin/platforms/exp1", json={"expires_at": None}, headers=h)
+    assert cleared.json()["platform"]["expires_at"] is None
+    client.delete("/tess/admin/platforms/exp1", headers=h)

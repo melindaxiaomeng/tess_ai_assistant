@@ -238,9 +238,9 @@ headers: {
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/tess/admin/platforms` | 列出全部平台（含 llm_api_key、启用状态） |
-| POST | `/tess/admin/platforms` | 新增：body `{ id, name, llm_api_key?, is_active? }` |
-| PUT | `/tess/admin/platforms/{id}` | 改：body 任意子集 `{ name, llm_api_key, is_active }` |
+| GET | `/tess/admin/platforms` | 列出全部平台（含 llm_api_key、启用状态、expires_at） |
+| POST | `/tess/admin/platforms` | 新增：body `{ id, name, llm_api_key?, is_active?, expires_at? }` |
+| PUT | `/tess/admin/platforms/{id}` | 改：body 任意子集 `{ name, llm_api_key, is_active, expires_at }` |
 | DELETE | `/tess/admin/platforms/{id}` | 删（历史记录保留原 platform_id，仅停该平台后续定时诊断） |
 
 字段说明：
@@ -248,13 +248,28 @@ headers: {
 - `llm_api_key`：该平台专用 **LLM（DeepSeek）key**，可选 —— 上层平台各自在 DeepSeek 开
   独立 key（如 Melodong 的 `sk-1e62c...`），Tess 调 LLM 时优先用它，用量/账单按平台
   区分；为空则回退全局 `TESS_LLM_API_KEY`。
+- `expires_at`：**AI 对话框付费授权到期时间**（见 §8.3）。可空 = 永久有效。支持
+  `"2026-09-30"`（当天 23:59:59 UTC 结束）或带时间的 ISO 串。**PUT 传 `null` 或 `""`
+  表示清空（取消到期）**，这一点与其它字段「不传即不改」的语义不同。
 
 ```bash
 # 新增一个平台（llm_api_key 填该平台在 DeepSeek 开的专用 key；取数 token 已不需要）
 curl -s -X POST "https://<host>/tess/admin/platforms" \
   -H "X-Admin-Key: $TESS_ADMIN_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"id":"melodong","name":"Melodong","llm_api_key":"sk-<该平台DeepSeek key>","is_active":true}'
+  -d '{"id":"melodong","name":"Melodong","llm_api_key":"sk-<该平台DeepSeek key>","is_active":true,"expires_at":"2026-12-31"}'
+
+# 续费/改到期时间
+curl -s -X PUT "https://<host>/tess/admin/platforms/melodong" \
+  -H "X-Admin-Key: $TESS_ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"expires_at":"2027-06-30"}'
+
+# 取消到期（永久有效）
+curl -s -X PUT "https://<host>/tess/admin/platforms/melodong" \
+  -H "X-Admin-Key: $TESS_ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"expires_at":null}'
 
 # 只跑某平台的一次诊断（即时验证）
 curl -s -X POST "https://<host>/tess/cron/run" \
@@ -262,4 +277,56 @@ curl -s -X POST "https://<host>/tess/cron/run" \
   -H "Content-Type: application/json" \
   -d '{"platform":"facemoji","limit":20}'
 ```
+
+### 8.3 AI 付费授权（到期时间）与客户端接入
+
+「AI 对话框」是**按平台维度**的付费功能：平台到期后，**只禁新建提问，历史照常可看**。
+判定数据唯一来源是 `tess_platforms.expires_at`（由 §8.2 管理端写入）。
+
+#### 到期后会发生什么
+
+| 入口 | 到期后 | 说明 |
+| --- | --- | --- |
+| `POST /tess/ask` | **403** | 自然语言问答，拦 |
+| `POST /tess/analytics` | **403** | 分析胶囊，拦 |
+| `POST /tess/tool` | **403** | 宽工具（含 `tess_ask`），拦 |
+| `GET /tess/chats` | 200 | 历史会话列表，**不拦** |
+| `GET /tess/chat/{chat_id}` | 200 | 单会话多轮，**不拦** |
+| `GET /tess/chats/export` | 200 | 明细导出，**不拦** |
+| `GET /tess/chats/stats` | 200 | 聚合统计，**不拦** |
+
+到期时 403 响应体（`detail` 是对象，带机器可读 `code`）：
+
+```json
+{ "detail": { "code": "AI_EXPIRED",
+              "message": "AI 功能已于 2026-09-30 到期，请联系我们续费后继续使用。",
+              "platform_id": "melodong", "expires_at": "2026-09-30", "days_left": 0 } }
+```
+
+平台被停用（`is_active=false`）同理，但 `code` 是 `PLATFORM_DISABLED`。
+
+#### 客户端启动时查授权状态：`GET /tess/entitlement`
+
+前端**不用**等用户提问才发现到期 —— 启动时（或进页面前）拉一次，据此隐藏/禁用 AI 入口。
+
+```bash
+curl -s "https://<host>/tess/entitlement" \
+  -H "X-API-Key: $TESS_API_KEY" \
+  -H "X-Platform-Id: melodong"
+```
+
+```json
+{ "platform_id": "melodong", "ai_enabled": true, "expired": false,
+  "expires_at": "2026-12-31", "days_left": 102, "reason": "ok" }
+```
+
+`reason` 取值：`ok`（有到期时间且未过期）/ `no_expiry`（永久有效）/ `expired`（已过期）/
+`disabled`（平台停用）/ `unregistered`（平台未注册，放行）/ `no_platform`（未带平台标识，放行）。
+
+前端接法（要点）：
+1. 平台标识用请求头 `X-Platform-Id`（或 `?platform=`），与提问时用的值保持一致。
+2. `ai_enabled === false` → 隐藏浮动按钮、或保留按钮但点开显示「已到期，请联系续费」并禁用发送。
+3. 提问收到 403 且 `detail.code === "AI_EXPIRED"` → 同样按到期处理（兜底，防缓存过期）。
+4. **不要长缓存**：续费后要尽快生效，建议 ≤60s 或不缓存，每次进页面重拉。
+5. 未带平台标识时一律放行（`no_platform`），所以**必须带上 `X-Platform-Id` 才有拦截效果**。
 
