@@ -495,7 +495,7 @@ def normalize_to_context(raw: dict) -> dict:
             result["history_baseline"] = history
         return result
 
-    # (b) Teensing fluctuation/anomaly-warning 真实形状（已对齐 saas.melo.support 接口）
+    # (b) Teensing fluctuation/anomaly-warning 真实形状（已对齐 adminv3.melodong.com 接口）
     #     实体标识：campaign_id（稳定）优先，回退 campaign_name / advertiser_name
     #     环比变化：fluctuation 用 revenue_change；anomaly-warning 无则 None
     entity_id = raw.get("campaign_id") or raw.get("advertiser_id") or raw.get("publisher_id")
