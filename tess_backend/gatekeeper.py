@@ -155,7 +155,24 @@ def validate_tess_output(
             return data
 
         # 5. 幻觉 ID 校验（ID 层屏障）：LLM 返回的 ID 必须存在于算法候选集
-        valid_ids = {c["dimension_value"] for c in input_data.get("top_contributors", [])}
+        valid_ids = set()
+        for c in input_data.get("top_contributors", []) or []:
+            if not isinstance(c, dict):
+                continue
+            if c.get("dimension_value") is not None:
+                valid_ids.add(str(c["dimension_value"]))
+            # top_contributors 里常附带实体名称，一并作为合法归因值
+            for _nkey in ("advertiser_name", "publisher_name"):
+                if c.get(_nkey):
+                    valid_ids.add(str(c[_nkey]))
+        # 真实 anomaly-warning 的 top_contributors 仅含「名称」维度值，但 LLM 常以
+        # campaign_id / publisher_id / advertiser_id 等数字 ID 归因；这些 ID 同样合法，
+        # 一并纳入候选集，避免「归到真实 campaign 7160172 却被判幻觉」的误杀。
+        meta = input_data.get("anomaly_metadata") or {}
+        for _k in ("campaign_id", "publisher_id", "advertiser_id"):
+            _v = meta.get(_k)
+            if _v is not None:
+                valid_ids.add(str(_v))
         returned_id = data.get("primary_contributor_id")
         if returned_id and returned_id not in valid_ids:
             return {

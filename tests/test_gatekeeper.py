@@ -81,6 +81,41 @@ def test_hallucination_id_triggers_circuit_break():
     ]
 
 
+def _real_anomaly_input(campaign_id, publisher_id, name="com.didiglobal.cashloan_MX"):
+    """模拟真实 anomaly-warning 归一化后的 Input：top_contributors 仅含名称维度值，
+    anomaly_metadata 带真实数字 ID（与上游 campaign_id 对应）。"""
+    return {
+        "anomaly_metadata": {
+            "event_id": str(campaign_id),
+            "campaign_id": campaign_id,
+            "publisher_id": publisher_id,
+            "severity": "MEDIUM",
+        },
+        "top_contributors": [
+            {"dimension_type": "Campaign", "dimension_value": name,
+             "publisher_name": "shareit-ioger-kay"},
+        ],
+        "associated_signals": [],
+    }
+
+
+def test_real_anomaly_campaign_id_accepted_as_contributor():
+    # 真实场景：LLM 以 campaign_id 数字归因，该 ID 必须被接纳，不得误判幻觉。
+    # 复现 7160172 那条 INCONCLUSIVE 误杀。
+    inp = _real_anomaly_input(7160172, 1000676)
+    out = validate_tess_output(_valid_llm(0.92, pid="7160172"), inp)
+    assert out["status"] == STATUS_DIAGNOSED
+    assert "不存在的维度" not in out["summary"]
+
+
+def test_real_anomaly_unknown_numeric_id_still_blocked():
+    # 真·幻觉：返回既不在 top_contributors 也不在 anomaly_metadata 的数字 ID -> 仍降级。
+    inp = _real_anomaly_input(7160172, 1000676)
+    out = validate_tess_output(_valid_llm(0.95, pid="9999999"), inp)
+    assert out["status"] == STATUS_INCONCLUSIVE
+    assert "不存在的维度" in out["summary"]
+
+
 def test_severity_injection_triggers_circuit_break():
     # LLM 越权返回 severity 字段 -> 危险字段物理锁死 -> 熔断 INCONCLUSIVE
     # （剪枝式 Gatekeeper 仍保留对 severity/calculated_loss 的无情熔断）
