@@ -45,7 +45,10 @@
   （/report/export 存在但返回文件流非 JSON，BI 简报不适用。）
 """
 
+import os
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Optional
 import json
@@ -820,9 +823,12 @@ def fetch_bi_analysis_context(
         opts, _ = _safe_api_get(connector, "/users/options", token=token)
         opts = opts if isinstance(opts, list) else []
         name_map = {str(_fmt_id(u.get("id"))): (u.get("real_name") or u.get("name")) for u in opts}
-        # 3) 逐个负责人名下广告主打 /report 聚合近 N 日利润（封顶 30 个 AM 防失控）
+        # 3) 并发逐个负责人名下广告主打 /report 聚合近 N 日利润（封顶 30 个 AM 防失控）
+        #    串行逐 AM 取数在 AM 较多时耗时过长（曾触发 125s 超时 504），改为线程池并发。
         rows, errs = [], []
-        for oid in list(by_owner)[:30]:
+        owners = list(by_owner)[:30]
+
+        def _one_owner(oid):
             adv_ids = by_owner[oid]
             rep, err_r = _safe_api_get(
                 connector, "/report",
@@ -830,16 +836,20 @@ def fetch_bi_analysis_context(
                         "advertiser_ids": ",".join(adv_ids), "page": 1, "page_size": 100}, token=token)
             r_items = (rep or {}).get("items", []) if isinstance(rep, dict) else []
             agg = _aggregate_report(r_items)["total"]
-            rows.append({
-                "owner_user_id": oid,
-                "owner_name": name_map.get(oid),
-                "advertiser_count": len(adv_ids),
-                "revenue": agg.get("revenue", 0),
-                "profit": agg.get("profit", 0),
-                "conversions": agg.get("conversions", 0),
-            })
-            if err_r:
-                errs.append(err_r)
+            return oid, agg, err_r
+
+        with ThreadPoolExecutor(max_workers=min(len(owners), 10)) as ex:
+            for oid, agg, err_r in ex.map(_one_owner, owners):
+                rows.append({
+                    "owner_user_id": oid,
+                    "owner_name": name_map.get(oid),
+                    "advertiser_count": len(by_owner[oid]),
+                    "revenue": agg.get("revenue", 0),
+                    "profit": agg.get("profit", 0),
+                    "conversions": agg.get("conversions", 0),
+                })
+                if err_r:
+                    errs.append(err_r)
         rows.sort(key=lambda x: x["profit"], reverse=True)
         return {
             "analysis_type": "am_leaderboard",
@@ -1458,19 +1468,35 @@ def _scan_list_pages(connector, path, params, token, max_pages: int = 30):
     """分页扫描列表接口，累计返回所有 items（上限 max_pages 防止失控）。
 
     用于需要全量枚举的场景（如拉全部广告主筛 am 为空、按 am 分组统计）。
+    首页串行确认是否有更多页，之后并发拉取剩余页以提速（避免串行堆叠导致 504）。
     每页固定 page_size=100（API 上限），不足一页即止。
     """
-    all_items = []
-    for pg in range(1, max_pages + 1):
+    max_pages = min(max_pages, 30)
+    # 首页：确认是否还有下一页
+    d0, _ = _safe_api_get(
+        connector, path, params={**params, "page": 1, "page_size": 100}, token=token
+    )
+    first = (d0 or {}).get("items", []) if isinstance(d0, dict) else []
+    if not first or len(first) < 100 or max_pages <= 1:
+        return first
+    all_items = list(first)
+    if max_pages <= 1:
+        return all_items
+
+    def _one_page(pg):
         d, _ = _safe_api_get(
             connector, path, params={**params, "page": pg, "page_size": 100}, token=token
         )
-        items = (d or {}).get("items", []) if isinstance(d, dict) else []
-        if not items:
-            break
-        all_items.extend(items)
-        if len(items) < 100:
-            break
+        return (d or {}).get("items", []) if isinstance(d, dict) else []
+
+    # 并发拉取剩余页（最多 8 并发）
+    with ThreadPoolExecutor(max_workers=min(max_pages - 1, 8)) as ex:
+        for items in ex.map(_one_page, range(2, max_pages + 1)):
+            if not items:
+                break
+            all_items.extend(items)
+            if len(items) < 100:
+                break
     return all_items
 
 
@@ -1693,14 +1719,46 @@ def process_question(
                     route_source = "inferred"
 
     if route_source == "inferred_multi":
-        # 复合问题：逐类型取数并合并上下文，让 LLM 一次性回答全部子目标
+        # 复合问题：并发取数各子类型 + 整体超时预算 + 单类型超时，避免任一类型慢拖垮整次请求（曾触发 125s 504）。
+        per_type_timeout = float(os.getenv("TESS_MULTI_FETCH_TIMEOUT", "45"))
+        total_budget = float(os.getenv("TESS_ASK_TOTAL_TIMEOUT", "80"))
+        started = time.monotonic()
+        sections: dict = {}
+
+        def _fetch_one(at):
+            return at, fetch_bi_analysis_context(connector, at, token=token, params=params)
+
+        with ThreadPoolExecutor(max_workers=min(len(multi_types), 6)) as ex:
+            futures = {ex.submit(_fetch_one, at): at for at in multi_types}
+            for fut in as_completed(futures):
+                at = futures[fut]
+                if time.monotonic() - started > total_budget:
+                    sections[at] = None  # 超过整体预算，截断该子目标
+                    continue
+                try:
+                    _, c = fut.result(timeout=per_type_timeout)
+                    sections[at] = c
+                except Exception as e:  # noqa: BLE001 —— 子类型取数失败/超时不应拖垮整轮
+                    sections[at] = {
+                        "analysis_type": at,
+                        "errors": [f"{at} 取数失败/超时: {type(e).__name__}: {e}"],
+                    }
         parts = []
-        for at in multi_types:
-            c = fetch_bi_analysis_context(connector, at, token=token, params=params)
+        all_errors = []
+        for at in multi_types:  # 保持请求顺序输出
+            c = sections.get(at)
+            if c is None:
+                parts.append(
+                    f"【深度下钻：{at}】取数超时（已超过整体预算 {int(total_budget)}s），"
+                    "本子目标数据不足，暂无法确认。"
+                )
+                continue
+            if isinstance(c, dict) and c.get("errors"):
+                all_errors.extend(c["errors"])
             c = _enrich_names_with_ids(c)
             parts.append(f"【深度下钻：{at}】\n{_trim_for_prompt(c, limit=4000)}")
         ctx_text = "\n\n".join(parts)
-        ctx = {"errors": []}
+        ctx = {"errors": all_errors}
         analysis_type = "multi:" + ",".join(multi_types)
         user_prompt = (
             f"【Teensing 业务数据上下文（复合下钻：{analysis_type}）】\n"

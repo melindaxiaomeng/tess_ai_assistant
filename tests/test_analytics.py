@@ -280,6 +280,36 @@ def test_process_question_single_intent_still_single_route():
     assert res["context_summary"]["analysis_type"] == "advertisers_missing_owner"
 
 
+def test_scan_list_pages_merges_multiple_pages():
+    """_scan_list_pages 并发扫页后仍完整合并所有 items（含多页 + 末页不满）。"""
+    # 250 个广告主 -> 3 页（100 + 100 + 50）
+    advs = [{"id": i, "name": f"A{i}", "am": (i % 3) + 100} for i in range(250)]
+    c = MockConnector(advertisers=advs)
+    items = analytics._scan_list_pages(c, "/advertisers", {}, "t", max_pages=30)
+    assert len(items) == 250
+    # 顺序不强制，但内容应全
+    ids = {it["id"] for it in items}
+    assert ids == set(range(250))
+
+
+def test_compound_dispatch_survives_subtype_failure():
+    """复合分发的任一子类型取数异常时，应被捕获（转 errors）而非让整轮崩溃。"""
+    class BoomConnector(MockConnector):
+        def api_get(self, path, params=None, token=None):
+            raise RuntimeError("upstream boom")
+
+    llm = MockLLM()
+    # 多意图：应包含 account_profit_rollup + am_leaderboard 等多个子类型
+    res = process_question(
+        "最近两周的利润，哪个AM负责的客户收入利润最高，点击最大但转化最低的，哪些广告主没配AM",
+        BoomConnector(), llm, token="t",
+    )
+    assert res["context_summary"]["route_source"] == "inferred_multi"
+    # 不抛异常，answer 正常返回；errors 应记录到取数失败
+    assert res["answer"]
+    assert res["context_summary"]["errors"]
+
+
 # ---------------------------------------------------------------------------
 # 5) 注册面同步
 # ---------------------------------------------------------------------------
