@@ -252,6 +252,34 @@ def test_process_question_routes_to_am_leaderboard_not_advertiser():
     assert "leaderboard" in llm.last_user
 
 
+def test_process_question_compound_multi_dispatch():
+    """复合问题（一句含 4 个意图）应走 inferred_multi，逐类型取数并合并上下文。"""
+    llm = MockLLM()
+    q = ("帮我总结一下最近两周的利润，然后看看哪个AM负责的客户收入利润最高，"
+         "以及点击最大但是转化率最低；帮我看看哪些广告主没有配置am")
+    res = process_question(q, _connector(), llm, token="t")
+    cs = res["context_summary"]
+    assert cs["route_source"] == "inferred_multi"
+    mts = set(cs["multi_types"])
+    # 4 个意图应全部命中：利润汇总 / AM 排名 / 点击转化极端 / 缺 AM 广告主
+    assert {"account_profit_rollup", "am_leaderboard",
+            "metric_ranking", "advertisers_missing_owner"} <= mts
+    # LLM 应收到合并后的多份上下文（每段都带【深度下钻：...】标记）
+    assert llm.last_user.count("【深度下钻：") == len(mts)
+    assert "account_profit_rollup" in llm.last_user
+    assert "am_leaderboard" in llm.last_user
+    assert "metric_ranking" in llm.last_user
+    assert "advertisers_missing_owner" in llm.last_user
+
+
+def test_process_question_single_intent_still_single_route():
+    """单意图问题不应被误判为复合，保持原 inferred 路由（回归保护）。"""
+    llm = MockLLM()
+    res = process_question("哪些广告主没有配置am", _connector(), llm, token="t")
+    assert res["context_summary"]["route_source"] == "inferred"
+    assert res["context_summary"]["analysis_type"] == "advertisers_missing_owner"
+
+
 # ---------------------------------------------------------------------------
 # 5) 注册面同步
 # ---------------------------------------------------------------------------

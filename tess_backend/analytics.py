@@ -1170,7 +1170,8 @@ _ANALYSIS_KEYWORDS: list = [
     ("publisher_deepdive", ["渠道", "publisher", "媒体质量", "扣量", "作弊", "渠道质量"]),
     ("account_overview", ["账户全景", "整体大盘", "总览", "概览", "全景", "account overview"]),
     ("daily_summary", ["复盘", "每日", "昨日", "昨天", "日报", "今日表现", "daily summary"]),
-    ("account_profit_rollup", ["两周利润", "两周的", "近期利润", "利润汇总", "总利润",
+    ("account_profit_rollup", ["最近两周", "近两周", "近两周利润", "最近两周利润", "两周利润",
+                               "两周的", "近期利润", "利润汇总", "总利润",
                                "整体利润", "全账户利润", "账户利润", "利润总计", "利润总览"]),
     ("scaling_opportunity", ["放量", "扩量", "加预算", "增长机会", "潜力", "机会", "加大投放", "scale"]),
     ("campaign_detail", ["ctit", "etit", "漏斗", "转化时间", "事件质量", "活动详情", "单活动", "campaign详情"]),
@@ -1186,6 +1187,30 @@ _ANALYSIS_KEYWORDS: list = [
     ("owner_performance", ["负责人名下", "am 名下", "bd 名下", "名下客户", "名下广告主", "业绩盘点", "手上的客户", "负责的渠道"]),
     ("kpi_compare", ["环比", "对比", "波动", "暴跌", "暴涨", "趋势", "trend", "对比昨日"]),
 ]
+
+# 通用实体下钻类型：仅作"给我这个实体的明细"兜底。复合问题去重时，
+# 若同业务域已命中更具体的类型（如 am_leaderboard / advertisers_missing_owner /
+# campaign_ranking 等），则抑制这些通用 drill，避免重复取数、干扰 LLM。
+_ANALYSIS_DOMAIN: dict = {
+    "advertisers_missing_owner": "advertiser",
+    "am_leaderboard": "advertiser",
+    "owner_performance": "advertiser",
+    "advertiser_deepdive": "advertiser",
+    "publisher_deepdive": "publisher",
+    "campaign_detail": "campaign",
+    "campaign_ranking": "campaign",
+    "pkg_deepdive": "package",
+    "account_profit_rollup": "account",
+    "account_overview": "account",
+    "metric_ranking": "metric",
+    "finance_check": "finance",
+    "scaling_capacity": "scaling",
+    "scaling_opportunity": "scaling",
+    "traffic_policy_check": "traffic",
+    "daily_summary": "daily",
+    "kpi_compare": "kpi",
+}
+_GENERIC_DRILL = {"advertiser_deepdive", "publisher_deepdive", "campaign_detail", "pkg_deepdive"}
 
 
 def infer_analysis_type(question: str) -> Optional[str]:
@@ -1203,6 +1228,30 @@ def infer_analysis_type(question: str) -> Optional[str]:
             if kw.lower() in q:
                 return atype
     return None
+
+
+def infer_all_analysis_types(question: str) -> list:
+    """与 infer_analysis_type 同表，但返回【所有】命中的 analysis_type（去重、保序）。
+
+    用于复合问题：一句问题含多个意图（如「最近两周利润 + 哪个AM最高 + 点击转化极端 + 缺AM广告主」），
+    单路由只取首个会丢意图；本函数把所有命中类型都返回，由 process_question 逐个取数合并上下文。
+    """
+    if not question:
+        return []
+    q = question.lower()
+    seen, kept_domains, out = set(), set(), []
+    for atype, kws in _ANALYSIS_KEYWORDS:
+        for kw in kws:
+            if kw.lower() in q and atype not in seen:
+                seen.add(atype)
+                dom = _ANALYSIS_DOMAIN.get(atype)
+                # 通用实体下钻：同域已命中更具体类型时抑制
+                if atype in _GENERIC_DRILL and dom in kept_domains:
+                    break
+                kept_domains.add(dom)
+                out.append(atype)
+                break
+    return out
 
 
 def extract_entities(question: str, params: Optional[dict]) -> dict:
@@ -1634,10 +1683,40 @@ def process_question(
         else:
             inferred = infer_analysis_type(question)
             if inferred:
-                analysis_type = inferred
-                route_source = "inferred"
+                all_inferred = infer_all_analysis_types(question)
+                if len(all_inferred) >= 2:
+                    # 复合问题：一句话含多个意图，逐类型取数并合并上下文
+                    route_source = "inferred_multi"
+                    multi_types = all_inferred
+                else:
+                    analysis_type = inferred
+                    route_source = "inferred"
 
-    if route_source:  # ①②③ 走深度上下文（与 /tess/analytics 同一套取数）
+    if route_source == "inferred_multi":
+        # 复合问题：逐类型取数并合并上下文，让 LLM 一次性回答全部子目标
+        parts = []
+        for at in multi_types:
+            c = fetch_bi_analysis_context(connector, at, token=token, params=params)
+            c = _enrich_names_with_ids(c)
+            parts.append(f"【深度下钻：{at}】\n{_trim_for_prompt(c, limit=4000)}")
+        ctx_text = "\n\n".join(parts)
+        ctx = {"errors": []}
+        analysis_type = "multi:" + ",".join(multi_types)
+        user_prompt = (
+            f"【Teensing 业务数据上下文（复合下钻：{analysis_type}）】\n"
+            f"{ctx_text}\n\n"
+            f"【用户问题】\n{question}\n\n"
+            "用户的问题包含多个子目标，上方已分别取数。请逐条回答每一个子目标"
+            "（利润汇总 / AM 排名 / 点击转化极端值 / 缺 AM 广告主等）；"
+            "若某子目标数据仍不足，单独说明该子目标「数据不足，暂无法确认」，不要臆测、不要遗漏其它子目标。"
+        )
+        summary_extra = {
+            "analysis_type": analysis_type,
+            "route_source": route_source,
+            "multi_types": multi_types,
+            "date_or_month": None,
+        }
+    elif route_source:  # ①②③ 走深度上下文（与 /tess/analytics 同一套取数）
         ctx = fetch_bi_analysis_context(connector, analysis_type, token=token, params=params)
         ctx = _enrich_names_with_ids(ctx)  # 名称追加 (id)，便于核对实体
         ctx_text = _trim_for_prompt(ctx, limit=9000)  # 深度上下文更大，放宽截断
