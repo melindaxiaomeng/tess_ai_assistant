@@ -455,6 +455,7 @@ SUPPORTED = (
     "account_overview", "publisher_deepdive", "scaling_capacity",
     "campaign_detail", "advertiser_deepdive", "traffic_policy_check", "kpi_compare",
     "campaign_ranking", "pkg_deepdive", "owner_performance", "cross_dimension",
+    "account_profit_rollup", "am_leaderboard", "advertisers_missing_owner", "metric_ranking",
 )
 
 
@@ -467,7 +468,8 @@ def post_analytics(payload: dict, request: Request) -> dict:
         "analysis_type": "daily_summary" | "scaling_opportunity" | "finance_check"
                          | "account_overview" | "publisher_deepdive" | "scaling_capacity"
                          | "campaign_detail" | "advertiser_deepdive" | "traffic_policy_check" | "kpi_compare"
-                         | "campaign_ranking" | "pkg_deepdive" | "owner_performance" | "cross_dimension",
+                         | "campaign_ranking" | "pkg_deepdive" | "owner_performance" | "cross_dimension"
+                         | "account_profit_rollup" | "am_leaderboard" | "advertisers_missing_owner" | "metric_ranking",
         # cross_dimension 需 params 内 ≥2 个实体 id（campaign_id/advertiser_id/publisher_id/package_name/owner_user_id）
         "params": { "report_month": "2026-08" }   # finance_check 可选
         # 实体下钻可选参数：campaign_id / advertiser_id / publisher_id（如 campaign_detail 需 campaign_id）

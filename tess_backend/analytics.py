@@ -761,13 +761,192 @@ def fetch_bi_analysis_context(
             "errors": [e for e in (err_r,) if e],
         }
 
+    # ---------------------------------------------------------------
+    # 场景 15：全账户利润/营收汇总（近 N 天，按天维度归集）
+    # ---------------------------------------------------------------
+    elif analysis_type == "account_profit_rollup":
+        try:
+            days = int(params.get("days"))
+        except (TypeError, ValueError):
+            days = 14
+        end = today.strftime("%Y-%m-%d")
+        start = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+        report, err_r = _safe_api_get(
+            connector, "/report",
+            params={"dimensions": "date", "date_start": start, "date_end": end,
+                    "page": 1, "page_size": 100}, token=token)
+        r_items = (report or {}).get("items", []) if isinstance(report, dict) else []
+        # /report dimensions=date 返回每日一行（账户级，无需指定实体）；
+        # 若上游不支持无实体过滤则返回空，errors 里体现，由 LLM 如实告知数据不足。
+        daily, tot = [], {"revenue": 0.0, "profit": 0.0, "payout": 0.0, "clicks": 0, "conversions": 0}
+        for it in r_items:
+            rev = _to_float(it.get("revenue")); pr = _to_float(it.get("profit"))
+            po = _to_float(it.get("payout")); cl = int(_to_float(it.get("clicks")))
+            cv = int(_to_float(it.get("conversions")))
+            tot["revenue"] += rev; tot["profit"] += pr; tot["payout"] += po
+            tot["clicks"] += cl; tot["conversions"] += cv
+            daily.append({"date": it.get("date"), "revenue": round(rev, 2),
+                          "profit": round(pr, 2), "clicks": cl, "conversions": cv})
+        return {
+            "analysis_type": "account_profit_rollup",
+            "time_range": f"{start} ~ {end}",
+            "days": days,
+            "metric_note": "全账户利润/营收汇总：经 /report(dimensions=date) 按天归集，不限定单一实体；"
+                           "若上游在无实体过滤时返回空，则无法汇总（属接口限制，非逻辑缺陷）。",
+            "total": {k: round(v, 2) if isinstance(v, float) else v for k, v in tot.items()},
+            "daily": daily,
+            "errors": [err_r] if err_r else [],
+        }
+
+    # ---------------------------------------------------------------
+    # 场景 16：跨 AM/BD 负责人业绩排名（哪个负责人名下客户收入/利润最高）
+    # ---------------------------------------------------------------
+    elif analysis_type == "am_leaderboard":
+        try:
+            days = int(params.get("days"))
+        except (TypeError, ValueError):
+            days = 7
+        end = today.strftime("%Y-%m-%d")
+        start = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+        # 1) 全量扫描广告主，按 am 字段分组
+        advs = _scan_list_pages(connector, "/advertisers", {}, token, max_pages=30)
+        by_owner = defaultdict(list)
+        for it in advs:
+            oid = _coerce_owner_id(it.get("am"))
+            if oid is None:
+                continue
+            by_owner[str(oid)].append(_fmt_id(it.get("id")))
+        # 2) 解析 am 名称（/users/options 覆盖有限）
+        opts, _ = _safe_api_get(connector, "/users/options", token=token)
+        opts = opts if isinstance(opts, list) else []
+        name_map = {str(_fmt_id(u.get("id"))): (u.get("real_name") or u.get("name")) for u in opts}
+        # 3) 逐个负责人名下广告主打 /report 聚合近 N 日利润（封顶 30 个 AM 防失控）
+        rows, errs = [], []
+        for oid in list(by_owner)[:30]:
+            adv_ids = by_owner[oid]
+            rep, err_r = _safe_api_get(
+                connector, "/report",
+                params={"dimensions": "advertiser", "date_start": start, "date_end": end,
+                        "advertiser_ids": ",".join(adv_ids), "page": 1, "page_size": 100}, token=token)
+            r_items = (rep or {}).get("items", []) if isinstance(rep, dict) else []
+            agg = _aggregate_report(r_items)["total"]
+            rows.append({
+                "owner_user_id": oid,
+                "owner_name": name_map.get(oid),
+                "advertiser_count": len(adv_ids),
+                "revenue": agg.get("revenue", 0),
+                "profit": agg.get("profit", 0),
+                "conversions": agg.get("conversions", 0),
+            })
+            if err_r:
+                errs.append(err_r)
+        rows.sort(key=lambda x: x["profit"], reverse=True)
+        return {
+            "analysis_type": "am_leaderboard",
+            "time_range": f"{start} ~ {end}",
+            "total_owners_scanned": len(by_owner),
+            "owners_ranked": len(rows),
+            "metric_note": "跨负责人排名：先全量扫描 /advertisers 按 am 字段分组，再逐个负责人名下广告主打 "
+                           "/report 聚合近 N 日利润。仅排序前 30 个负责人（防 API 爆炸）；am 名称经 "
+                           "/users/options 解析，覆盖不全时显示 user id。",
+            "leaderboard": rows[:15],
+            "errors": errs,
+        }
+
+    # ---------------------------------------------------------------
+    # 场景 17：反向枚举——未配置 AM/BD 负责人的广告主
+    # ---------------------------------------------------------------
+    elif analysis_type == "advertisers_missing_owner":
+        advs = _scan_list_pages(connector, "/advertisers", {}, token, max_pages=30)
+        missing = []
+        for it in advs:
+            if _coerce_owner_id(it.get("am")) is None:
+                missing.append({
+                    "advertiser_id": _fmt_id(it.get("id")),
+                    "advertiser_name": it.get("name"),
+                    "status": it.get("status"),
+                })
+        return {
+            "analysis_type": "advertisers_missing_owner",
+            "scanned_total": len(advs),
+            "missing_owner_count": len(missing),
+            "metric_note": "反向枚举：全量扫描 /advertisers，筛 am 字段为空（None/0/空）的广告主。"
+                           "扫描上限 30 页=3000 个广告主。",
+            "missing_advertisers": missing[:50],
+            "errors": [],
+        }
+
+    # ---------------------------------------------------------------
+    # 场景 18：指标极端排名（点击最大 / 转化率最低 等）
+    # ---------------------------------------------------------------
+    elif analysis_type == "metric_ranking":
+        try:
+            days = int(params.get("days"))
+        except (TypeError, ValueError):
+            days = 7
+        end = today.strftime("%Y-%m-%d")
+        start = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+        report, err_r = _safe_api_get(
+            connector, "/report",
+            params={"dimensions": "campaign", "date_start": start, "date_end": end,
+                    "page": 1, "page_size": 100}, token=token)
+        r_items = (report or {}).get("items", []) if isinstance(report, dict) else []
+        # 分页扫描（封顶 10 页=1000 行，非全量 Campaign）
+        for pg in range(2, 11):
+            more, _ = _safe_api_get(
+                connector, "/report",
+                params={"dimensions": "campaign", "date_start": start, "date_end": end,
+                        "page": pg, "page_size": 100}, token=token)
+            its = (more or {}).get("items", []) if isinstance(more, dict) else []
+            if not its:
+                break
+            r_items.extend(its)
+            if len(its) < 100:
+                break
+        # 合并为每 Campaign 累计，计算 CVR=conversions/clicks
+        camp = {}
+        for it in r_items:
+            cid = _fmt_id(it.get("campaign_id"))
+            if not cid:
+                continue
+            c = camp.setdefault(cid, {"campaign_id": cid, "campaign_name": it.get("campaign_name"),
+                                      "clicks": 0, "conversions": 0, "revenue": 0.0, "profit": 0.0})
+            c["clicks"] += int(_to_float(it.get("clicks")))
+            c["conversions"] += int(_to_float(it.get("conversions")))
+            c["revenue"] += _to_float(it.get("revenue"))
+            c["profit"] += _to_float(it.get("profit"))
+        for c in camp.values():
+            c["cvr"] = round(c["conversions"] / c["clicks"], 4) if c["clicks"] else 0.0
+            c["revenue"] = round(c["revenue"], 2)
+            c["profit"] = round(c["profit"], 2)
+        camps_sorted = list(camp.values())
+        top_clicks = sorted(camps_sorted, key=lambda x: x["clicks"], reverse=True)[:10]
+        with_clicks = [c for c in camps_sorted if c["clicks"] > 0]
+        bottom_cvr = sorted(with_clicks, key=lambda x: x["cvr"])[:10]
+        top_click_ids = {c["campaign_id"] for c in top_clicks}
+        high_click_low_cvr = [c for c in bottom_cvr if c["campaign_id"] in top_click_ids]
+        return {
+            "analysis_type": "metric_ranking",
+            "time_range": f"{start} ~ {end}",
+            "scanned_campaign_rows": len(r_items),
+            "metric_note": "指标极端排名：/report(dimensions=campaign) 按天归集后合并为每 Campaign 累计，"
+                           "计算 CVR=conversions/clicks。扫描上限 10 页=1000 行（非全量 Campaign）；"
+                           "点击榜取前 10，转化最低榜取 CVR 最低前 10（仅含有效点击）。"
+                           "高点击低转化=同时出现在两榜的 Campaign。",
+            "top_by_clicks": top_clicks,
+            "lowest_cvr": bottom_cvr,
+            "high_click_low_cvr": high_click_low_cvr,
+            "errors": [err_r] if err_r else [],
+        }
+
     else:
         raise ValueError(
             f"未知的 analysis_type={analysis_type!r}；"
             "支持: daily_summary / scaling_opportunity / finance_check / account_overview / "
             "publisher_deepdive / scaling_capacity / campaign_detail / advertiser_deepdive / "
             "traffic_policy_check / kpi_compare / campaign_ranking / pkg_deepdive / "
-            "owner_performance / cross_dimension"
+            "owner_performance / cross_dimension / account_profit_rollup / am_leaderboard / "
+            "advertisers_missing_owner / metric_ranking"
         )
 
 
@@ -874,6 +1053,10 @@ def _build_user_prompt(analysis_type: str, ctx: dict) -> str:
         "pkg_deepdive": "以下是该包名在系统中的归属（广告主/渠道映射）与近 7 日跨 Campaign 营收/利润/Margin 表现，请分析该包的跑量情况、主要投放渠道与转化效率，并说明数据口径（来自 pkg-maps 归因 + /report 聚合，非单 campaign 视角）。",
         "owner_performance": "以下是该 AM/BD 负责人名下所有广告主近 7 日的消耗与利润表现，请汇总其业绩（总营收/利润、头部广告主、异常项），并说明数据口径（/advertisers?am|bd= 解析名下广告主 + /report 聚合）。",
         "cross_dimension": "以下是多个实体维度的交叉切片（近 7 日，各维度取交集 AND）。请围绕【交叉维度】作答：先说明本次是哪几个维度交叉、过滤后样本量，再给出联合视角下的营收/利润/Margin、头部明细（用表格），并指出交叉后暴露的结构性问题（如某广告主在某渠道集中、某负责人客户转化差）。数据口径：package 经 pkg-maps 归因到广告主、owner 经 /advertisers?am|bd= 归因到名下广告主，再与显式 advertiser_id 取交集后联合打 /report。",
+        "account_profit_rollup": "以下是全账户近 N 天（按天维度）的利润/营收/点击/转化汇总，含每日明细与总计。请输出账户级利润复盘：先给总计（营收/利润/消耗/点击/转化），再列每日走势，指出盈利与否与异常日。数据口径：/report(dimensions=date) 账户级归集，不限单一实体。",
+        "am_leaderboard": "以下是跨 AM/BD 负责人的业绩排名（按近 N 日利润排序），含每个负责人的广告主数、营收、利润。请输出负责人业绩榜：先给 Top 负责人（带 owner id/名称），指出收入利润最高的负责人，再说明数据口径（全量 /advertisers 按 am 分组 + /report 聚合，仅排前 30 个负责人，am 名称可能仅显示 id）。",
+        "advertisers_missing_owner": "以下是未配置 AM 负责人的广告主清单（反向枚举）。请直接列出缺失 AM 的广告主（id + 名称），给出缺失数量与扫描总量，并建议运营补全负责人配置。数据口径：全量扫描 /advertisers，筛 am 为空。",
+        "metric_ranking": "以下是 Campaign 维度的指标极端排名：点击榜 Top10、转化率(CVR)最低 Top10，以及同时高点击低转化的 Campaign。请找出「点击最大但转化最低」的 Campaign（用 campaign_id），说明其点击量与 CVR，并给出优化建议。数据口径：/report(dimensions=campaign) 合并每 Campaign 累计，CVR=conversions/clicks，扫描上限 1000 行非全量。",
     }.get(analysis_type, "请基于以下数据做商业分析。")
 
     return (
@@ -970,21 +1153,35 @@ ANALYSIS_TYPES = {
     "pkg_deepdive",
     "owner_performance",
     "cross_dimension",
+    "account_profit_rollup",
+    "am_leaderboard",
+    "advertisers_missing_owner",
+    "metric_ranking",
 }
 
 # 关键词路由表（优先级自上而下：先匹配更具体的类型）。
 # 英文关键词统一小写匹配；中文不区分大小写。
 _ANALYSIS_KEYWORDS: list = [
+    # 反向枚举优先于「广告主」通用词：避免「哪些广告主没有配置am」被 advertiser_deepdive 抢走
+    ("advertisers_missing_owner", ["没有配置am", "未配置am", "哪些广告主没有", "未分配am",
+                                   "am为空", "没有负责人", "没有配置负责人", "缺am", "没有am"]),
     ("scaling_capacity", ["容量", "cap", "放量空间", "还能放", "预算上限", "放量容量", "容量评估"]),
     ("finance_check", ["对账", "毛利", "结算", "营收核对", "对账差异", "月报", "财务", "month", "invoice"]),
     ("publisher_deepdive", ["渠道", "publisher", "媒体质量", "扣量", "作弊", "渠道质量"]),
     ("account_overview", ["账户全景", "整体大盘", "总览", "概览", "全景", "account overview"]),
     ("daily_summary", ["复盘", "每日", "昨日", "昨天", "日报", "今日表现", "daily summary"]),
+    ("account_profit_rollup", ["两周利润", "两周的", "近期利润", "利润汇总", "总利润",
+                               "整体利润", "全账户利润", "账户利润", "利润总计", "利润总览"]),
     ("scaling_opportunity", ["放量", "扩量", "加预算", "增长机会", "潜力", "机会", "加大投放", "scale"]),
     ("campaign_detail", ["ctit", "etit", "漏斗", "转化时间", "事件质量", "活动详情", "单活动", "campaign详情"]),
+    # am_leaderboard 必须排在 advertiser_deepdive 之前：「哪个AM负责的客户」会命中 advertiser_deepdive 的「客户」词
+    ("am_leaderboard", ["哪个am", "am排名", "am业绩", "业绩排行", "am排行", "谁的利润最高",
+                        "am业绩排名", "业绩最高", "am业绩排行", "am业绩盘点"]),
     ("advertiser_deepdive", ["广告主", "advertiser", "主户", "客户"]),
     ("traffic_policy_check", ["替换渠道", "切量", "切流量", "流量策略", "屏蔽", "block", "replace", "映射", "渠道映射"]),
     ("campaign_ranking", ["利润环比下滑", "利润下滑", "营收下滑", "环比下滑", "下滑最快", "跌幅最大", "掉得最快", "降幅最大", "哪个campaign", "哪个活动", "哪个 campaign", "谁掉得最快", "利润下降最快", "营收下降最快"]),
+    ("metric_ranking", ["点击最大", "点击最高", "转化率最低", "转化最低", "高点击低转化",
+                        "点击和转化", "点击榜", "转化榜", "点击最多转化最差"]),
     ("pkg_deepdive", ["包名", "这个包", "应用包", "包的表现", "包跑量", "package", "pkg"]),
     ("owner_performance", ["负责人名下", "am 名下", "bd 名下", "名下客户", "名下广告主", "业绩盘点", "手上的客户", "负责的渠道"]),
     ("kpi_compare", ["环比", "对比", "波动", "暴跌", "暴涨", "趋势", "trend", "对比昨日"]),
@@ -1189,6 +1386,43 @@ def _find_in_list(connector, path, name, token, id_field="id", name_field="name"
         if len(items) < 100:
             break
     return None
+
+
+def _coerce_owner_id(v):
+    """把 advertiser 记录里的 am/bd 字段归一化为整型 user id（或 None）。
+
+    Teensing 接口 am/bd 可能是 int、dict（含 id 子字段）、字符串或缺失，统一处理：
+    缺失 / 空 / 0 -> None；dict -> 取 id；其余尝试转 int。
+    """
+    if v is None or v == "" or v == 0:
+        return None
+    if isinstance(v, dict):
+        return _coerce_owner_id(v.get("id") or v.get("user_id"))
+    try:
+        iv = int(v)
+    except (TypeError, ValueError):
+        return None
+    return iv if iv != 0 else None
+
+
+def _scan_list_pages(connector, path, params, token, max_pages: int = 30):
+    """分页扫描列表接口，累计返回所有 items（上限 max_pages 防止失控）。
+
+    用于需要全量枚举的场景（如拉全部广告主筛 am 为空、按 am 分组统计）。
+    每页固定 page_size=100（API 上限），不足一页即止。
+    """
+    all_items = []
+    for pg in range(1, max_pages + 1):
+        d, _ = _safe_api_get(
+            connector, path, params={**params, "page": pg, "page_size": 100}, token=token
+        )
+        items = (d or {}).get("items", []) if isinstance(d, dict) else []
+        if not items:
+            break
+        all_items.extend(items)
+        if len(items) < 100:
+            break
+    return all_items
 
 
 def _aggregate_report(items):
