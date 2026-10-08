@@ -73,6 +73,14 @@ class MockLLM:
         self.calls += 1
         return "（Mock LLM 简报）"
 
+    def stream(self, system, user):
+        self.last_system = system
+        self.last_user = user
+        self.calls += 1
+        text = "（Mock LLM 简报）"
+        for i in range(0, len(text), 3):
+            yield text[i:i + 3]
+
 
 # ---------------------------------------------------------------------------
 # 测试数据
@@ -308,6 +316,151 @@ def test_compound_dispatch_survives_subtype_failure():
     # 不抛异常，answer 正常返回；errors 应记录到取数失败
     assert res["answer"]
     assert res["context_summary"]["errors"]
+
+
+# ---------------------------------------------------------------------------
+# 4.5) SSE 流式回调：on_progress / on_context_ready / on_token
+# ---------------------------------------------------------------------------
+
+def test_process_question_compound_emits_progress_and_tokens():
+    """复合问题：on_progress 应覆盖每个子类型（index/total），on_token 应逐块推送。"""
+    llm = MockLLM()
+    progress = []
+    tokens = []
+
+    def on_progress(stage, label, index, total):
+        progress.append((stage, index, total))
+
+    def on_token(text):
+        tokens.append(text)
+
+    q = ("帮我总结一下最近两周的利润，然后看看哪个AM负责的客户收入利润最高，"
+         "以及点击最大但是转化率最低；帮我看看哪些广告主没有配置am")
+    res = process_question(q, _connector(), llm, token="t",
+                           on_progress=on_progress, on_token=on_token)
+    cs = res["context_summary"]
+    assert cs["route_source"] == "inferred_multi"
+    n = len(cs["multi_types"])
+    # 每个子类型各推一次 progress，total 均为 n
+    assert len(progress) == n
+    assert all(t == n for _, _, t in progress)
+    # index 应为 1..n 覆盖
+    assert {idx for _, idx, _ in progress} == set(range(1, n + 1))
+    # on_token 被调用，且拼接后等于最终 answer
+    assert tokens
+    assert "".join(tokens) == res["answer"]
+
+
+def test_process_question_single_route_emits_one_progress():
+    """单意图问题：on_progress 应只推一次（index=1,total=1）。"""
+    llm = MockLLM()
+    progress = []
+    res = process_question("哪些广告主没有配置am", _connector(), llm, token="t",
+                           on_progress=lambda s, l, i, t: progress.append((s, i, t)))
+    assert res["context_summary"]["route_source"] == "inferred"
+    assert len(progress) == 1
+    assert progress[0][0] == "advertisers_missing_owner"
+    assert progress[0][1] == 1 and progress[0][2] == 1
+
+
+def test_process_question_stream_falls_back_without_stream():
+    """llm 无 stream 方法时（仅 complete），不应调用 on_token，但 answer 正常产出。"""
+    class NoStreamLLM:
+        def complete(self, system, user, json_mode=False):
+            return "plain answer"
+
+    tokens = []
+    res = process_question("哪些广告主没有配置am", _connector(), NoStreamLLM(), token="t",
+                           on_token=lambda t: tokens.append(t))
+    assert res["answer"] == "plain answer"
+    assert tokens == []  # 无 stream 方法 -> 不推 token
+
+
+def test_tess_agent_mock_client_stream_yields_and_joins():
+    """tess_agent.MockLLMClient.stream 应逐块吐字，拼接后等于 complete。"""
+    from tess_backend.tess_agent import MockLLMClient
+
+    client = MockLLMClient({"answer": "hello world"})
+    chunks = list(client.stream("sys", "user"))
+    assert "".join(chunks) == client.complete("sys", "user")
+    assert len(chunks) >= 1  # 至少切成一块
+
+
+def test_tess_agent_http_client_has_stream():
+    """HttpLLMClient 应提供 stream 方法（真实流式由线上验证，这里只校验可调用）。"""
+    from tess_backend.tess_agent import HttpLLMClient
+
+    c = HttpLLMClient("https://api.deepseek.com/v1", "fake-key", "deepseek-chat")
+    assert callable(getattr(c, "stream", None))
+
+
+# ---------------------------------------------------------------------------
+# 6) /tess/ask 端点：SSE 内容协商 + 帧顺序（HTTP 层）
+# ---------------------------------------------------------------------------
+
+def _parse_sse(text):
+    """把 SSE 文本解析成事件 dict 列表（同前端 tessAskStream 的解析逻辑）。"""
+    events = []
+    buf = ""
+    for raw in text.split("\n\n"):
+        raw = raw.strip()
+        if not raw.startswith("data:"):
+            continue
+        events.append(json.loads(raw[5:].strip()))
+    return events
+
+
+def test_ask_sse_stream_emits_ordered_frames():
+    """带 Accept: text/event-stream -> SSE 流式，帧顺序 start/progress/context_ready/token/done。"""
+    from tess_backend import app as app_module
+    from fastapi.testclient import TestClient
+
+    app_module._require_ai_entitlement = lambda req: None
+    app_module.get_data_connector = lambda: _connector()
+    app_module._get_llm_client = lambda pid: MockLLM()
+    app_module._resolve_access_token = lambda req, pid: ("", "system")
+    app_module._platform_id = lambda req: "default"
+    app_module._operator_id = lambda req: "anonymous"
+
+    client = TestClient(app_module.app)
+    r = client.post(
+        "/tess/ask",
+        json={"question": "哪些广告主没有配置am"},
+        headers={"Accept": "text/event-stream"},
+    )
+    assert r.status_code == 200
+    assert "text/event-stream" in r.headers.get("content-type", "")
+    events = _parse_sse(r.text)
+    types = [e["type"] for e in events]
+    assert types[0] == "start"
+    assert "progress" in types and types.count("progress") == 1
+    assert "context_ready" in types
+    assert "token" in types
+    assert types[-1] == "done"
+    done = [e for e in events if e["type"] == "done"][0]
+    assert done["answer"]
+    # token 拼接应等于 done.answer
+    assert "".join(e["text"] for e in events if e["type"] == "token") == done["answer"]
+
+
+def test_ask_non_stream_returns_json():
+    """不带 Accept -> 保持原 JSON 返回（向后兼容 / 既有集成测试）。"""
+    from tess_backend import app as app_module
+    from fastapi.testclient import TestClient
+
+    app_module._require_ai_entitlement = lambda req: None
+    app_module.get_data_connector = lambda: _connector()
+    app_module._get_llm_client = lambda pid: MockLLM()
+    app_module._resolve_access_token = lambda req, pid: ("", "system")
+    app_module._platform_id = lambda req: "default"
+    app_module._operator_id = lambda req: "anonymous"
+
+    client = TestClient(app_module.app)
+    r = client.post("/tess/ask", json={"question": "哪些广告主没有配置am"})
+    assert r.status_code == 200
+    body = r.json()
+    assert "answer" in body
+    assert body["context_summary"]["route_source"] == "inferred"
 
 
 # ---------------------------------------------------------------------------

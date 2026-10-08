@@ -11,7 +11,7 @@ import json
 import logging
 import re
 import time
-from typing import List, Optional, Protocol, runtime_checkable
+from typing import Iterator, List, Optional, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,14 @@ class LLMClient(Protocol):
     def complete(self, system: str, user: str) -> str:
         ...
 
+    def stream(self, system: str, user: str) -> Iterator[str]:
+        """流式生成，逐块 yield 文本片段（OpenAI 兼容 SSE delta）。
+
+        非流式后端可简单 yield 一次完整文本；消费方（analytics）已对缺失 stream
+        做兜底（回退 complete），因此实现可选但建议提供。
+        """
+        ...
+
 
 class MockLLMClient:
     """测试 / 本地开发用的假 LLM。
@@ -115,6 +123,14 @@ class MockLLMClient:
         payload = self._responses[self._idx]
         self._idx += 1
         return json.dumps(payload, ensure_ascii=False)
+
+    def stream(self, system: str, user: str) -> Iterator[str]:
+        """测试用：把 complete 结果切成若干片段逐块吐出，便于验证 token 回调。"""
+        self.calls += 1
+        text = self.complete(system, user)
+        step = max(1, len(text) // 3) or 1
+        for i in range(0, len(text), step):
+            yield text[i:i + step]
 
 
 class HttpLLMClient:
@@ -177,6 +193,70 @@ class HttpLLMClient:
             "total_tokens": u.get("total_tokens"),
         }
         return data["choices"][0]["message"]["content"]
+
+    def stream(self, system: str, user: str) -> Iterator[str]:
+        """流式生成（OpenAI 兼容 /chat/completions，已验证 DeepSeek）。
+
+        以 stream=true 发起请求，按 SSE `data: {...}` 逐行解析，yield
+        choices[0].delta.content。结束时回填 last_usage。任何网络/解析异常都向上抛出，
+        由 analytics 的兜底逻辑回退到 complete()，保证总能产出答案。
+        """
+        if not self.api_key:
+            raise RuntimeError("HttpLLMClient 缺少 API Key，无法调用真实 LLM")
+        import urllib.request
+        import urllib.error
+
+        body: dict = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.1,
+            "stream": True,
+        }
+        req = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+                "Accept": "text/event-stream",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                usage: dict = {}
+                for raw in resp:
+                    line = raw.decode("utf-8", "ignore").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    u = chunk.get("usage")
+                    if isinstance(u, dict):
+                        usage = u
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    piece = (choices[0].get("delta") or {}).get("content")
+                    if piece:
+                        yield piece
+                if usage:
+                    self.last_usage = {
+                        "prompt_tokens": usage.get("prompt_tokens"),
+                        "completion_tokens": usage.get("completion_tokens"),
+                        "total_tokens": usage.get("total_tokens"),
+                    }
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "ignore")
+            raise RuntimeError(f"LLM HTTP {e.code}: {detail[:500]}") from e
 
 
 def llm_last_usage(llm) -> Optional[dict]:

@@ -1621,6 +1621,30 @@ def _trim_for_prompt(ctx: dict, limit: int = 6000) -> str:
     return text
 
 
+# 各分析类型对应的中文进度标签（SSE progress 事件 label 用）
+_STAGE_LABELS: dict = {
+    "daily_summary": "每日复盘",
+    "scaling_opportunity": "放量机会",
+    "finance_check": "财务对账",
+    "account_overview": "账户全景",
+    "publisher_deepdive": "渠道下钻",
+    "scaling_capacity": "放量容量",
+    "campaign_detail": "活动详情",
+    "advertiser_deepdive": "广告主下钻",
+    "traffic_policy_check": "流量策略",
+    "kpi_compare": "环比对比",
+    "campaign_ranking": "利润下滑排名",
+    "pkg_deepdive": "包名下钻",
+    "owner_performance": "负责人业绩",
+    "cross_dimension": "交叉维度",
+    "account_profit_rollup": "全账户利润汇总",
+    "am_leaderboard": "AM 排名",
+    "advertisers_missing_owner": "缺 AM 广告主",
+    "metric_ranking": "点击/转化极端排名",
+    "global_context": "全局态势上下文",
+}
+
+
 def process_question(
     question: str,
     connector,
@@ -1632,6 +1656,9 @@ def process_question(
     analysis_type: Optional[str] = None,
     history: Optional[str] = None,
     history_entities: Optional[dict] = None,
+    on_progress=None,
+    on_context_ready=None,
+    on_token=None,
 ) -> dict:
     """端到端执行一次自然语言问答，支持深度下钻。
 
@@ -1723,26 +1750,35 @@ def process_question(
         per_type_timeout = float(os.getenv("TESS_MULTI_FETCH_TIMEOUT", "45"))
         total_budget = float(os.getenv("TESS_ASK_TOTAL_TIMEOUT", "80"))
         started = time.monotonic()
+        total = len(multi_types)
         sections: dict = {}
 
         def _fetch_one(at):
             return at, fetch_bi_analysis_context(connector, at, token=token, params=params)
 
-        with ThreadPoolExecutor(max_workers=min(len(multi_types), 6)) as ex:
+        with ThreadPoolExecutor(max_workers=min(total, 6)) as ex:
             futures = {ex.submit(_fetch_one, at): at for at in multi_types}
             for fut in as_completed(futures):
                 at = futures[fut]
+                idx = multi_types.index(at) + 1
+                label = _STAGE_LABELS.get(at, at)
                 if time.monotonic() - started > total_budget:
                     sections[at] = None  # 超过整体预算，截断该子目标
+                    if on_progress:
+                        on_progress(at, f"{label}（超时，数据不足）", idx, total)
                     continue
                 try:
                     _, c = fut.result(timeout=per_type_timeout)
                     sections[at] = c
+                    if on_progress:
+                        on_progress(at, label, idx, total)
                 except Exception as e:  # noqa: BLE001 —— 子类型取数失败/超时不应拖垮整轮
                     sections[at] = {
                         "analysis_type": at,
                         "errors": [f"{at} 取数失败/超时: {type(e).__name__}: {e}"],
                     }
+                    if on_progress:
+                        on_progress(at, f"{label}（失败）", idx, total)
         parts = []
         all_errors = []
         for at in multi_types:  # 保持请求顺序输出
@@ -1775,6 +1811,8 @@ def process_question(
             "date_or_month": None,
         }
     elif route_source:  # ①②③ 走深度上下文（与 /tess/analytics 同一套取数）
+        if on_progress:
+            on_progress(analysis_type, _STAGE_LABELS.get(analysis_type, analysis_type), 1, 1)
         ctx = fetch_bi_analysis_context(connector, analysis_type, token=token, params=params)
         ctx = _enrich_names_with_ids(ctx)  # 名称追加 (id)，便于核对实体
         ctx_text = _trim_for_prompt(ctx, limit=9000)  # 深度上下文更大，放宽截断
@@ -1790,6 +1828,8 @@ def process_question(
             "date_or_month": ctx.get("date") or ctx.get("report_month") or ctx.get("time_range"),
         }
     else:  # ③ 浅层全局兜底（保持原行为）
+        if on_progress:
+            on_progress("global_context", _STAGE_LABELS.get("global_context", "全局态势上下文"), 1, 1)
         ctx = fetch_qa_context(connector, token=token, question=question)
         ctx = _enrich_names_with_ids(ctx)  # 名称追加 (id)，便于核对实体
         ctx_text = _trim_for_prompt(ctx, limit=6000)
@@ -1808,7 +1848,22 @@ def process_question(
             f"{history}\n\n"
         ) + user_prompt
 
-    answer = llm.complete(ASK_SYSTEM_PROMPT, user_prompt, json_mode=False)
+    if on_context_ready:
+        on_context_ready()
+
+    # LLM 生成：若提供 on_token 且客户端支持流式（有 stream 方法），则逐块吐字；
+    # 否则回退普通 complete。流式过程任意异常都回退 complete，保证总能产出答案。
+    if on_token and hasattr(llm, "stream"):
+        _chunks: list = []
+        try:
+            for _tok in llm.stream(ASK_SYSTEM_PROMPT, user_prompt):
+                _chunks.append(_tok)
+                on_token(_tok)
+            answer = "".join(_chunks)
+        except Exception:  # noqa: BLE001
+            answer = llm.complete(ASK_SYSTEM_PROMPT, user_prompt, json_mode=False)
+    else:
+        answer = llm.complete(ASK_SYSTEM_PROMPT, user_prompt, json_mode=False)
     context_summary = {
         "endpoint": "/tess/ask",
         "errors": ctx.get("errors", []),

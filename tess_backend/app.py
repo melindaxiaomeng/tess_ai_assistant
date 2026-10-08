@@ -13,12 +13,15 @@ import hmac
 import os
 import re
 import time
+import json
+import threading
+from queue import Queue
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import text
 
 from .orchestrator import run_diagnosis
@@ -537,42 +540,17 @@ def post_analytics(payload: dict, request: Request) -> dict:
 
 
 @app.post("/tess/ask")
-def post_ask(payload: dict, request: Request) -> dict:
+def post_ask(payload: dict, request: Request):
     """Tess AI Assistant 自然语言问答接口。
 
-    请求体：
-      {
-        "question": "自然语言问题（如：昨天营收为什么跌了？哪些 Campaign 最赚钱？）",
-        "chat_id": "可选，多轮会话 ID；首次由前端生成并原样带回即可开启多轮指代消解；留空则单轮",
-        "analysis_type": "campaign_detail" | ...   # 可选：显式深度下钻类型（前端胶囊透传，支持 14 种含 cross_dimension）
-        "params": { "report_month": "2026-08" }  # 可选：随 analysis_type 透传（如财务对账月份）
-        # 实体下钻可选参数（也可放在 params 里）：campaign_id / advertiser_id / publisher_id
-      }
-    请求头（鉴权与按权限取数，同 /tess/analytics）：
-      - X-API-Key        : Tess<->saas 共享密钥（网关注入，生产设了 TESS_API_KEY 后必带）
-      - X-Teensing-Token : 运营 SaaS access_token（按人取数，最高优先级；Tess 原样转发给 saas_v3.0，
-                           按该运营 RBAC 返回数据，各运营各看各的）
-      - X-Platform-Id    : 平台标识（落库打标 / 报表隔离 / 按平台选 llm_api_key，与取数无关）；
-                           未带运营 token 时回退全局 TESS_SYSTEM_TOKEN（后端配置，前端不接触）；
-                           生产连接器下两者皆无 -> 400
-      - X-Operator-Id    : 可选，审计归因
-    深度下钻说明：
-      - 路由优先级：① 显式 analysis_type（前端胶囊透传）> ② 问题正则识别实体 id（如
-        "5845554camp"/"ctit" -> campaign_detail，自动抽取 campaign_id；"广告主 1000734" -> advertiser_deepdive）
-        > ③ 关键词映射到深度类型 > ④ 都不命中退回浅层全局上下文；
-      - 传了非法 analysis_type -> 400。
-    返回：
-      {
-        "answer": "Markdown 回答",
-        "result": "<同 answer>",     # 兼容调用方 .answer/.result/.data 取值
-        "data":   "<同 answer>",
-        "context_summary": {
-          "errors", "operator_id", "token_mode",
-          "analysis_type",   # 仅深度下钻时存在：实际使用的分析类型
-          "route_source",    # 仅深度下钻时存在："explicit"(前端透传) | "entity"(问题正则识别 id) | "inferred"(后端关键词)
-          "date_or_month"    # 仅深度下钻时存在：日期/月份/时间范围
-        }
-      }
+    请求体 / 鉴权头 / 深度下钻路由优先级：与旧版完全一致（见源码历史 docstring）。
+
+    响应模式（内容协商）：
+      - 客户端在请求头带 ``Accept: text/event-stream``，或 body 带 ``"stream": true``
+        -> SSE 流式（事件协议见 docs/tess_ask_sse_frontend.md）：
+        start -> progress（每个子类型取数完成）-> context_ready -> token（LLM 逐字）
+        -> done（answer + context_summary + elapsed_ms）；中途异常 -> error。
+      - 否则（含既有调用方 / 集成测试）-> 保持原 JSON 返回，向后兼容。
     """
     _require_ai_entitlement(request)  # 付费授权闸门：到期/停用 -> 403
     question = (payload or {}).get("question")
@@ -608,49 +586,119 @@ def post_ask(payload: dict, request: Request) -> dict:
             status_code=400,
             detail="生产数据接入需取数凭据：运营 X-Teensing-Token、或在后端配置 TESS_SYSTEM_TOKEN",
         )
-    try:
-        result = process_question(
+
+    # 内容协商：是否走 SSE 流式
+    _accept = (request.headers.get("accept") or "").lower()
+    want_stream = ("text/event-stream" in _accept) or bool((payload or {}).get("stream"))
+
+    def _run():
+        return process_question(
             question, connector, llm,
             token=effective_token, operator_id=operator, token_mode=token_mode,
             analysis_type=analysis_type, params=params,
             history=history_text, history_entities=history_entities,
+            on_progress=_on_progress, on_context_ready=_on_context_ready, on_token=_on_token,
         )
-    except Exception as e:  # 数据 API / LLM 异常都不应泄露堆栈
-        raise HTTPException(
-            status_code=502, detail=f"问答执行失败：{type(e).__name__}: {e}"
+
+    def _after(res):
+        """取数完成后统一做：多轮落库 + 审计（流式/非流式共用）。"""
+        cs = res.get("context_summary", {})
+        if chat_id:
+            try:
+                _ents = extract_entities(question, params)
+                _ents = resolve_entities(_ents, connector, effective_token)
+            except Exception:
+                _ents = {}
+            record_turn(
+                chat_id, operator, question, res.get("answer", ""),
+                _ents,
+                analysis_type=cs.get("analysis_type"),
+                route_source=cs.get("route_source"),
+                platform_id=platform_id or "default",
+                usage=cs.get("llm_usage"),
+            )
+        AUDIT.log_query(
+            operator_id=operator,
+            endpoint="/tess/ask",
+            question=question,
+            answer=res.get("answer", ""),
+            status="answered",
+            confidence=1.0,
+            meta={
+                "token_mode": token_mode,
+                "analysis_type": cs.get("analysis_type"),
+                "route_source": cs.get("route_source"),
+                "llm_usage": cs.get("llm_usage"),
+            },
         )
-    # —— 多轮会话落库：把本轮问答写回（chat_id 为空则单轮，不写）——
-    cs = result.get("context_summary", {})
-    if chat_id:
+        return cs
+
+    # —— SSE 流式辅助（始终定义；非流式路径仅不使用，避免 _run 引用自由变量报错）——
+    started = time.monotonic()
+
+    def _sse(**kw):
+        return f"data: {json.dumps(kw, ensure_ascii=False)}\n\n"
+
+    q: Queue = Queue()
+    result_box: dict = {}
+
+    def _on_progress(stage, label, index, total):
+        q.put(_sse(type="progress", stage=stage, label=label, index=index, total=total))
+
+    def _on_context_ready():
+        q.put(_sse(type="context_ready", stages=1))
+
+    def _on_token(text):
+        if text:
+            q.put(_sse(type="token", text=text))
+
+    if not want_stream:
         try:
-            _ents = extract_entities(question, params)
-            _ents = resolve_entities(_ents, connector, effective_token)
-        except Exception:
-            _ents = {}
-        record_turn(
-            chat_id, operator, question, result.get("answer", ""),
-            _ents,
-            analysis_type=cs.get("analysis_type"),
-            route_source=cs.get("route_source"),
-            platform_id=platform_id or "default",
-            usage=cs.get("llm_usage"),
-        )
-    # P6 审计：记录「谁问了什么 -> Tess 答了什么」
-    AUDIT.log_query(
-        operator_id=operator,
-        endpoint="/tess/ask",
-        question=question,
-        answer=result.get("answer", ""),
-        status="answered",
-        confidence=1.0,
-        meta={
-            "token_mode": token_mode,
-            "analysis_type": cs.get("analysis_type"),
-            "route_source": cs.get("route_source"),
-            "llm_usage": cs.get("llm_usage"),
+            res = _run()
+        except Exception as e:  # 数据 API / LLM 异常都不应泄露堆栈
+            raise HTTPException(status_code=502, detail=f"问答执行失败：{type(e).__name__}: {e}")
+        _after(res)
+        return res  # FastAPI 自动序列化为 JSON（向后兼容既有调用方/测试）
+
+    # —— SSE 流式路径 ——
+
+    def _worker():
+        try:
+            res = _run()
+            result_box["res"] = res
+        except Exception as e:  # 数据 API / LLM 异常都不应泄露堆栈
+            q.put(_sse(type="error", message=f"问答执行失败：{type(e).__name__}: {e}"))
+        finally:
+            q.put(None)  # 结束哨兵
+
+    def _gen():
+        yield _sse(type="start", question=question)
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            yield item
+        res = result_box.get("res")
+        if res:
+            cs = _after(res)
+            yield _sse(
+                type="done",
+                answer=res.get("answer", ""),
+                context_summary=cs,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+            )
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 让 nginx 不缓冲 SSE
         },
     )
-    return result
 
 
 @app.post("/tess/diagnose-from-source")
