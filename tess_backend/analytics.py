@@ -1970,7 +1970,7 @@ def process_question(
             if ctx.get("long_span"):
                 date_hint += ("（跨度较长，请按月对比各 Campaign 的变化趋势与环比，"
                               "指出哪些月份/哪些 Campaign 下滑，并给出下降原因推测与放量机会）"
-                              "；趋势数据已按月聚合（每月一个代表点）。"
+                              "；趋势数据已按月聚合（每月一个代表点）。")
         user_prompt = (
             f"【Teensing 业务数据上下文（深度下钻：{analysis_type}）】\n"
             f"{ctx_text}\n\n"
