@@ -15,7 +15,7 @@ import re
 import time
 import json
 import threading
-from queue import Queue
+from queue import Queue, Empty
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -690,6 +690,8 @@ def post_ask(payload: dict, request: Request):
 
     # —— SSE 流式路径 ——
 
+    SSE_HEARTBEAT_SEC = 15  # 空窗心跳：必须小于 Cloudflare 空闲重置阈值(≈100s)，确保复杂问题取数卡顿时连接上始终有字节流动
+
     def _worker():
         try:
             res = _run()
@@ -704,7 +706,11 @@ def post_ask(payload: dict, request: Request):
         worker = threading.Thread(target=_worker, daemon=True)
         worker.start()
         while True:
-            item = q.get()
+            try:
+                item = q.get(timeout=SSE_HEARTBEAT_SEC)
+            except Empty:  # 空窗超时 → 发 SSE 注释心跳，保持连接有字节流动，避免 Cloudflare 因静默 >100s 重置 HTTP/2 流
+                yield ": ping\n\n"
+                continue
             if item is None:
                 break
             yield item
