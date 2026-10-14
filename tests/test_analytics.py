@@ -482,11 +482,12 @@ def test_extract_date_range_last_n_months():
 
 
 def test_advertiser_deepdive_long_span_monthly_aggregation():
-    """长周期（>35天）下钻：逐 Campaign 并发拉 /campaign-kpi-trend（已验证可用），
+    """长周期（>35天）下钻：逐 Campaign × 逐月并发切片拉 /campaign-kpi-trend，
 
     本地 _monthly_from_daily 聚合成月度点，而非依赖 /report(date,campaign)——
-    线上验证该维度组合（date,campaign + 多 campaign_ids）上游直接返回 HTTP 500，
-    会导致整段月度对比全空（1000853 真实故障）。
+    线上验证该维度组合（date,campaign + 多 campaign_ids）上游直接返回 HTTP 500；
+    且上游 /campaign-kpi-trend 对超长区间（如 7-10 月）只回最近 ~7 天，整段拉会让
+    7/8/9 月全空。故必须按月切片（单月 ≤31 天不触发截断），头部 8 个 Campaign 优先。
     """
     from tess_backend.analytics import fetch_bi_analysis_context
     conn = _connector()
@@ -496,8 +497,8 @@ def test_advertiser_deepdive_long_span_monthly_aggregation():
     )
     assert ctx["date_range"] == "2026-07-01 ~ 2026-10-31"
     assert ctx["long_span"] is True
-    # 长周期走 /campaign-kpi-trend 逐 Campaign 拉取，本地按月聚合
-    assert "9001" in ctx["campaign_trends"], "应含 campaign 9001 的月度趋势"
+    # 长周期走 /campaign-kpi-trend 逐 Campaign × 逐月切片拉取，本地按月聚合
+    assert "9001" in ctx["campaign_trends"], "应含头部 campaign 9001 的月度趋势"
     series = ctx["campaign_trends"]["9001"]
     # 趋势按月聚合（4 个月 -> 4 个代表点），字段来自 /campaign-kpi-trend 日序列
     assert len(series) == 4, f"长周期趋势应聚合为 4 个月点，实际 {len(series)}"
@@ -505,12 +506,17 @@ def test_advertiser_deepdive_long_span_monthly_aggregation():
     assert series[-1]["time_label"] == "2026-10-31"
 
     # 回归：长周期严禁调用 /report(date,campaign) —— 该组合线上直接 HTTP 500，
-    # 会导致整段月度对比全空。必须走 /campaign-kpi-trend 逐 Campaign。
+    # 会导致整段月度对比全空。必须走 /campaign-kpi-trend 逐 Campaign × 逐月切片。
     report_calls = [(p, pr) for (p, pr) in conn.calls if p == "/report"]
     assert report_calls == [], f"长周期不应调用 /report，实际 {report_calls}"
     trend_calls = [(p, pr) for (p, pr) in conn.calls if p == "/campaign-kpi-trend"]
-    # 15 个 campaign 各一次（全区间，非按月切片）
-    assert len(trend_calls) == 15, f"应对 15 个 campaign 各发一次 /campaign-kpi-trend，实际 {len(trend_calls)} 次"
+    # 头部 8 个 campaign × 4 个月（逐月切片），而非整段一次拉 15 个
+    assert len(trend_calls) == 32, f"应逐 campaign×逐月各发一次 /campaign-kpi-trend（8×4=32），实际 {len(trend_calls)}"
+    # 每个切片都必须是单月（≤31 天），绝不能整段 7-10 月一次拉（否则上游只回最近 7 天）
+    for (_, pr) in trend_calls:
+        ds_, de_ = pr["date_start"], pr["date_end"]
+        span = (datetime.strptime(de_, "%Y-%m-%d") - datetime.strptime(ds_, "%Y-%m-%d")).days
+        assert span <= 31, f"逐月切片应 ≤31 天，实际 {ds_}~{de_}（{span}天）"
 
 
 def test_advertiser_deepdive_prompt_view_keeps_monthly_trends_before_truncation():
