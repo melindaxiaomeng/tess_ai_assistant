@@ -22,6 +22,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import text
 
 from .orchestrator import run_diagnosis
@@ -665,18 +666,21 @@ def post_ask(payload: dict, request: Request):
         # 算完再补 JSON 正文，前端 fetch().json() 照常解析，完全无感。需 nginx 对 /tess/ 关缓冲配合。
         def _gen_json():
             yield b" "
+            body = None
             try:
                 res = _run()
-            except Exception as e:  # 数据 API / LLM 异常都不应泄露堆栈
-                yield json.dumps(
+                try:
+                    _after(res)
+                except Exception:
+                    pass
+                # 用 FastAPI 同款 jsonable_encoder 兜底（datetime/Decimal/bytes 等非标准类型），
+                # 避免标准库 json.dumps 遇到不可序列化字段抛异常 -> 只剩首字节空格 -> 客户端 JSON 解析失败。
+                body = json.dumps(jsonable_encoder(res), ensure_ascii=False).encode("utf-8")
+            except Exception as e:  # 数据 API / LLM / 序列化 异常都不应泄露堆栈
+                body = json.dumps(
                     {"error": f"问答执行失败：{type(e).__name__}: {e}"}, ensure_ascii=False
                 ).encode("utf-8")
-                return
-            try:
-                _after(res)
-            except Exception:
-                pass
-            yield json.dumps(res, ensure_ascii=False).encode("utf-8")
+            yield body
 
         return StreamingResponse(
             _gen_json(),

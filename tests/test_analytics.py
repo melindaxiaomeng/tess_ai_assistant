@@ -658,6 +658,53 @@ def test_ask_non_stream_returns_json():
     assert body["context_summary"]["route_source"] == "inferred"
 
 
+def test_ask_non_stream_json_with_nonstandard_types():
+    """回归：res 含 datetime/Decimal 等非标准 JSON 类型时，非流式也必须返回合法 JSON。
+
+    曾因直接用标准库 json.dumps(res) 遇到不可序列化字段抛异常，
+    只剩首字节空格 -> 客户端 json.loads 报 Expecting value: line 1 column 2。
+    修复后用 FastAPI 同款 jsonable_encoder 兜底，且正文生成包在 try 内，任何异常都吐合法 JSON。
+    """
+    from tess_backend import app as app_module
+    from fastapi.testclient import TestClient
+    from datetime import datetime
+    from decimal import Decimal
+
+    app_module._require_ai_entitlement = lambda req: None
+    app_module.get_data_connector = lambda: _connector()
+    app_module._get_llm_client = lambda pid: MockLLM()
+    app_module._resolve_access_token = lambda req, pid: ("", "system")
+    app_module._platform_id = lambda req: "default"
+    app_module._operator_id = lambda req: "anonymous"
+
+    def _fake_pq(*a, **k):
+        return {
+            "answer": "ok",
+            "context_summary": {
+                "route_source": "advertiser_deepdive",
+                "generated_at": datetime(2026, 10, 14, 12, 0, 0),
+                "total": Decimal("1234.56"),
+            },
+            "campaign_trends": {
+                "9001": [{"date": datetime(2026, 7, 31), "cr": Decimal("0.12")}]
+            },
+        }
+
+    orig = app_module.process_question
+    app_module.process_question = _fake_pq
+    try:
+        client = TestClient(app_module.app)
+        r = client.post("/tess/ask", json={"question": "广告主1000853 7-10月"})
+        assert r.status_code == 200
+        body = r.json()  # 必须能解析，不能 JSONDecodeError
+        assert body["answer"] == "ok"
+        # 非标准类型应被 jsonable_encoder 转成字符串/数字，而非抛异常
+        assert body["context_summary"]["generated_at"].startswith("2026-10-14")
+        assert body["context_summary"]["total"] == 1234.56
+    finally:
+        app_module.process_question = orig
+
+
 # ---------------------------------------------------------------------------
 # 5) 注册面同步
 # ---------------------------------------------------------------------------
