@@ -57,7 +57,7 @@ class MockConnector:
             if dim == "campaign":
                 return {"items": self.report_by_dim.get("campaign", [])}
             if dim == "date,campaign":
-                # 长周期广告主下钻：返回 campaign × 月 扁平表，供 _monthly_by_campaign 聚合
+                # /report 维度聚合：按 campaign_ids 命中预设的 campaign × 月 扁平表
                 cids = [c for c in ((params or {}).get("campaign_ids") or "").split(",") if c]
                 months = ["2026-07-31", "2026-08-31", "2026-09-30", "2026-10-31"]
                 items = []
@@ -482,10 +482,11 @@ def test_extract_date_range_last_n_months():
 
 
 def test_advertiser_deepdive_long_span_monthly_aggregation():
-    """长周期（>35天）下钻：透传 date_range，改用 /report(date,campaign) 一次聚合替代 N 个趋势请求。
+    """长周期（>35天）下钻：逐 Campaign 并发拉 /campaign-kpi-trend（已验证可用），
 
-    验证 『7-10 月』类请求不再逐个 campaign 拉 /campaign-kpi-trend 导致 80s 超时，
-    而是一次 /report 聚合后本地按月分组，LLM 能拿到每月代表点答『月度变化』。
+    本地 _monthly_from_daily 聚合成月度点，而非依赖 /report(date,campaign)——
+    线上验证该维度组合（date,campaign + 多 campaign_ids）上游直接返回 HTTP 500，
+    会导致整段月度对比全空（1000853 真实故障）。
     """
     from tess_backend.analytics import fetch_bi_analysis_context
     conn = _connector()
@@ -495,31 +496,21 @@ def test_advertiser_deepdive_long_span_monthly_aggregation():
     )
     assert ctx["date_range"] == "2026-07-01 ~ 2026-10-31"
     assert ctx["long_span"] is True
-    # 长周期走 /report(date,campaign) 聚合，campaign_trends 由 _monthly_by_campaign 按 campaign 分组
+    # 长周期走 /campaign-kpi-trend 逐 Campaign 拉取，本地按月聚合
     assert "9001" in ctx["campaign_trends"], "应含 campaign 9001 的月度趋势"
-    # 趋势按月聚合（4 个月 -> 4 个代表点），字段来自 /report 扁平表
     series = ctx["campaign_trends"]["9001"]
+    # 趋势按月聚合（4 个月 -> 4 个代表点），字段来自 /campaign-kpi-trend 日序列
     assert len(series) == 4, f"长周期趋势应聚合为 4 个月点，实际 {len(series)}"
-    assert series[0]["date"] == "2026-07-31"
-    assert series[-1]["date"] == "2026-10-31"
-    # 转化率字段在 /report 下为 cr（非 cvr），两者皆被保留
-    assert "cr" in series[0]
+    assert series[0]["time_label"] == "2026-07-31"
+    assert series[-1]["time_label"] == "2026-10-31"
 
-    # 回归：长周期必须按月切片并发取数，绝不能退化成『整段 07-01~10-31 一次 /report』，
-    # 否则后端慢查询会撑爆 80s 预算（线上 1000853 超时根因）。
-    report_calls = [(p, pr) for (p, pr) in conn.calls if p == "/report"
-                    and pr.get("dimensions") == "date,campaign"]
-    assert len(report_calls) == 4, f"应按月切片发 4 次 /report，实际 {len(report_calls)} 次"
-    month_ranges = sorted((pr["date_start"], pr["date_end"]) for _, pr in report_calls)
-    assert month_ranges == [
-        ("2026-07-01", "2026-07-31"),
-        ("2026-08-01", "2026-08-31"),
-        ("2026-09-01", "2026-09-30"),
-        ("2026-10-01", "2026-10-31"),
-    ], f"切片区间不正确：{month_ranges}"
-    # 确认没有『整段一次性』调用
-    assert not any(pr.get("date_start") == "2026-07-01" and pr.get("date_end") == "2026-10-31"
-                   for _, pr in report_calls), "不应出现整段 4 个月一次拉取"
+    # 回归：长周期严禁调用 /report(date,campaign) —— 该组合线上直接 HTTP 500，
+    # 会导致整段月度对比全空。必须走 /campaign-kpi-trend 逐 Campaign。
+    report_calls = [(p, pr) for (p, pr) in conn.calls if p == "/report"]
+    assert report_calls == [], f"长周期不应调用 /report，实际 {report_calls}"
+    trend_calls = [(p, pr) for (p, pr) in conn.calls if p == "/campaign-kpi-trend"]
+    # 15 个 campaign 各一次（全区间，非按月切片）
+    assert len(trend_calls) == 15, f"应对 15 个 campaign 各发一次 /campaign-kpi-trend，实际 {len(trend_calls)} 次"
 
 
 def test_advertiser_deepdive_campaign_daily_kpi_timeout_falls_back_to_30d():
