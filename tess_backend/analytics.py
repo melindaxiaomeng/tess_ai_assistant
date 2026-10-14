@@ -505,37 +505,57 @@ def fetch_bi_analysis_context(
         # 旗下 Campaign（放宽到前 15 个，避免『其余 Campaign 明细数据不足』截断）
         ADV_CAMP_MAX = 15
         campaigns = (daily_d.get("campaigns") or [])[:ADV_CAMP_MAX]
-        # 逐 Campaign 并发拉趋势，补全 per-campaign 明细（变化/增长空间靠它答）
+        # 逐 Campaign 明细：变化/增长空间靠它答
         campaign_trends = {}
-        # 长周期（>35天，如 7-10 月）只拉前 8 个 campaign 趋势，避免取数超时；短周期拉满 15
-        ADV_CAMP_TREND_MAX = 8 if long_span else ADV_CAMP_MAX
-        trend_ids = [str(c.get("campaign_id")) for c in campaigns if c.get("campaign_id")][:ADV_CAMP_TREND_MAX]
         trend_errs = []
 
-        def _fetch_one_trend(cid):
-            try:
-                t, err = _safe_api_get(connector, "/campaign-kpi-trend",
-                                       params={"campaign_ids": cid, "date_start": ds, "date_end": de}, token=token)
-                items = (t or {}).get("items", []) if isinstance(t, dict) else []
-                if long_span:
-                    # 长周期：本地按月聚合（每月最后一点），避免逐日 120 点撑爆 prompt 与取数
-                    series = _monthly_from_daily(items)
-                else:
+        if long_span and campaigns:
+            # 长周期（>35天，如 7-10 月）：一次 /report(date,campaign) 聚合，
+            # 替代逐个 Campaign 拉 /campaign-kpi-trend 的 N 个请求，彻底避免取数超时。
+            cid_list = [str(c.get("campaign_id")) for c in campaigns if c.get("campaign_id")][:ADV_CAMP_MAX]
+            r_params = {
+                "dimensions": "date,campaign",
+                "campaign_ids": ",".join(cid_list),
+                "date_start": ds, "date_end": de,
+                "page": 1, "page_size": 300,
+            }
+            r_items = []
+            for _ in range(20):  # 分页安全阀，避免无限翻页
+                rep, err = _safe_api_get(connector, "/report", params=r_params, token=token)
+                rep_items = (rep or {}).get("items", []) if isinstance(rep, dict) else []
+                r_items.extend(rep_items)
+                if err:
+                    trend_errs.append(err)
+                if len(rep_items) < r_params["page_size"]:
+                    break
+                r_params["page"] += 1
+            campaign_trends = _monthly_by_campaign(r_items)
+            if not campaign_trends:
+                trend_errs.append("长周期 /report(date,campaign) 聚合返回空（可能不支持该维度组合）")
+        else:
+            # 短周期：逐 Campaign 并发拉 /campaign-kpi-trend（已验证可用）
+            trend_ids = [str(c.get("campaign_id")) for c in campaigns if c.get("campaign_id")][:ADV_CAMP_MAX]
+
+            def _fetch_one_trend(cid):
+                try:
+                    t, err = _safe_api_get(connector, "/campaign-kpi-trend",
+                                           params={"campaign_ids": cid, "date_start": ds, "date_end": de}, token=token)
+                    items = (t or {}).get("items", []) if isinstance(t, dict) else []
                     series = _pick_many(items,
                         ["time_label", "revenue", "clicks", "cvr", "margin_rate", "payout"])[:10]
-                return cid, series, err
-            except Exception as e:  # noqa: BLE001 —— 单 campaign 趋势失败不应拖垮整轮
-                return cid, [], f"trend fetch failed: {type(e).__name__}: {e}"
+                    return cid, series, err
+                except Exception as e:  # noqa: BLE001 —— 单 campaign 趋势失败不应拖垮整轮
+                    return cid, [], f"trend fetch failed: {type(e).__name__}: {e}"
 
-        if trend_ids:
-            with ThreadPoolExecutor(max_workers=min(len(trend_ids), 8)) as ex:
-                futs = {ex.submit(_fetch_one_trend, cid): cid for cid in trend_ids}
-                for fut in as_completed(futs):
-                    cid, series, err = fut.result()
-                    if series:
-                        campaign_trends[cid] = series
-                    if err:
-                        trend_errs.append(err)
+            if trend_ids:
+                with ThreadPoolExecutor(max_workers=min(len(trend_ids), 8)) as ex:
+                    futs = {ex.submit(_fetch_one_trend, cid): cid for cid in trend_ids}
+                    for fut in as_completed(futs):
+                        cid, series, err = fut.result()
+                        if series:
+                            campaign_trends[cid] = series
+                        if err:
+                            trend_errs.append(err)
         return {
             "analysis_type": "advertiser_deepdive",
             "advertiser_id": aid,
@@ -1044,6 +1064,28 @@ def _monthly_from_daily(items):
         mk = f"{y}-{m.group(2)}"  # 月份 key
         by_month[mk] = _pick(it, ["time_label", "revenue", "clicks", "cvr", "margin_rate", "payout"])
     return [by_month[k] for k in sorted(by_month)]
+
+
+def _monthly_by_campaign(items):
+    """把 /report(dimensions=date,campaign) 扁平表按 Campaign 分组，每组按月取代表点。
+
+    用于长周期广告主下钻：一次 /report 聚合替代逐 Campaign 拉趋势的 N 个请求，避免取数超时。
+    每行含 date/campaign_id/campaign_name 及营收利润等；/report 下转化率字段为 cr（非 cvr），两者皆取以兼容。
+    """
+    by_camp = {}
+    for it in (items or []):
+        cid = str(it.get("campaign_id") or it.get("campaign_name") or "unknown")
+        tl = str(it.get("date") or it.get("time_label") or "")
+        m = re.search(r"(?:(\d{4})-)?(\d{2})-(\d{2})", tl)
+        if not m:
+            continue
+        y = m.group(1) or str(datetime.now().year)
+        mk = f"{y}-{m.group(2)}"  # 月份 key
+        months = by_camp.setdefault(cid, {})
+        months[mk] = _pick(it, ["date", "campaign_id", "campaign_name",
+                                "revenue", "profit", "payout", "clicks",
+                                "conversions", "cr", "cvr", "margin_rate"])
+    return {cid: [months[k] for k in sorted(months)] for cid, months in by_camp.items()}
 
 
 def _pct_delta(today: Optional[dict], yesterday: Optional[dict]) -> dict:

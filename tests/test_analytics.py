@@ -56,6 +56,21 @@ class MockConnector:
                 return {"items": self.report_by_dim.get("date", [])}
             if dim == "campaign":
                 return {"items": self.report_by_dim.get("campaign", [])}
+            if dim == "date,campaign":
+                # 长周期广告主下钻：返回 campaign × 月 扁平表，供 _monthly_by_campaign 聚合
+                cids = [c for c in ((params or {}).get("campaign_ids") or "").split(",") if c]
+                months = ["2026-07-31", "2026-08-31", "2026-09-30", "2026-10-31"]
+                items = []
+                for ci, cc in enumerate(cids):
+                    for mi, m in enumerate(months):
+                        items.append({
+                            "date": m, "campaign_id": cc, "campaign_name": f"Camp {cc}",
+                            "revenue": 100 + mi * 20 + ci, "profit": 40 + mi * 5,
+                            "payout": 50 + mi * 3, "clicks": 500 + mi * 50,
+                            "conversions": 50 + mi * 5, "cr": round(0.1 + mi * 0.01, 3),
+                            "cvr": round(0.1 + mi * 0.01, 3), "margin_rate": 0.4,
+                        })
+                return {"items": items}
             # advertiser 维度：按 advertiser_ids 命中预设聚合
             aids = (params or {}).get("advertiser_ids")
             return {"items": self.report_by_ids.get(aids, [])}
@@ -467,10 +482,10 @@ def test_extract_date_range_last_n_months():
 
 
 def test_advertiser_deepdive_long_span_monthly_aggregation():
-    """长周期（>35天）下钻：透传 date_range、只拉前 8 个 campaign 趋势、趋势按月聚合。
+    """长周期（>35天）下钻：透传 date_range，改用 /report(date,campaign) 一次聚合替代 N 个趋势请求。
 
-    验证 『7-10 月』类请求不再无脑拉 15 个 campaign 逐日趋势导致 80s 超时，
-    且 LLM 能拿到每月代表点答『月度变化』。
+    验证 『7-10 月』类请求不再逐个 campaign 拉 /campaign-kpi-trend 导致 80s 超时，
+    而是一次 /report 聚合后本地按月分组，LLM 能拿到每月代表点答『月度变化』。
     """
     from tess_backend.analytics import fetch_bi_analysis_context
     ctx = fetch_bi_analysis_context(
@@ -479,15 +494,15 @@ def test_advertiser_deepdive_long_span_monthly_aggregation():
     )
     assert ctx["date_range"] == "2026-07-01 ~ 2026-10-31"
     assert ctx["long_span"] is True
-    # 长周期只拉前 8 个 campaign 趋势（9001~9008），9009+ 不拉
-    for cid in ("9001", "9008"):
-        assert cid in ctx["campaign_trends"], f"应含趋势 {cid}"
-    assert "9009" not in ctx["campaign_trends"], "长周期不应拉第 9+ 个 campaign 趋势"
-    # 趋势按月聚合（4 个月 -> 4 个代表点）
+    # 长周期走 /report(date,campaign) 聚合，campaign_trends 由 _monthly_by_campaign 按 campaign 分组
+    assert "9001" in ctx["campaign_trends"], "应含 campaign 9001 的月度趋势"
+    # 趋势按月聚合（4 个月 -> 4 个代表点），字段来自 /report 扁平表
     series = ctx["campaign_trends"]["9001"]
     assert len(series) == 4, f"长周期趋势应聚合为 4 个月点，实际 {len(series)}"
-    assert series[0]["time_label"] == "2026-07-31"
-    assert series[-1]["time_label"] == "2026-10-31"
+    assert series[0]["date"] == "2026-07-31"
+    assert series[-1]["date"] == "2026-10-31"
+    # 转化率字段在 /report 下为 cr（非 cvr），两者皆被保留
+    assert "cr" in series[0]
 
 
 def test_process_question_routes_digit_first_advertiser_to_deepdive():
