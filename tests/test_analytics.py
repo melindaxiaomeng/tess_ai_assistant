@@ -650,6 +650,9 @@ def test_ask_non_stream_returns_json():
     client = TestClient(app_module.app)
     r = client.post("/tess/ask", json={"question": "哪些广告主没有配置am"})
     assert r.status_code == 200
+    # 非流式也必须走「先吐首字节」的 StreamingResponse，否则长问题零首字节被 Cloudflare 砍 524
+    assert r.headers.get("x-accel-buffering") == "no", "非流式应由 StreamingResponse 先吐首字节规避 524"
+    assert "application/json" in r.headers.get("content-type", "")
     body = r.json()
     assert "answer" in body
     assert body["context_summary"]["route_source"] == "inferred"

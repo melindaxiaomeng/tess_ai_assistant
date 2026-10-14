@@ -659,12 +659,30 @@ def post_ask(payload: dict, request: Request):
             q.put(_sse(type="token", text=text))
 
     if not want_stream:
-        try:
-            res = _run()
-        except Exception as e:  # 数据 API / LLM 异常都不应泄露堆栈
-            raise HTTPException(status_code=502, detail=f"问答执行失败：{type(e).__name__}: {e}")
-        _after(res)
-        return res  # FastAPI 自动序列化为 JSON（向后兼容既有调用方/测试）
+        # 非流式 JSON 也走 StreamingResponse 先吐首字节，规避 Cloudflare 524（零首字节超时）：
+        # 默认 JSON 路径需「取数 + LLM 生成」整段算完才返回首字节，长问题易 >100s 被 Cloudflare 砍 524。
+        # 先 yield 一个字节（JSON.parse / json.loads 均容忍前导空白），首字节 <1s 到达网关即不触发 524；
+        # 算完再补 JSON 正文，前端 fetch().json() 照常解析，完全无感。需 nginx 对 /tess/ 关缓冲配合。
+        def _gen_json():
+            yield b" "
+            try:
+                res = _run()
+            except Exception as e:  # 数据 API / LLM 异常都不应泄露堆栈
+                yield json.dumps(
+                    {"error": f"问答执行失败：{type(e).__name__}: {e}"}, ensure_ascii=False
+                ).encode("utf-8")
+                return
+            try:
+                _after(res)
+            except Exception:
+                pass
+            yield json.dumps(res, ensure_ascii=False).encode("utf-8")
+
+        return StreamingResponse(
+            _gen_json(),
+            media_type="application/json",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     # —— SSE 流式路径 ——
 
