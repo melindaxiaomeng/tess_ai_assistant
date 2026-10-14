@@ -471,6 +471,41 @@ def test_advertiser_deepdive_includes_campaign_trends():
     assert "9001" in cids and "9002" in cids
 
 
+def test_single_type_deepdive_fetch_timeout_degrades(monkeypatch):
+    """单类型深度下钻（如 advertiser_deepdive）取数若超过整体预算，须降级为
+    『数据不足』错误而非让整次 HTTP 卡到 Cloudflare 100s 504（此前单类型路径无预算）。
+
+    回归：把 TESS_ASK_TOTAL_TIMEOUT 调小到 1s，让 mock 取数 sleep 2s 触发超时，
+    断言 process_question 在预算内返回、context_summary.errors 含『超时』、且仍能产出 answer。
+    """
+    import time as _t
+    from tess_backend import analytics as _analytics
+
+    def _slow_fetch(connector, at, token=None, params=None):
+        _t.sleep(2.0)  # 故意超过 1s 预算
+        return {"analysis_type": at}
+
+    monkeypatch.setattr(_analytics, "fetch_bi_analysis_context", _slow_fetch)
+    monkeypatch.setenv("TESS_ASK_TOTAL_TIMEOUT", "1")
+
+    llm = MockLLM()
+    t0 = _t.monotonic()
+    res = process_question(
+        "1000908 这个广告主最近一周怎样",
+        _connector(), llm, token="t",
+        analysis_type="advertiser_deepdive",
+        params={"advertiser_id": "1000908"},
+    )
+    elapsed = _t.monotonic() - t0
+    # 不应卡到 2s（预算 1s 即熔断），留余量给 LLM 兜底生成
+    assert elapsed < 5.0, f"取数超时未生效，耗时 {elapsed:.1f}s"
+    cs = res["context_summary"]
+    assert cs["analysis_type"] == "advertiser_deepdive"
+    assert any("超时" in (e or "") for e in (cs.get("errors") or []))
+    # 即使取数超时，LLM 仍应基于『数据不足』产出 answer，而非整次 504
+    assert res.get("answer")
+
+
 def _parse_sse(text):
     """把 SSE 文本解析成事件 dict 列表（同前端 tessAskStream 的解析逻辑）。"""
     events = []

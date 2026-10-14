@@ -1844,7 +1844,25 @@ def process_question(
     elif route_source:  # ①②③ 走深度上下文（与 /tess/analytics 同一套取数）
         if on_progress:
             on_progress(analysis_type, _STAGE_LABELS.get(analysis_type, analysis_type), 1, 1)
-        ctx = fetch_bi_analysis_context(connector, analysis_type, token=token, params=params)
+        # 单类型深度下钻（如 advertiser_deepdive 现需拉 profile+daily-kpi+逐 Campaign 趋势）
+        # 同样可能因子数据源慢而拖垮整次请求（曾触发 Cloudflare 100s 504）；
+        # 加整体超时预算，超时则降级为「数据不足」而非让整次 HTTP 504。
+        fetch_budget = float(os.getenv("TESS_ASK_TOTAL_TIMEOUT", "80"))
+        try:
+            with ThreadPoolExecutor(max_workers=1) as _fx:
+                _fut = _fx.submit(
+                    fetch_bi_analysis_context, connector, analysis_type,
+                    token=token, params=params,
+                )
+                ctx = _fut.result(timeout=fetch_budget)
+        except Exception as e:  # noqa: BLE001 —— 取数超时/异常降级，不让整次请求 504
+            ctx = {
+                "analysis_type": analysis_type,
+                "errors": [
+                    f"{analysis_type} 取数超时/失败（超过整体预算 {int(fetch_budget)}s）："
+                    f"{type(e).__name__}: {e}"
+                ],
+            }
         ctx = _enrich_names_with_ids(ctx)  # 名称追加 (id)，便于核对实体
         # advertiser_deepdive 含逐 Campaign 趋势，上下文更大，放宽截断避免『明细被截断』
         trim_limit = 14000 if analysis_type == "advertiser_deepdive" else 9000
