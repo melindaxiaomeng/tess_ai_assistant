@@ -513,6 +513,71 @@ def test_advertiser_deepdive_long_span_monthly_aggregation():
     assert len(trend_calls) == 15, f"应对 15 个 campaign 各发一次 /campaign-kpi-trend，实际 {len(trend_calls)} 次"
 
 
+def test_advertiser_deepdive_prompt_view_keeps_monthly_trends_before_truncation():
+    """回归：advertiser_deepdive 的 LLM prompt 视图必须把『月度趋势』排在最前、
+
+    把日级 KPI 压缩为近期快照，否则日级明细会把截断预算吃光、把真正的月度对比数据裁掉
+    （线上 1000853：daily_kpi 快照占满 14000 字，campaign_trends 被截断在 Ajaib，
+    LLM 误报 7/8/9 月无数据）。本测试用 15 个 campaign × 100 行日级明细模拟 bloated 日 KPI，
+    断言精简后趋势存活、且 14000 字截断后最后一个 campaign 的月度点仍在。
+    """
+    from tess_backend.analytics import _advertiser_deepdive_prompt_view, _trim_for_prompt
+
+    # 模拟真实上游：daily_kpi.campaigns 带大量日级明细行；campaign_trends 为月度聚合
+    bloated_campaigns = []
+    for i in range(1, 16):
+        cid = 9000 + i
+        daily_rows = [
+            {"date": f"2026-10-{d:02d}", "revenue": 10, "clicks": 5, "conversions": 1,
+             "payout": 4, "cvr": 0.2, "margin_rate": 0.4, "impressions": 100,
+             "note": "x" * 50}  # 长备注模拟冗余字段
+            for d in range(1, 15)  # 14 天日级明细
+        ]
+        bloated_campaigns.append({
+            "campaign_id": cid, "name": f"Camp {cid}", "status": 1,
+            "revenue": 100 * i, "clicks": 50 * i, "conversions": 5 * i,
+            "payout": 40 * i, "daily": daily_rows,
+        })
+    monthly_trends = {}
+    for i in range(1, 16):
+        cid = 9000 + i
+        monthly_trends[str(cid)] = [
+            {"time_label": m, "revenue": 100 + k * 10, "clicks": 50 + k * 5,
+             "cvr": 0.1, "margin_rate": 0.4, "payout": 60}
+            for k, m in enumerate(["2026-07-31", "2026-08-31", "2026-09-30", "2026-10-31"])
+        ]
+    raw_ctx = {
+        "analysis_type": "advertiser_deepdive",
+        "advertiser_id": "1000853",
+        "date_range": "2026-07-01 ~ 2026-10-31",
+        "long_span": True,
+        "profile": {"id": "1000853", "name": "Flymobi_API_NEW"},
+        "daily_kpi": {"campaigns": bloated_campaigns},
+        "campaign_trends": monthly_trends,
+        "errors": [],
+    }
+    # 原始序列化（含日级明细）体量巨大
+    raw_text = _trim_for_prompt(raw_ctx, limit=14000)
+    # 精简视图：月度趋势最前、日 KPI 压缩
+    view = _advertiser_deepdive_prompt_view(raw_ctx)
+    view_text = _trim_for_prompt(view, limit=14000)
+
+    # 1) 月度趋势必须存在且含全部 15 个 campaign
+    assert set(view["campaign_trends_monthly"].keys()) == {str(9000 + i) for i in range(1, 16)}
+    # 2) 近期快照只保留 7 个紧凑字段，丢弃日级明细（无 'daily' 键）
+    snap = view["campaigns_snapshot"]
+    assert len(snap) == 15
+    assert "daily" not in snap[0], "近期快照不应含日级明细行"
+    assert set(snap[0].keys()) == {"campaign_id", "name", "status", "revenue", "clicks", "conversions", "payout"}
+    # 3) 月度趋势在序列化文本中排在近期快照之前
+    assert view_text.index("campaign_trends_monthly") < view_text.index("campaigns_snapshot")
+    # 4) 精简后体量显著缩小（对比未截断的真实原始序列化大小）
+    raw_full = len(json.dumps(raw_ctx, ensure_ascii=False, default=str))
+    assert len(view_text) < raw_full * 0.5, f"精简后应显著变小：{len(view_text)} vs {raw_full}"
+    # 5) 14000 字截断后，最后一个 campaign（9015）的月度点仍存活（趋势在最前）
+    assert "9015" in view_text, "截断后最后一个 campaign 的月度趋势应存活"
+
+
 def test_advertiser_deepdive_campaign_daily_kpi_timeout_falls_back_to_30d():
     """回归：campaign-daily-kpi 整段区间（如 7-10 月）触发后端读取超时（TimeoutError）时，
     应缩小到最近 30 天兜底拿回 campaign 列表，而非整条链路因 campaigns 为空而『数据不足』。

@@ -1061,6 +1061,51 @@ def _monthly_from_daily(items):
     return [by_month[k] for k in sorted(by_month)]
 
 
+def _advertiser_deepdive_prompt_view(ctx: dict) -> dict:
+    """为 LLM prompt 精简 advertiser_deepdive 上下文：月度趋势优先、日 KPI 压缩。
+
+    背景：原始返回的 daily_kpi（旗下 Campaign 日级明细）体量远大于 campaign_trends，
+    按 dict 顺序序列化时把 14000 字截断预算吃光，导致 campaign_trends（真正回答
+    「7-10 月逐 Campaign 月度对比」的数据）被截断，LLM 只能看到 10-08~10-14 快照而
+    误报「7/8/9 月无数据」。本函数把『按月聚合趋势』提到最前、把日 KPI 压缩为
+    带名称映射的近期快照，确保答案数据不被截断。
+    """
+    daily_kpi = ctx.get("daily_kpi") or {}
+    campaigns = daily_kpi.get("campaigns") or []
+    name_map = {
+        str(c.get("campaign_id")): (c.get("name") or c.get("campaign_name"))
+        for c in campaigns if c.get("campaign_id")
+    }
+    # 压缩后的近期快照：仅保留名称/id/状态/区间汇总，丢弃日级明细行
+    compact_campaigns = [
+        {
+            "campaign_id": c.get("campaign_id"),
+            "name": c.get("name") or c.get("campaign_name"),
+            "status": c.get("status"),
+            "revenue": c.get("revenue"),
+            "clicks": c.get("clicks"),
+            "conversions": c.get("conversions"),
+            "payout": c.get("payout"),
+        }
+        for c in campaigns
+    ]
+    # 月度趋势：把 campaign 名称并入每个点，便于 LLM 关联阅读（这是答案主体）
+    trends = ctx.get("campaign_trends") or {}
+    compact_trends = {}
+    for cid, series in trends.items():
+        nm = name_map.get(str(cid))
+        compact_trends[str(cid)] = {"name": nm, "monthly": series}
+    return {
+        "advertiser_id": ctx.get("advertiser_id"),
+        "date_range": ctx.get("date_range"),
+        "long_span": ctx.get("long_span"),
+        "profile": ctx.get("profile"),
+        "campaign_trends_monthly": compact_trends,  # 优先：真正回答 7-10 月对比
+        "campaigns_snapshot": compact_campaigns,    # 压缩后的近期快照 + 名称映射
+        "errors": ctx.get("errors"),
+    }
+
+
 def _pct_delta(today: Optional[dict], yesterday: Optional[dict]) -> dict:
     """计算今日相对昨日的环比（仅对数值字段）。"""
     out = {}
@@ -1934,7 +1979,9 @@ def process_question(
             if isinstance(c, dict) and c.get("errors"):
                 all_errors.extend(c["errors"])
             c = _enrich_names_with_ids(c)
-            parts.append(f"【深度下钻：{at}】\n{_trim_for_prompt(c, limit=4000)}")
+            if at == "advertiser_deepdive":
+                c = _advertiser_deepdive_prompt_view(c)
+            parts.append(f"【深度下钻：{at}】\n{_trim_for_prompt(c, limit=20000 if at == 'advertiser_deepdive' else 4000)}")
         ctx_text = "\n\n".join(parts)
         ctx = {"errors": all_errors}
         analysis_type = "multi:" + ",".join(multi_types)
@@ -1975,8 +2022,11 @@ def process_question(
                 ],
             }
         ctx = _enrich_names_with_ids(ctx)  # 名称追加 (id)，便于核对实体
-        # advertiser_deepdive 含逐 Campaign 趋势，上下文更大，放宽截断避免『明细被截断』
-        trim_limit = 14000 if analysis_type == "advertiser_deepdive" else 9000
+        # advertiser_deepdive 含逐 Campaign 趋势：改用精简视图（月度趋势优先、日 KPI 压缩），
+        # 避免日级明细把截断预算吃光、把真正的月度对比数据裁掉
+        if analysis_type == "advertiser_deepdive":
+            ctx = _advertiser_deepdive_prompt_view(ctx)
+        trim_limit = 20000 if analysis_type == "advertiser_deepdive" else 9000
         ctx_text = _trim_for_prompt(ctx, limit=trim_limit)  # 深度上下文更大，放宽截断
         # 时间范围与长周期对比指导：让用户指定的 7-10 月等被 LLM 明确按月分析
         date_hint = ""
