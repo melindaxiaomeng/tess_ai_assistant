@@ -677,58 +677,49 @@ def fetch_bi_analysis_context(
     # 场景 9：跨 Campaign 排名 / 诊断（"哪个 Campaign 利润环比下滑最快"）
     # ---------------------------------------------------------------
     elif analysis_type == "campaign_ranking":
-        fluc, err_fluc = _safe_api_get(connector, "/overview/ranking/fluctuation", token=token)
-        fluc_map = fluc if isinstance(fluc, dict) else {}
-        rising = fluc_map.get("rising") or []
-        falling = fluc_map.get("falling") or []
-        metric_note = "涨跌榜口径为营收(revenue)环比（revenue_change）；接口未提供独立利润(profit)环比字段，利润口径以营收环比代理。"
-
-        # fluctuation 超时/为空时，回退到 /report 自己算 campaign 级利润环比
-        if err_fluc or (not rising and not falling):
-            yesterday = (today - timedelta(days=1)).strftime("%Y-%m-%d")
-            today_str = today.strftime("%Y-%m-%d")
-            all_items = []
-            page = 1
-            while True:
-                report, err_report = _safe_api_get(
-                    connector, "/report",
-                    params={
-                        "dimensions": "date,hour,campaign",
-                        "date_start": yesterday,
-                        "date_end": today_str,
-                        "page": page,
-                        "page_size": 100,
-                    },
-                    token=token,
-                )
-                if err_report or not report:
-                    break
-                rows = report.get("items", []) if isinstance(report, dict) else []
-                all_items.extend(rows)
-                if len(rows) < 100:
-                    break
-                page += 1
-            if all_items:
-                candidates = _build_campaign_change_from_report(
-                    {"items": all_items}, yesterday, today_str
-                )
-                rising = [c for c in candidates if _change_metric(c) >= 0]
-                falling = [c for c in candidates if _change_metric(c) < 0]
-                metric_note = "fluctuation 接口超时/为空，已回退到 /report（date,hour,campaign）按 campaign 汇总计算利润(profit_change)与营收(revenue_change)环比。"
-                err_fluc = None
-            else:
-                err_fluc = err_fluc or err_report
-
-        # 按利润环比优先（有 profit_change 时用 profit_change，否则退到 revenue_change）
+        # 始终基于 /report 自算真实环比（不依赖 fluctuation，后者数据不全且常缺利润字段）。
+        # 窗口取「昨日 vs 前日」两个完整日，规避「今日」部分日导致的虚高/虚低。
+        yesterday = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+        day_before = (today - timedelta(days=2)).strftime("%Y-%m-%d")
+        all_items = []
+        page = 1
+        while True:
+            report, err_report = _safe_api_get(
+                connector, "/report",
+                params={
+                    "dimensions": "date,campaign",
+                    "date_start": day_before,
+                    "date_end": yesterday,
+                    "page": page,
+                    "page_size": 100,
+                },
+                token=token,
+            )
+            if err_report or not report:
+                break
+            rows = report.get("items", []) if isinstance(report, dict) else []
+            all_items.extend(rows)
+            if len(rows) < 100:
+                break
+            page += 1
+        candidates = _build_campaign_change({"items": all_items}, day_before, yesterday)
+        rising = [c for c in candidates if _change_metric(c) >= 0]
+        falling = [c for c in candidates if _change_metric(c) < 0]
+        metric_note = (
+            "涨跌榜口径为日环比（昨日 vs 前日），基于 /report?dimensions=date,campaign "
+            "按 campaign 汇总真实 revenue/profit 计算；优先以利润(profit_change)排序，"
+            "缺失时退到营收(revenue_change)。本期取昨日（完整日）以规避今日部分日偏差。"
+        )
         falling_sorted = sorted(falling, key=_change_metric)[:10]
         rising_sorted = sorted(rising, key=lambda x: -_change_metric(x))[:10]
-
+        errs = [] if all_items else ([err_report] if err_report else ["/report 在对比窗口内无数据"])
         return {
             "analysis_type": "campaign_ranking",
             "metric_note": metric_note + " falling_top 已按环比变化升序排列，[0] 即下滑最快的 Campaign。",
             "rising_top": rising_sorted,
             "falling_top": falling_sorted,
-            "errors": [e for e in (err_fluc,) if e],
+            "time_range": f"{day_before} ~ {yesterday}",
+            "errors": errs,
         }
 
     # ---------------------------------------------------------------
@@ -1827,12 +1818,11 @@ def _aggregate_report(items):
     }
 
 
-def _build_campaign_change_from_report(report, yesterday: str, today: str) -> list[dict]:
-    """把 /report（如 dimensions=date,hour,campaign）返回按 campaign 汇总，
-
-    计算今日相对昨日的 revenue_change / profit_change。返回条目形如：
-      {campaign_id, campaign_name, revenue, revenue_change, revenue_change_pct,
-       profit, profit_change, profit_change_pct}
+def _build_campaign_change(report, prev_date: str, curr_date: str) -> list[dict]:
+    """把 /report（dimensions=date,campaign）按 campaign 汇总，计算 curr_date 相对 prev_date 的
+    revenue/profit 环比。返回条目包含完整字段，供 LLM 直接下钻 kpi_compare：
+      {campaign_id, campaign_name, revenue(本期), revenue_prev, revenue_change,
+       profit(本期), profit_prev, profit_change, 及 *_change_pct}
     """
     items = (report or {}).get("items", []) if isinstance(report, dict) else []
     by_c: dict[str, dict] = {}
@@ -1841,45 +1831,41 @@ def _build_campaign_change_from_report(report, yesterday: str, today: str) -> li
         if not cid:
             continue
         d = str(it.get("date", ""))
-        if d not in (yesterday, today):
+        if d not in (prev_date, curr_date):
             continue
         c = by_c.setdefault(cid, {
             "campaign_id": cid,
             "campaign_name": it.get("campaign_name", ""),
-            "revenue_yesterday": 0.0,
-            "revenue_today": 0.0,
-            "profit_yesterday": 0.0,
-            "profit_today": 0.0,
+            "revenue_prev": 0.0, "revenue_curr": 0.0,
+            "profit_prev": 0.0, "profit_curr": 0.0,
         })
         rev = _to_float(it.get("revenue"))
         prf = _to_float(it.get("profit"))
-        if d == yesterday:
-            c["revenue_yesterday"] += rev
-            c["profit_yesterday"] += prf
+        if d == prev_date:
+            c["revenue_prev"] += rev
+            c["profit_prev"] += prf
         else:
-            c["revenue_today"] += rev
-            c["profit_today"] += prf
+            c["revenue_curr"] += rev
+            c["profit_curr"] += prf
 
     out = []
     for c in by_c.values():
-        rev_y = c["revenue_yesterday"]
-        rev_t = c["revenue_today"]
-        prf_y = c["profit_yesterday"]
-        prf_t = c["profit_today"]
+        rv_p, rv_c = c["revenue_prev"], c["revenue_curr"]
+        pf_p, pf_c = c["profit_prev"], c["profit_curr"]
         row = {
             "campaign_id": c["campaign_id"],
             "campaign_name": c["campaign_name"],
-            "revenue": round(rev_t, 2),
-            "revenue_yesterday": round(rev_y, 2),
-            "revenue_change": round(rev_t - rev_y, 2),
-            "profit": round(prf_t, 2),
-            "profit_yesterday": round(prf_y, 2),
-            "profit_change": round(prf_t - prf_y, 2),
+            "revenue": round(rv_c, 2),
+            "revenue_prev": round(rv_p, 2),
+            "revenue_change": round(rv_c - rv_p, 2),
+            "profit": round(pf_c, 2),
+            "profit_prev": round(pf_p, 2),
+            "profit_change": round(pf_c - pf_p, 2),
         }
-        if rev_y:
-            row["revenue_change_pct"] = round((rev_t - rev_y) / rev_y * 100, 2)
-        if prf_y:
-            row["profit_change_pct"] = round((prf_t - prf_y) / prf_y * 100, 2)
+        if rv_p:
+            row["revenue_change_pct"] = round((rv_c - rv_p) / rv_p * 100, 2)
+        if pf_p:
+            row["profit_change_pct"] = round((pf_c - pf_p) / pf_p * 100, 2)
         out.append(row)
     return out
 

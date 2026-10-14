@@ -62,16 +62,32 @@ class MockConnector:
             if dim == "date,campaign":
                 # /report 维度聚合：按 campaign_ids 命中预设的 campaign × 月 扁平表
                 cids = [c for c in ((params or {}).get("campaign_ids") or "").split(",") if c]
-                months = ["2026-07-31", "2026-08-31", "2026-09-30", "2026-10-31"]
+                if cids:
+                    months = ["2026-07-31", "2026-08-31", "2026-09-30", "2026-10-31"]
+                    items = []
+                    for ci, cc in enumerate(cids):
+                        for mi, m in enumerate(months):
+                            items.append({
+                                "date": m, "campaign_id": cc, "campaign_name": f"Camp {cc}",
+                                "revenue": 100 + mi * 20 + ci, "profit": 40 + mi * 5,
+                                "payout": 50 + mi * 3, "clicks": 500 + mi * 50,
+                                "conversions": 50 + mi * 5, "cr": round(0.1 + mi * 0.01, 3),
+                                "cvr": round(0.1 + mi * 0.01, 3), "margin_rate": 0.4,
+                            })
+                    return {"items": items}
+                # campaign_ranking：按 date_start/date_end 生成两天数据
+                # （prev 高、curr 低，模拟下滑，便于断言 profit_change）
+                ds = (params or {}).get("date_start", "2026-10-13")
+                de = (params or {}).get("date_end", "2026-10-14")
                 items = []
-                for ci, cc in enumerate(cids):
-                    for mi, m in enumerate(months):
+                for d in (ds, de):
+                    is_prev = (d == ds)
+                    base = {"revenue": 1000 if is_prev else 800,
+                            "profit": 200 if is_prev else 100}
+                    for cid in ("8001", "8002", "8003"):
                         items.append({
-                            "date": m, "campaign_id": cc, "campaign_name": f"Camp {cc}",
-                            "revenue": 100 + mi * 20 + ci, "profit": 40 + mi * 5,
-                            "payout": 50 + mi * 3, "clicks": 500 + mi * 50,
-                            "conversions": 50 + mi * 5, "cr": round(0.1 + mi * 0.01, 3),
-                            "cvr": round(0.1 + mi * 0.01, 3), "margin_rate": 0.4,
+                            "date": d, "campaign_id": cid, "campaign_name": f"Camp {cid}",
+                            "revenue": base["revenue"], "profit": base["profit"],
                         })
                 return {"items": items}
             if dim == "date,hour,campaign":
@@ -846,40 +862,42 @@ def test_tool_schemas_enum_includes_new_types():
         assert all(t in e for e in enums), f"{t} 未在 tool_schemas.json 枚举中"
 
 
-def test_campaign_ranking_uses_fluctuation_when_available():
-    """fluctuation 正常返回时，campaign_ranking 直接用涨跌榜，不再调 /report。"""
+def test_campaign_ranking_always_uses_report_and_produces_profit_change():
+    """campaign_ranking 始终基于 /report 自算真实环比（不再依赖 fluctuation），
+    产出含 profit_change 的完整 falling_top（带 campaign_id / campaign_name）。"""
+    conn = _connector()
+    ctx = fetch_bi_analysis_context(conn, "campaign_ranking", token="t")
+    assert ctx["analysis_type"] == "campaign_ranking"
+    assert not ctx["errors"], f"不应有错误: {ctx['errors']}"
+    report_calls = [c for c in conn.calls if c[0] == "/report"]
+    assert report_calls, "应调用 /report"
+    assert report_calls[0][1].get("dimensions") == "date,campaign"
+    assert report_calls[0][1].get("date_start") and report_calls[0][1].get("date_end")
+    assert ctx["falling_top"], "falling_top 不应为空"
+    top = ctx["falling_top"][0]
+    # 8001/8002/8003 利润均 100(本期) - 200(上期) = -100，均属下滑
+    assert top.get("profit_change") == -100, "利润环比应为 本期100 - 上期200 = -100"
+    assert "profit_change_pct" in top
+    assert top.get("campaign_id") and top.get("campaign_name"), "需带完整 campaign 信息供下钻"
+
+
+def test_campaign_ranking_ignores_fluctuation_when_present():
+    """即使 fluctuation 返回数据，campaign_ranking 仍基于 /report（不依赖该不可靠接口）。"""
     class FlucConnector(MockConnector):
         def api_get(self, path, params=None, token=None, timeout=None):
             self.calls.append((path, dict(params or {})))
             if path == "/overview/ranking/fluctuation":
                 return {
-                    "rising": [
-                        {"campaign_id": "9001", "campaign_name": "Camp 9001", "revenue_change": 50},
-                    ],
-                    "falling": [
-                        {"campaign_id": "9002", "campaign_name": "Camp 9002", "revenue_change": -30},
-                    ],
+                    "rising": [{"campaign_id": "9001", "campaign_name": "Camp 9001", "revenue_change": 50}],
+                    "falling": [{"campaign_id": "9002", "campaign_name": "Camp 9002", "revenue_change": -30}],
                 }
             return super().api_get(path, params, token, timeout)
 
     conn = FlucConnector()
     ctx = fetch_bi_analysis_context(conn, "campaign_ranking", token="t")
     assert ctx["analysis_type"] == "campaign_ranking"
-    assert ctx["falling_top"][0]["campaign_id"] == "9002"
-    assert ctx["rising_top"][0]["campaign_id"] == "9001"
-    assert not any(c[0] == "/report" for c in conn.calls), "fluctuation 可用时不应调 /report"
-
-
-def test_campaign_ranking_falls_back_to_report_on_fluctuation_empty():
-    """fluctuation 超时/为空时，campaign_ranking 回退 /report 自己算 campaign 级利润环比。"""
-    conn = _connector()
-    ctx = fetch_bi_analysis_context(conn, "campaign_ranking", token="t")
-    assert ctx["analysis_type"] == "campaign_ranking"
-    assert not ctx["errors"], f"不应有错误: {ctx['errors']}"
-    report_calls = [c for c in conn.calls if c[0] == "/report"]
-    assert report_calls, "应回退调用 /report"
-    assert report_calls[0][1].get("dimensions") == "date,hour,campaign"
-    assert ctx["falling_top"], "falling_top 不应为空"
-    top = ctx["falling_top"][0]
-    assert top.get("profit_change") == -100, "利润环比应为 今日100 - 昨日200 = -100"
-    assert "profit_change_pct" in top
+    assert not any(c[0] == "/overview/ranking/fluctuation" for c in conn.calls), "不应调用 fluctuation"
+    # 结果来自 /report：8001/8002/8003 全下滑，9002 不应出现
+    ids = {c["campaign_id"] for c in ctx["falling_top"]}
+    assert "9002" not in ids, "fluctuation 数据不应混入结果"
+    assert ctx["falling_top"][0].get("profit_change") == -100
