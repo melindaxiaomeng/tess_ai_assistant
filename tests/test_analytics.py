@@ -33,11 +33,12 @@ from tess_backend.analytics import (
 class MockConnector:
     """按 path + params 返回罐头数据，模拟 TeensingDataConnector.api_get。"""
 
-    def __init__(self, advertisers=None, users=None, report_by_dim=None, report_by_ids=None):
+    def __init__(self, advertisers=None, users=None, report_by_dim=None, report_by_ids=None, daily_kpi=None):
         self.advertisers = advertisers or []
         self.users = users or []
         self.report_by_dim = report_by_dim or {}      # dimensions -> list[rows]
         self.report_by_ids = report_by_ids or {}     # advertiser_ids csv -> list[rows]
+        self.daily_kpi = daily_kpi or []              # /overview/daily-kpi 返回的账户级日汇总
         self.calls = []
 
     def api_get(self, path, params=None, token=None, timeout=None):
@@ -53,6 +54,8 @@ class MockConnector:
         if path == "/overview/ranking/fluctuation":
             # 默认返回空（触发 /report 回退）；测试可 override api_get 来模拟成功
             return {"rising": [], "falling": []}
+        if path == "/overview/daily-kpi":
+            return self.daily_kpi
         if path == "/report":
             dim = (params or {}).get("dimensions")
             if dim == "date":
@@ -190,6 +193,12 @@ REPORT_DATE = [
     {"date": "2026-09-21", "revenue": 1200, "profit": 120, "clicks": 600, "conversions": 60},
 ]
 
+# account_profit_rollup 现走 /overview/daily-kpi（固定近 7 日），日期需在测试运行时的 7 日窗口内
+DAILY_KPI = [
+    {"date": "2026-10-08", "revenue": 1000, "profit": 100, "payout": 500, "clicks": 500, "conversions": 50},
+    {"date": "2026-10-09", "revenue": 1200, "profit": 120, "payout": 600, "clicks": 600, "conversions": 60},
+]
+
 # metric_ranking 测试数据集：11 个中庸 campaign（点击 100 / 转化 10 / CVR 0.1）
 # + 2 个特殊：900=超高点击低转化(CVR 0.002)、901=超高点击正常转化(CVR 0.1)
 _REPORT_CAMPAIGN_FILLER = [
@@ -208,7 +217,8 @@ REPORT_CAMPAIGN = _REPORT_CAMPAIGN_FILLER + [
 def _connector(**overrides):
     kw = dict(advertisers=ADVERTISERS, users=USERS,
               report_by_dim={"date": REPORT_DATE, "campaign": REPORT_CAMPAIGN},
-              report_by_ids=REPORT_BY_IDS)
+              report_by_ids=REPORT_BY_IDS,
+              daily_kpi=DAILY_KPI)
     kw.update(overrides)
     return MockConnector(**kw)
 
@@ -227,10 +237,10 @@ def test_account_profit_rollup_sums_daily():
 
 
 def test_account_profit_rollup_empty_report_is_honest():
-    conn = _connector(report_by_dim={"date": [], "campaign": []})
+    conn = _connector(daily_kpi=[])
     ctx = fetch_bi_analysis_context(conn, "account_profit_rollup", token="t", params={})
     assert ctx["total"]["revenue"] == 0
-    # 上游无数据时不臆测，errors 标记（LLM 会据此如实告知数据不足）
+    # 上游无数据时不臆测，daily 为空（LLM 会据此如实告知数据不足）
     assert ctx["daily"] == []
 
 

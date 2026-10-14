@@ -906,34 +906,37 @@ def fetch_bi_analysis_context(
     # 场景 15：全账户利润/营收汇总（近 N 天，按天维度归集）
     # ---------------------------------------------------------------
     elif analysis_type == "account_profit_rollup":
+        # /overview/daily-kpi 是账户级日汇总（近 7 日固定），含 profit；
+        # /report 不带实体过滤恒为空，不能再走那条路。
+        daily_raw, err_r = _safe_api_get(connector, "/overview/daily-kpi", token=token)
+        daily_raw = daily_raw if isinstance(daily_raw, list) else []
         try:
             days = int(params.get("days"))
         except (TypeError, ValueError):
-            days = 14
+            days = 7
         end = today.strftime("%Y-%m-%d")
         start = (today - timedelta(days=days)).strftime("%Y-%m-%d")
-        report, err_r = _safe_api_get(
-            connector, "/report",
-            params={"dimensions": "date", "date_start": start, "date_end": end,
-                    "page": 1, "page_size": 100}, token=token)
-        r_items = (report or {}).get("items", []) if isinstance(report, dict) else []
-        # /report dimensions=date 返回每日一行（账户级，无需指定实体）；
-        # 若上游不支持无实体过滤则返回空，errors 里体现，由 LLM 如实告知数据不足。
+
         daily, tot = [], {"revenue": 0.0, "profit": 0.0, "payout": 0.0, "clicks": 0, "conversions": 0}
-        for it in r_items:
+        for it in daily_raw:
+            d = str(it.get("date", ""))
+            if not d or d < start or d > end:
+                continue
             rev = _to_float(it.get("revenue")); pr = _to_float(it.get("profit"))
             po = _to_float(it.get("payout")); cl = int(_to_float(it.get("clicks")))
             cv = int(_to_float(it.get("conversions")))
             tot["revenue"] += rev; tot["profit"] += pr; tot["payout"] += po
             tot["clicks"] += cl; tot["conversions"] += cv
-            daily.append({"date": it.get("date"), "revenue": round(rev, 2),
-                          "profit": round(pr, 2), "clicks": cl, "conversions": cv})
+            daily.append({"date": d, "revenue": round(rev, 2),
+                          "profit": round(pr, 2), "payout": round(po, 2),
+                          "clicks": cl, "conversions": cv})
+        daily.sort(key=lambda x: x["date"])
         return {
             "analysis_type": "account_profit_rollup",
             "time_range": f"{start} ~ {end}",
             "days": days,
-            "metric_note": "全账户利润/营收汇总：经 /report(dimensions=date) 按天归集，不限定单一实体；"
-                           "若上游在无实体过滤时返回空，则无法汇总（属接口限制，非逻辑缺陷）。",
+            "metric_note": "全账户利润/营收汇总：经 /overview/daily-kpi 按天归集，已含 profit，无需指定实体；"
+                           "上游固定返回近 7 日，本地再按请求日期窗口过滤。",
             "total": {k: round(v, 2) if isinstance(v, float) else v for k, v in tot.items()},
             "daily": daily,
             "errors": [err_r] if err_r else [],
@@ -1297,7 +1300,7 @@ def _build_user_prompt(analysis_type: str, ctx: dict) -> str:
         "advertiser_deepdive": "以下是广告主档案与日 KPI 趋势，请分析该广告主的整体消耗与旗下活动表现。",
         "traffic_policy_check": "以下是该渠道/活动的映射、替换与屏蔽规则，请核查流量策略配置是否完整、是否存在风险。",
         "kpi_compare": "以下是该 Campaign 的指标趋势与同期对比，请分析波动原因与环比变化。",
-        "campaign_ranking": "以下是各 Campaign 的环比涨跌榜（rising/falling，字段含 campaign_id、campaign_name、revenue、revenue_change）。请找出利润/营收环比下滑最快的 Campaign，给出 campaign_id、名称、下滑幅度与可能原因。注意：涨跌榜口径为营收(revenue)环比，接口未提供独立利润(profit)环比字段，若用户问「利润」请明确说明并以营收环比作答。",
+        "campaign_ranking": "以下是各 Campaign 的环比涨跌榜（rising/falling，字段含 campaign_id、campaign_name、revenue、revenue_change、profit_change）。profit_change 已由 /report 按昨日 vs 前日回补真实利润环比并优先用于排序；只有该 campaign 无利润数据时才退到 revenue_change。请找出利润环比下滑最快的 Campaign，给出 campaign_id、名称、profit_change、revenue_change 与可能原因。",
         "pkg_deepdive": "以下是该包名在系统中的归属（广告主/渠道映射）与近 7 日跨 Campaign 营收/利润/Margin 表现，请分析该包的跑量情况、主要投放渠道与转化效率，并说明数据口径（来自 pkg-maps 归因 + /report 聚合，非单 campaign 视角）。",
         "owner_performance": "以下是该 AM/BD 负责人名下所有广告主近 7 日的消耗与利润表现，请汇总其业绩（总营收/利润、头部广告主、异常项），并说明数据口径（/advertisers?am|bd= 解析名下广告主 + /report 聚合）。",
         "cross_dimension": "以下是多个实体维度的交叉切片（近 7 日，各维度取交集 AND）。请围绕【交叉维度】作答：先说明本次是哪几个维度交叉、过滤后样本量，再给出联合视角下的营收/利润/Margin、头部明细（用表格），并指出交叉后暴露的结构性问题（如某广告主在某渠道集中、某负责人客户转化差）。数据口径：package 经 pkg-maps 归因到广告主、owner 经 /advertisers?am|bd= 归因到名下广告主，再与显式 advertiser_id 取交集后联合打 /report。",
@@ -1415,8 +1418,13 @@ _ANALYSIS_KEYWORDS: list = [
                                    "am为空", "没有负责人", "没有配置负责人", "缺am", "没有am"]),
     ("scaling_capacity", ["容量", "cap", "放量空间", "还能放", "预算上限", "放量容量", "容量评估"]),
     ("finance_check", ["对账", "毛利", "结算", "营收核对", "对账差异", "月报", "财务", "month", "invoice"]),
-    ("publisher_deepdive", ["渠道", "publisher", "媒体质量", "扣量", "作弊", "渠道质量"]),
-    ("account_overview", ["账户全景", "整体大盘", "总览", "概览", "全景", "account overview"]),
+    ("publisher_deepdive", ["渠道详情", "渠道明细", "渠道下钻", "这个渠道", "某个渠道",
+                            "渠道表现", "渠道趋势", "publisher", "媒体质量", "扣量", "作弊", "渠道质量"]),
+    ("account_overview", ["账户全景", "整体大盘", "总览", "概览", "全景", "account overview",
+                          "广告主大盘", "广告主数据", "广告主排名", "广告主排行", "广告主列表",
+                          "渠道大盘", "渠道数据", "渠道排名", "渠道排行", "渠道列表",
+                          "campaign大盘", "campaign数据", "campaign排名", "campaign排行",
+                          "活动数据", "活动大盘", "全盘", "全盘数据"]),
     ("daily_summary", ["复盘", "每日", "昨日", "昨天", "日报", "今日表现", "daily summary"]),
     ("account_profit_rollup", ["最近两周", "近两周", "近两周利润", "最近两周利润", "两周利润",
                                "两周的", "近期利润", "利润汇总", "总利润",
@@ -1426,7 +1434,8 @@ _ANALYSIS_KEYWORDS: list = [
     # am_leaderboard 必须排在 advertiser_deepdive 之前：「哪个AM负责的客户」会命中 advertiser_deepdive 的「客户」词
     ("am_leaderboard", ["哪个am", "am排名", "am业绩", "业绩排行", "am排行", "谁的利润最高",
                         "am业绩排名", "业绩最高", "am业绩排行", "am业绩盘点"]),
-    ("advertiser_deepdive", ["广告主", "advertiser", "主户", "客户"]),
+    ("advertiser_deepdive", ["广告主详情", "广告主明细", "广告主下钻", "这个广告主", "某个广告主",
+                             "广告主表现", "广告主趋势", "advertiser", "主户", "客户详情", "这个客户"]),
     ("traffic_policy_check", ["替换渠道", "切量", "切流量", "流量策略", "屏蔽", "block", "replace", "映射", "渠道映射"]),
     ("campaign_ranking", ["利润环比下滑", "利润下滑", "营收下滑", "环比下滑", "下滑最快", "跌幅最大", "掉得最快", "降幅最大", "哪个campaign", "哪个活动", "哪个 campaign", "谁掉得最快", "利润下降最快", "营收下降最快"]),
     ("metric_ranking", ["点击最大", "点击最高", "转化率最低", "转化最低", "高点击低转化",
