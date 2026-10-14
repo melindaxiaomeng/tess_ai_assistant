@@ -522,6 +522,44 @@ def test_advertiser_deepdive_long_span_monthly_aggregation():
                    for _, pr in report_calls), "不应出现整段 4 个月一次拉取"
 
 
+def test_advertiser_deepdive_campaign_daily_kpi_timeout_falls_back_to_30d():
+    """回归：campaign-daily-kpi 整段区间（如 7-10 月）触发后端读取超时（TimeoutError）时，
+    应缩小到最近 30 天兜底拿回 campaign 列表，而非整条链路因 campaigns 为空而『数据不足』。
+
+    这是线上 1000853 长周期查询从『崩溃』转为『优雅降级但缺数据』后，更进一步的根因修复：
+    默认 10s 超时太短，大广告主整段查询必超时。兜底拿到列表后 /report 切片仍能产出趋势。
+    """
+    from tess_backend.analytics import fetch_bi_analysis_context
+
+    class TimeoutThenOkConnector(MockConnector):
+        def api_get(self, path, params=None, token=None):
+            self.calls.append((path, dict(params or {})))
+            if path == "/advertisers/campaign-daily-kpi":
+                ds = (params or {}).get("date_start")
+                if ds == "2026-07-01":  # 整段 7-10 月 -> 模拟后端读取超时
+                    raise TimeoutError("The read operation timed out")
+                # 兜底（最近 30 天）-> 返回活跃 campaign 列表
+                return {
+                    "advertiser_id": (params or {}).get("advertiser_id"),
+                    "campaigns": [{"campaign_id": 9001, "revenue": 100}],
+                }
+            return super().api_get(path, params, token)
+
+    base = _connector()
+    conn = TimeoutThenOkConnector(
+        advertisers=base.advertisers, users=base.users,
+        report_by_dim=base.report_by_dim, report_by_ids=base.report_by_ids,
+    )
+    ctx = fetch_bi_analysis_context(
+        conn, "advertiser_deepdive", token="t",
+        params={"advertiser_id": "1000853", "date_start": "2026-07-01", "date_end": "2026-10-31"},
+    )
+    kpi_calls = [(p, pr) for (p, pr) in conn.calls if p == "/advertisers/campaign-daily-kpi"]
+    assert len(kpi_calls) == 2, f"整段超时后应触发一次 30 天兜底调用，实际 {len(kpi_calls)} 次"
+    # 兜底拿到 campaign 列表后，/report 按月切片应产出趋势（而非因列表空而缺失）
+    assert "9001" in ctx["campaign_trends"], "兜底拿到 campaign 列表后，/report 切片应产出趋势"
+
+
 def test_process_question_routes_digit_first_advertiser_to_deepdive():
     """端到端：『1000908这个广告主…』应路由到 advertiser_deepdive 且带 id，而非降级『数据不足』。"""
     llm = MockLLM()

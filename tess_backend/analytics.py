@@ -500,6 +500,17 @@ def fetch_bi_analysis_context(
             connector, "/advertisers/campaign-daily-kpi",
             params={"advertiser_id": aid, "date_start": ds, "date_end": de}, token=token,
         )
+        # 整段区间（如 7-10 月）对大广告主可能触发后端读取超时（默认 60s 仍可能不够）：
+        # 兜底缩小到最近 30 天重试，至少拿回活跃 campaign 列表（趋势仍走 /report 按月切片覆盖整段），
+        # 避免整条链路因 campaigns 为空而降级为「数据不足」。
+        if err_d:
+            _fb_start = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+            daily_fb, err_d_fb = _safe_api_get(
+                connector, "/advertisers/campaign-daily-kpi",
+                params={"advertiser_id": aid, "date_start": _fb_start, "date_end": de}, token=token,
+            )
+            if daily_fb is not None:
+                daily, err_d = daily_fb, err_d_fb
         rec_d = rec if isinstance(rec, dict) else {}
         daily_d = daily if isinstance(daily, dict) else {}
         # 旗下 Campaign（放宽到前 15 个，避免『其余 Campaign 明细数据不足』截断）

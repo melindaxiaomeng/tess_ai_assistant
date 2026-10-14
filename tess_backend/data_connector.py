@@ -196,7 +196,7 @@ class TeensingDataConnector:
         self,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
-        timeout: int = 10,
+        timeout: int = 60,
     ):
         self.base_url = (base_url or os.getenv("TESS_DATA_API_BASE_URL", "")).rstrip("/")
         self.api_key = api_key if api_key is not None else os.getenv("TESS_DATA_API_KEY", "")
