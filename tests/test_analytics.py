@@ -12,6 +12,7 @@
 """
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -60,22 +61,26 @@ class MockConnector:
             return {"items": self.report_by_ids.get(aids, [])}
         if path == "/advertisers/campaign-daily-kpi":
             aid = (params or {}).get("advertiser_id")
+            # 返回 15 个 campaign 以覆盖长周期『只拉前 8 个趋势』分支
+            camps = [{"campaign_id": 9000 + i, "revenue": 100 * (16 - i)} for i in range(1, 16)]
             return {
                 "advertiser_id": aid,
-                "start_date": "2026-10-07",
-                "end_date": "2026-10-13",
+                "start_date": (params or {}).get("date_start", "2026-10-07"),
+                "end_date": (params or {}).get("date_end", "2026-10-13"),
                 "total": {"revenue": 1234, "profit": 567},
-                "campaigns": [{"campaign_id": 9001, "revenue": 800},
-                              {"campaign_id": 9002, "revenue": 434}],
+                "campaigns": camps,
             }
         if path == "/campaign-kpi-trend":
             # 逐 Campaign 趋势；campaign_ids 为单 id（advertiser_deepdive 逐条并发拉）
+            # 返回跨 4 个月（7-10 月）的代表点，验证长周期月度聚合
             cid = (params or {}).get("campaign_ids")
-            base = {"9001": [{"time_label": "10-07", "revenue": 100, "clicks": 50, "cvr": 0.1, "margin_rate": 0.4, "payout": 60},
-                              {"time_label": "10-13", "revenue": 160, "clicks": 80, "cvr": 0.12, "margin_rate": 0.45, "payout": 90}],
-                    "9002": [{"time_label": "10-07", "revenue": 60, "clicks": 30, "cvr": 0.08, "margin_rate": 0.3, "payout": 40},
-                              {"time_label": "10-13", "revenue": 40, "clicks": 20, "cvr": 0.06, "margin_rate": 0.25, "payout": 30}]}
-            return {"items": base.get(str(cid), [])}
+            months = ["2026-07-31", "2026-08-31", "2026-09-30", "2026-10-31"]
+            if cid:
+                items = [{"time_label": m, "revenue": 100 + i * 10, "clicks": 50 + i * 5,
+                          "cvr": round(0.1 + i * 0.01, 2), "margin_rate": 0.4, "payout": 60}
+                         for i, m in enumerate(months)]
+                return {"items": items}
+            return {"items": []}
         if path.startswith("/advertisers/"):
             # /advertisers/{id} 档案查询（advertiser_deepdive 用）
             aid = path.split("/")[-1]
@@ -438,6 +443,53 @@ def test_extract_advertiser_id_digit_before_keyword():
         assert e.get("advertiser_name") is None, q  # 不应误填名称
 
 
+def test_extract_date_range_month_list():
+    """回归：『7,8,9月和10月』应抽出 date_start/date_end，覆盖长周期下钻盲区。
+
+    复现线上 bug：问『广告主1000853,7,8,9月和10月…』时系统不识别月份范围，
+    取数按默认范围拉全量，4 个月数据触发 80s 超时降级『数据不足』。
+    """
+    from tess_backend.analytics import extract_entities
+    e = extract_entities("广告主1000853，7,8,9月和10月，campaign维度数据有什么变化？", {})
+    assert e.get("advertiser_id") == "1000853"
+    # 当年 7 月 1 日 ~ 10 月 31 日
+    assert e.get("date_start") == f"{datetime.now().year}-07-01"
+    assert e.get("date_end") == f"{datetime.now().year}-10-31"
+
+
+def test_extract_date_range_last_n_months():
+    """『最近3个月』应抽到相对当前日期的范围。"""
+    from tess_backend.analytics import extract_entities
+    e = extract_entities("最近3个月的整体表现", {})
+    assert e.get("date_start") and e.get("date_end")
+    ds = datetime.strptime(e["date_start"], "%Y-%m-%d")
+    assert (datetime.now() - ds).days >= 85
+
+
+def test_advertiser_deepdive_long_span_monthly_aggregation():
+    """长周期（>35天）下钻：透传 date_range、只拉前 8 个 campaign 趋势、趋势按月聚合。
+
+    验证 『7-10 月』类请求不再无脑拉 15 个 campaign 逐日趋势导致 80s 超时，
+    且 LLM 能拿到每月代表点答『月度变化』。
+    """
+    from tess_backend.analytics import fetch_bi_analysis_context
+    ctx = fetch_bi_analysis_context(
+        _connector(), "advertiser_deepdive", token="t",
+        params={"advertiser_id": "1000853", "date_start": "2026-07-01", "date_end": "2026-10-31"},
+    )
+    assert ctx["date_range"] == "2026-07-01 ~ 2026-10-31"
+    assert ctx["long_span"] is True
+    # 长周期只拉前 8 个 campaign 趋势（9001~9008），9009+ 不拉
+    for cid in ("9001", "9008"):
+        assert cid in ctx["campaign_trends"], f"应含趋势 {cid}"
+    assert "9009" not in ctx["campaign_trends"], "长周期不应拉第 9+ 个 campaign 趋势"
+    # 趋势按月聚合（4 个月 -> 4 个代表点）
+    series = ctx["campaign_trends"]["9001"]
+    assert len(series) == 4, f"长周期趋势应聚合为 4 个月点，实际 {len(series)}"
+    assert series[0]["time_label"] == "2026-07-31"
+    assert series[-1]["time_label"] == "2026-10-31"
+
+
 def test_process_question_routes_digit_first_advertiser_to_deepdive():
     """端到端：『1000908这个广告主…』应路由到 advertiser_deepdive 且带 id，而非降级『数据不足』。"""
     llm = MockLLM()
@@ -465,7 +517,7 @@ def test_advertiser_deepdive_includes_campaign_trends():
     trends = res["campaign_trends"]
     # 旗下 9001/9002 两条 campaign 都应拉到趋势
     assert "9001" in trends and "9002" in trends
-    assert trends["9001"][-1]["revenue"] == 160  # 末日营收，供 LLM 判断变化方向
+    assert trends["9001"][-1]["revenue"] == 130  # 末日营收，供 LLM 判断变化方向
     # daily_kpi 的 campaigns 列表也应保留（不再 [:10] 之外的截断导致整体缺失）
     cids = [str(c["campaign_id"]) for c in res["daily_kpi"]["campaigns"]]
     assert "9001" in cids and "9002" in cids

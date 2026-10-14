@@ -491,10 +491,14 @@ def fetch_bi_analysis_context(
             return {"analysis_type": "advertiser_deepdive",
                     "errors": ["advertiser_deepdive 需要 advertiser_id 参数"]}
         aid = str(aid)
+        # 时间范围：优先用户明示（7/8/9/10月等），否则默认最近 30 天
+        ds = params.get("date_start") or (today - timedelta(days=30)).strftime("%Y-%m-%d")
+        de = params.get("date_end") or today.strftime("%Y-%m-%d")
+        long_span = (datetime.strptime(de, "%Y-%m-%d") - datetime.strptime(ds, "%Y-%m-%d")).days > 35
         rec, err_r = _safe_api_get(connector, f"/advertisers/{aid}", token=token)
         daily, err_d = _safe_api_get(
             connector, "/advertisers/campaign-daily-kpi",
-            params={"advertiser_id": aid}, token=token,
+            params={"advertiser_id": aid, "date_start": ds, "date_end": de}, token=token,
         )
         rec_d = rec if isinstance(rec, dict) else {}
         daily_d = daily if isinstance(daily, dict) else {}
@@ -503,16 +507,22 @@ def fetch_bi_analysis_context(
         campaigns = (daily_d.get("campaigns") or [])[:ADV_CAMP_MAX]
         # 逐 Campaign 并发拉趋势，补全 per-campaign 明细（变化/增长空间靠它答）
         campaign_trends = {}
-        trend_ids = [str(c.get("campaign_id")) for c in campaigns if c.get("campaign_id")][:ADV_CAMP_MAX]
+        # 长周期（>35天，如 7-10 月）只拉前 8 个 campaign 趋势，避免取数超时；短周期拉满 15
+        ADV_CAMP_TREND_MAX = 8 if long_span else ADV_CAMP_MAX
+        trend_ids = [str(c.get("campaign_id")) for c in campaigns if c.get("campaign_id")][:ADV_CAMP_TREND_MAX]
         trend_errs = []
 
         def _fetch_one_trend(cid):
             try:
                 t, err = _safe_api_get(connector, "/campaign-kpi-trend",
-                                       params={"campaign_ids": cid}, token=token)
+                                       params={"campaign_ids": cid, "date_start": ds, "date_end": de}, token=token)
                 items = (t or {}).get("items", []) if isinstance(t, dict) else []
-                series = _pick_many(items,
-                    ["time_label", "revenue", "clicks", "cvr", "margin_rate", "payout"])[:10]
+                if long_span:
+                    # 长周期：本地按月聚合（每月最后一点），避免逐日 120 点撑爆 prompt 与取数
+                    series = _monthly_from_daily(items)
+                else:
+                    series = _pick_many(items,
+                        ["time_label", "revenue", "clicks", "cvr", "margin_rate", "payout"])[:10]
                 return cid, series, err
             except Exception as e:  # noqa: BLE001 —— 单 campaign 趋势失败不应拖垮整轮
                 return cid, [], f"trend fetch failed: {type(e).__name__}: {e}"
@@ -529,11 +539,13 @@ def fetch_bi_analysis_context(
         return {
             "analysis_type": "advertiser_deepdive",
             "advertiser_id": aid,
+            "date_range": f"{ds} ~ {de}",
+            "long_span": long_span,
             "profile": {k: rec_d.get(k) for k in ("id", "name", "user_name", "bd", "am", "status", "status_name", "jointime")},
             "daily_kpi": {
                 "advertiser_id": daily_d.get("advertiser_id"),
-                "start_date": daily_d.get("start_date"),
-                "end_date": daily_d.get("end_date"),
+                "start_date": ds,
+                "end_date": de,
                 "total": daily_d.get("total"),
                 "campaigns": campaigns,
             },
@@ -1016,6 +1028,24 @@ def _pick_many(items, keys, limit: Optional[int] = None):
     return out
 
 
+def _monthly_from_daily(items):
+    """把按天的趋势序列本地聚合为按月代表序列（每月取最后一天的点）。
+
+    用于长周期（>35 天）下钻：避免逐日 100+ 点撑爆 prompt 与取数超时，
+    同时仍保留「月度变化」所需的粒度。time_label 形如 10-07 / 2026-10-07 均可解析。
+    """
+    by_month = {}
+    for it in (items or []):
+        tl = str(it.get("time_label", ""))
+        m = re.search(r"(?:(\d{4})-)?(\d{2})-(\d{2})", tl)
+        if not m:
+            continue
+        y = m.group(1) or str(datetime.now().year)
+        mk = f"{y}-{m.group(2)}"  # 月份 key
+        by_month[mk] = _pick(it, ["time_label", "revenue", "clicks", "cvr", "margin_rate", "payout"])
+    return [by_month[k] for k in sorted(by_month)]
+
+
 def _pct_delta(today: Optional[dict], yesterday: Optional[dict]) -> dict:
     """计算今日相对昨日的环比（仅对数值字段）。"""
     out = {}
@@ -1293,6 +1323,60 @@ def infer_all_analysis_types(question: str) -> list:
     return out
 
 
+def _extract_date_range(q: str):
+    """从自然语言抽取时间范围，返回 (date_start, date_end) 或 (None, None)。
+
+    支持：『7,8,9月和10月』『7月到10月』『7-9月』『最近3个月』『2026年7月』等。
+    跨年与 YYYY 年 形式一并识别；未识别则返回 None。
+    """
+    now = datetime.now()
+    year = now.year
+    # 显式年份：2026年7月、2026年7月到10月
+    ym = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月", q)
+    year_used = int(ym.group(1)) if ym else year
+
+    # 1) 月份列表 / 区间：7,8,9月和10月 | 7-9月 | 7月到10月
+    #    先抓『月』前面的整段数字串（支持逗号/顿号分隔的 7,8,9月），再拆成各月。
+    #    用 (?<!\d) 防止长数字（如广告主 ID 1000853）被误吞为月份起点。
+    months = []
+    for blk in re.findall(r"(?<![\d])([\d,，、\s]{0,15}?\d{1,2})\s*月", q):
+        # 只保留合法月份 1-12（过滤长数字如广告主 ID 1000853 被误吞的情况）
+        months.extend(int(x) for x in re.findall(r"\d+", blk) if 1 <= int(x) <= 12)
+    mrange = re.search(r"(\d{1,2})\s*月\s*(?:到|-|~|至)\s*(\d{1,2})\s*月", q)
+    if mrange:
+        mn, mx = int(mrange.group(1)), int(mrange.group(2))
+    elif months:
+        mn, mx = min(months), max(months)
+    else:
+        mn = mx = None
+    if mn and mx and 1 <= mn <= 12 and 1 <= mx <= 12:
+        ds = f"{year_used}-{mn:02d}-01"
+        if mx == 12:
+            de = f"{year_used}-12-31"
+        else:
+            de = (datetime(year_used, mx + 1, 1) - timedelta(days=1)).strftime("%Y-%m-%d")
+        return ds, de
+
+    # 2) 最近 N 个月
+    m = re.search(r"(?:最近|近)\s*(\d{1,2})\s*个?\s*月", q)
+    if m:
+        n = int(m.group(1))
+        end = now
+        start = end - timedelta(days=30 * n)
+        return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+    # 3) 显式 YYYY年M月（无区间，单月）
+    if ym:
+        mm = int(ym.group(2))
+        ds = f"{year_used}-{mm:02d}-01"
+        if mm == 12:
+            de = f"{year_used}-12-31"
+        else:
+            de = (datetime(year_used, mm + 1, 1) - timedelta(days=1)).strftime("%Y-%m-%d")
+        return ds, de
+    return None, None
+
+
 def extract_entities(question: str, params: Optional[dict]) -> dict:
     """从自然语言问题中抽取五维实体（Campaign / Advertiser / Publisher / Package / Owner）。
 
@@ -1316,7 +1400,7 @@ def extract_entities(question: str, params: Optional[dict]) -> dict:
         "campaign_id": None, "advertiser_id": None, "advertiser_name": None,
         "publisher_id": None, "publisher_name": None, "channel": None,
         "package_name": None, "owner_name": None, "owner_role": None,
-        "owner_user_id": None,
+        "owner_user_id": None, "date_start": None, "date_end": None,
     }
     # 1) 显性参数优先（前端胶囊/显式透传）
     if params.get("campaign_id"):
@@ -1405,6 +1489,13 @@ def extract_entities(question: str, params: Optional[dict]) -> dict:
             m2 = re.search(r"([\w\u4e00-\u9fa5]+)(?:\s*(?:的客户|负责的|手上|名下|管理))", q)
             if m2:
                 out["owner_name"] = m2.group(1)
+
+    # 7) 时间范围（月份列表 / 最近N月 / YYYY年M月）
+    ds, de = _extract_date_range(q)
+    if ds:
+        out["date_start"] = ds
+    if de:
+        out["date_end"] = de
     return out
 
 
@@ -1762,6 +1853,11 @@ def process_question(
                                                     "owner_role": ents.get("owner_role"),
                                                     "owner_name": ents.get("owner_name")}
         if ent_type:
+            # 把抽取到的时间范围并入 params（各深度分析类型透传给数据源）
+            if ents.get("date_start"):
+                params["date_start"] = ents["date_start"]
+            if ents.get("date_end"):
+                params["date_end"] = ents["date_end"]
             analysis_type = ent_type
             route_source = "entity"
         else:
@@ -1867,16 +1963,26 @@ def process_question(
         # advertiser_deepdive 含逐 Campaign 趋势，上下文更大，放宽截断避免『明细被截断』
         trim_limit = 14000 if analysis_type == "advertiser_deepdive" else 9000
         ctx_text = _trim_for_prompt(ctx, limit=trim_limit)  # 深度上下文更大，放宽截断
+        # 时间范围与长周期对比指导：让用户指定的 7-10 月等被 LLM 明确按月分析
+        date_hint = ""
+        if ctx.get("date_range"):
+            date_hint = f"【分析时间范围】{ctx['date_range']}"
+            if ctx.get("long_span"):
+                date_hint += ("（跨度较长，请按月对比各 Campaign 的变化趋势与环比，"
+                              "指出哪些月份/哪些 Campaign 下滑，并给出下降原因推测与放量机会）"
+                              "；趋势数据已按月聚合（每月一个代表点）。"
         user_prompt = (
             f"【Teensing 业务数据上下文（深度下钻：{analysis_type}）】\n"
             f"{ctx_text}\n\n"
             f"【用户问题】\n{question}\n\n"
+            f"{date_hint}\n\n"
             "请结合上方深度数据作答；若数据不足以回答，明确告知「数据不足，暂无法确认」，不要臆测。"
         )
         summary_extra = {
             "analysis_type": analysis_type,
             "route_source": route_source,
-            "date_or_month": ctx.get("date") or ctx.get("report_month") or ctx.get("time_range"),
+            "date_or_month": (ctx.get("date") or ctx.get("report_month")
+                             or ctx.get("time_range") or ctx.get("date_range")),
         }
     else:  # ③ 浅层全局兜底（保持原行为）
         if on_progress:
