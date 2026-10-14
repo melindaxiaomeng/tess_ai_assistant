@@ -862,42 +862,53 @@ def test_tool_schemas_enum_includes_new_types():
         assert all(t in e for e in enums), f"{t} 未在 tool_schemas.json 枚举中"
 
 
-def test_campaign_ranking_always_uses_report_and_produces_profit_change():
-    """campaign_ranking 始终基于 /report 自算真实环比（不再依赖 fluctuation），
-    产出含 profit_change 的完整 falling_top（带 campaign_id / campaign_name）。"""
-    conn = _connector()
-    ctx = fetch_bi_analysis_context(conn, "campaign_ranking", token="t")
-    assert ctx["analysis_type"] == "campaign_ranking"
-    assert not ctx["errors"], f"不应有错误: {ctx['errors']}"
-    report_calls = [c for c in conn.calls if c[0] == "/report"]
-    assert report_calls, "应调用 /report"
-    assert report_calls[0][1].get("dimensions") == "date,campaign"
-    assert report_calls[0][1].get("date_start") and report_calls[0][1].get("date_end")
-    assert ctx["falling_top"], "falling_top 不应为空"
-    top = ctx["falling_top"][0]
-    # 8001/8002/8003 利润均 100(本期) - 200(上期) = -100，均属下滑
-    assert top.get("profit_change") == -100, "利润环比应为 本期100 - 上期200 = -100"
-    assert "profit_change_pct" in top
-    assert top.get("campaign_id") and top.get("campaign_name"), "需带完整 campaign 信息供下钻"
-
-
-def test_campaign_ranking_ignores_fluctuation_when_present():
-    """即使 fluctuation 返回数据，campaign_ranking 仍基于 /report（不依赖该不可靠接口）。"""
-    class FlucConnector(MockConnector):
+def test_campaign_ranking_uses_fluctuation_and_enriches_with_report():
+    """campaign_ranking 用 fluctuation 拿全量涨跌榜，再用 /report?campaign_ids 回补
+    profit_change 与 campaign_name；排序优先 profit_change。"""
+    class RankingConnector(MockConnector):
         def api_get(self, path, params=None, token=None, timeout=None):
             self.calls.append((path, dict(params or {})))
             if path == "/overview/ranking/fluctuation":
                 return {
-                    "rising": [{"campaign_id": "9001", "campaign_name": "Camp 9001", "revenue_change": 50}],
-                    "falling": [{"campaign_id": "9002", "campaign_name": "Camp 9002", "revenue_change": -30}],
+                    "rising": [{"campaign_id": "8001", "campaign_name": "Camp 8001", "revenue_change": 50}],
+                    "falling": [{"campaign_id": "8002", "campaign_name": "Camp 8002", "revenue_change": -30}],
                 }
+            if path == "/report" and (params or {}).get("dimensions") == "date,hour,campaign":
+                ds = (params or {}).get("date_start")
+                de = (params or {}).get("date_end")
+                items = []
+                for d in (ds, de):
+                    is_prev = (d == ds)
+                    base = {"revenue": 1000 if is_prev else 800, "profit": 200 if is_prev else 100}
+                    for cid in ("8001", "8002", "8003"):
+                        for h in range(3):
+                            items.append({
+                                "date": d, "hour": h, "campaign_id": cid, "campaign_name": f"Camp {cid}",
+                                "revenue": base["revenue"] / 3, "profit": base["profit"] / 3,
+                            })
+                return {"items": items}
             return super().api_get(path, params, token, timeout)
 
-    conn = FlucConnector()
+    conn = RankingConnector()
     ctx = fetch_bi_analysis_context(conn, "campaign_ranking", token="t")
     assert ctx["analysis_type"] == "campaign_ranking"
-    assert not any(c[0] == "/overview/ranking/fluctuation" for c in conn.calls), "不应调用 fluctuation"
-    # 结果来自 /report：8001/8002/8003 全下滑，9002 不应出现
-    ids = {c["campaign_id"] for c in ctx["falling_top"]}
-    assert "9002" not in ids, "fluctuation 数据不应混入结果"
-    assert ctx["falling_top"][0].get("profit_change") == -100
+    # 应同时调用 fluctuation 与 /report?campaign_ids
+    assert any(c[0] == "/overview/ranking/fluctuation" for c in conn.calls)
+    report_calls = [c for c in conn.calls if c[0] == "/report"]
+    assert report_calls, "应调用 /report 回补"
+    assert report_calls[0][1].get("campaign_ids"), "report 应带 campaign_ids 过滤"
+    assert ctx["falling_top"], "falling_top 不应为空"
+    top = ctx["falling_top"][0]
+    assert top["campaign_id"] == "8002", "下滑最快应为 8002"
+    assert top.get("profit_change") == -100, "利润环比应为 本期100 - 上期200 = -100"
+    assert top.get("campaign_name"), "campaign_name 应由 /report 回补"
+    assert ctx["rising_top"][0]["campaign_id"] == "8001"
+
+
+def test_campaign_ranking_empty_when_fluctuation_empty():
+    """fluctuation 返回空时，campaign_ranking 优雅返回空榜单 + 说明错误，不崩溃。"""
+    conn = _connector()  # 默认 MockConnector 的 fluctuation 返回空
+    ctx = fetch_bi_analysis_context(conn, "campaign_ranking", token="t")
+    assert ctx["analysis_type"] == "campaign_ranking"
+    assert not ctx["rising_top"] and not ctx["falling_top"], "榜单应为空"
+    assert ctx["errors"], "应说明 fluctuation 无数据"

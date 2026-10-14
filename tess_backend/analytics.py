@@ -677,48 +677,65 @@ def fetch_bi_analysis_context(
     # 场景 9：跨 Campaign 排名 / 诊断（"哪个 Campaign 利润环比下滑最快"）
     # ---------------------------------------------------------------
     elif analysis_type == "campaign_ranking":
-        # 始终基于 /report 自算真实环比（不依赖 fluctuation，后者数据不全且常缺利润字段）。
-        # 窗口取「昨日 vs 前日」两个完整日，规避「今日」部分日导致的虚高/虚低。
-        yesterday = (today - timedelta(days=1)).strftime("%Y-%m-%d")
-        day_before = (today - timedelta(days=2)).strftime("%Y-%m-%d")
-        all_items = []
-        page = 1
-        while True:
-            report, err_report = _safe_api_get(
+        # fluctuation 是平台唯一的「全量 campaign 涨跌榜」免过滤来源；
+        # /report 不带 campaign_ids 等过滤时返回空，无法单独算全量榜。
+        # 因此：先用 fluctuation 拿全量榜（id + rising 完整信息），再用 /report?campaign_ids
+        # 回补真实 revenue/profit 算 profit_change 并补全 campaign_name（取昨日 vs 前日两完整日）。
+        fluc, err_fluc = _safe_api_get(connector, "/overview/ranking/fluctuation", token=token, timeout=30)
+        fluc_map = fluc if isinstance(fluc, dict) else {}
+        rising_raw = fluc_map.get("rising") or []
+        falling_raw = fluc_map.get("falling") or []
+        ids = sorted({_fmt_id(x.get("campaign_id")) for x in (rising_raw + falling_raw) if x.get("campaign_id")})
+        profit_map = {}
+        if ids:
+            yesterday = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+            day_before = (today - timedelta(days=2)).strftime("%Y-%m-%d")
+            report, err_r = _safe_api_get(
                 connector, "/report",
                 params={
-                    "dimensions": "date,campaign",
+                    "dimensions": "date,hour,campaign",
+                    "campaign_ids": ",".join(ids),
                     "date_start": day_before,
                     "date_end": yesterday,
-                    "page": page,
+                    "page": 1,
                     "page_size": 100,
                 },
-                token=token,
+                token=token, timeout=30,
             )
-            if err_report or not report:
-                break
-            rows = report.get("items", []) if isinstance(report, dict) else []
-            all_items.extend(rows)
-            if len(rows) < 100:
-                break
-            page += 1
-        candidates = _build_campaign_change({"items": all_items}, day_before, yesterday)
-        rising = [c for c in candidates if _change_metric(c) >= 0]
-        falling = [c for c in candidates if _change_metric(c) < 0]
+            if report:
+                profit_map = {c["campaign_id"]: c for c in _build_campaign_change(report, day_before, yesterday)}
+
+        def _enrich(item):
+            cid = _fmt_id(item.get("campaign_id"))
+            p = profit_map.get(cid, {})
+            return {
+                "campaign_id": cid,
+                "campaign_name": p.get("campaign_name") or item.get("campaign_name", ""),
+                "revenue_change": item.get("revenue_change", p.get("revenue_change")),
+                "profit_change": p.get("profit_change"),
+                "revenue": p.get("revenue"),
+                "profit": p.get("profit"),
+            }
+
+        rising = [_enrich(x) for x in rising_raw]
+        falling = [_enrich(x) for x in falling_raw]
         metric_note = (
-            "涨跌榜口径为日环比（昨日 vs 前日），基于 /report?dimensions=date,campaign "
-            "按 campaign 汇总真实 revenue/profit 计算；优先以利润(profit_change)排序，"
-            "缺失时退到营收(revenue_change)。本期取昨日（完整日）以规避今日部分日偏差。"
+            "涨跌榜由 /overview/ranking/fluctuation 提供全量 campaign 环比（营收 revenue_change 由平台计算）；"
+            "利润(profit_change)与 campaign_name 由 /report?campaign_ids 回补（取昨日 vs 前日两完整日）。"
+            "排序优先利润环比，缺失时退到营收环比。"
         )
         falling_sorted = sorted(falling, key=_change_metric)[:10]
         rising_sorted = sorted(rising, key=lambda x: -_change_metric(x))[:10]
-        errs = [] if all_items else ([err_report] if err_report else ["/report 在对比窗口内无数据"])
+        errs = []
+        if err_fluc:
+            errs.append(err_fluc)
+        if not (rising or falling):
+            errs.append("fluctuation 当前返回空（上游涨跌榜无数据，可能数据延迟）")
         return {
             "analysis_type": "campaign_ranking",
             "metric_note": metric_note + " falling_top 已按环比变化升序排列，[0] 即下滑最快的 Campaign。",
             "rising_top": rising_sorted,
             "falling_top": falling_sorted,
-            "time_range": f"{day_before} ~ {yesterday}",
             "errors": errs,
         }
 
