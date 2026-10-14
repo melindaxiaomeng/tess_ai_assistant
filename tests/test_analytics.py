@@ -50,6 +50,9 @@ class MockConnector:
             return {"total": len(self.advertisers), "items": chunk}
         if path == "/users/options":
             return self.users
+        if path == "/overview/ranking/fluctuation":
+            # 默认返回空（触发 /report 回退）；测试可 override api_get 来模拟成功
+            return {"rising": [], "falling": []}
         if path == "/report":
             dim = (params or {}).get("dimensions")
             if dim == "date":
@@ -70,6 +73,23 @@ class MockConnector:
                             "conversions": 50 + mi * 5, "cr": round(0.1 + mi * 0.01, 3),
                             "cvr": round(0.1 + mi * 0.01, 3), "margin_rate": 0.4,
                         })
+                return {"items": items}
+            if dim == "date,hour,campaign":
+                # campaign_ranking 回退场景：按 date 返回两天的 campaign 小时明细
+                ds = (params or {}).get("date_start", "2026-10-13")
+                de = (params or {}).get("date_end", "2026-10-14")
+                items = []
+                for d in (ds, de):
+                    for cid in ("8001", "8002", "8003"):
+                        base = {"2026-10-13": {"revenue": 1000, "profit": 200},
+                                "2026-10-14": {"revenue": 800, "profit": 100}}[d]
+                        # 3 个小时行，汇总后等于 base
+                        for h in range(3):
+                            items.append({
+                                "date": d, "hour": h, "campaign_id": cid,
+                                "campaign_name": f"Camp {cid}",
+                                "revenue": base["revenue"] / 3, "profit": base["profit"] / 3,
+                            })
                 return {"items": items}
             # advertiser 维度：按 advertiser_ids 命中预设聚合
             aids = (params or {}).get("advertiser_ids")
@@ -824,3 +844,42 @@ def test_tool_schemas_enum_includes_new_types():
              for s in schemas if s["function"]["name"] in ("tess_analyze", "tess_ask")]
     for t in ("account_profit_rollup", "am_leaderboard", "advertisers_missing_owner", "metric_ranking"):
         assert all(t in e for e in enums), f"{t} 未在 tool_schemas.json 枚举中"
+
+
+def test_campaign_ranking_uses_fluctuation_when_available():
+    """fluctuation 正常返回时，campaign_ranking 直接用涨跌榜，不再调 /report。"""
+    class FlucConnector(MockConnector):
+        def api_get(self, path, params=None, token=None, timeout=None):
+            self.calls.append((path, dict(params or {})))
+            if path == "/overview/ranking/fluctuation":
+                return {
+                    "rising": [
+                        {"campaign_id": "9001", "campaign_name": "Camp 9001", "revenue_change": 50},
+                    ],
+                    "falling": [
+                        {"campaign_id": "9002", "campaign_name": "Camp 9002", "revenue_change": -30},
+                    ],
+                }
+            return super().api_get(path, params, token, timeout)
+
+    conn = FlucConnector()
+    ctx = fetch_bi_analysis_context(conn, "campaign_ranking", token="t")
+    assert ctx["analysis_type"] == "campaign_ranking"
+    assert ctx["falling_top"][0]["campaign_id"] == "9002"
+    assert ctx["rising_top"][0]["campaign_id"] == "9001"
+    assert not any(c[0] == "/report" for c in conn.calls), "fluctuation 可用时不应调 /report"
+
+
+def test_campaign_ranking_falls_back_to_report_on_fluctuation_empty():
+    """fluctuation 超时/为空时，campaign_ranking 回退 /report 自己算 campaign 级利润环比。"""
+    conn = _connector()
+    ctx = fetch_bi_analysis_context(conn, "campaign_ranking", token="t")
+    assert ctx["analysis_type"] == "campaign_ranking"
+    assert not ctx["errors"], f"不应有错误: {ctx['errors']}"
+    report_calls = [c for c in conn.calls if c[0] == "/report"]
+    assert report_calls, "应回退调用 /report"
+    assert report_calls[0][1].get("dimensions") == "date,hour,campaign"
+    assert ctx["falling_top"], "falling_top 不应为空"
+    top = ctx["falling_top"][0]
+    assert top.get("profit_change") == -100, "利润环比应为 今日100 - 昨日200 = -100"
+    assert "profit_change_pct" in top
