@@ -510,28 +510,44 @@ def fetch_bi_analysis_context(
         trend_errs = []
 
         if long_span and campaigns:
-            # 长周期（>35天，如 7-10 月）：一次 /report(date,campaign) 聚合，
-            # 替代逐个 Campaign 拉 /campaign-kpi-trend 的 N 个请求，彻底避免取数超时。
+            # 长周期（>35天，如 7-10 月）：按月切片并发拉 /report(date,campaign)。
+            # 单月数据量远小于整段 4 个月，单请求更快；并发后墙钟≈最慢单月，
+            # 彻底规避「整段区间一次 /report」在后端慢查询下撑爆 80s 预算的问题。
             cid_list = [str(c.get("campaign_id")) for c in campaigns if c.get("campaign_id")][:ADV_CAMP_MAX]
-            r_params = {
-                "dimensions": "date,campaign",
-                "campaign_ids": ",".join(cid_list),
-                "date_start": ds, "date_end": de,
-                "page": 1, "page_size": 300,
-            }
+            month_ranges = _split_months(ds, de)
+
+            def _fetch_month(ms: str, me: str):
+                p = {
+                    "dimensions": "date,campaign",
+                    "campaign_ids": ",".join(cid_list),
+                    "date_start": ms, "date_end": me,
+                    "page": 1, "page_size": 300,
+                }
+                items = []
+                for _ in range(20):  # 分页安全阀，避免无限翻页
+                    rep, err = _safe_api_get(connector, "/report", params=p, token=token)
+                    rep_items = (rep or {}).get("items", []) if isinstance(rep, dict) else []
+                    items.extend(rep_items)
+                    if err:
+                        return items, err
+                    if len(rep_items) < p["page_size"]:
+                        break
+                    p["page"] += 1
+                return items, None
+
             r_items = []
-            for _ in range(20):  # 分页安全阀，避免无限翻页
-                rep, err = _safe_api_get(connector, "/report", params=r_params, token=token)
-                rep_items = (rep or {}).get("items", []) if isinstance(rep, dict) else []
-                r_items.extend(rep_items)
-                if err:
-                    trend_errs.append(err)
-                if len(rep_items) < r_params["page_size"]:
-                    break
-                r_params["page"] += 1
+            month_errs = []
+            with ThreadPoolExecutor(max_workers=min(len(month_ranges), 4)) as ex:
+                futs = {ex.submit(_fetch_month, ms, me): (ms, me) for ms, me in month_ranges}
+                for fut in as_completed(futs):
+                    items, err = fut.result()
+                    r_items.extend(items)
+                    if err:
+                        month_errs.append(err)
             campaign_trends = _monthly_by_campaign(r_items)
             if not campaign_trends:
-                trend_errs.append("长周期 /report(date,campaign) 聚合返回空（可能不支持该维度组合）")
+                hint = f"；分月错误：{month_errs}" if month_errs else ""
+                trend_errs.append("长周期 /report(date,campaign) 聚合返回空（可能不支持该维度组合）" + hint)
         else:
             # 短周期：逐 Campaign 并发拉 /campaign-kpi-trend（已验证可用）
             trend_ids = [str(c.get("campaign_id")) for c in campaigns if c.get("campaign_id")][:ADV_CAMP_MAX]
@@ -1086,6 +1102,32 @@ def _monthly_by_campaign(items):
                                 "revenue", "profit", "payout", "clicks",
                                 "conversions", "cr", "cvr", "margin_rate"])
     return {cid: [months[k] for k in sorted(months)] for cid, months in by_camp.items()}
+
+
+def _split_months(ds: str, de: str):
+    """把 [ds, de] 拆成按月区间列表，每片 [月初, 月末]，含两端闭区间。
+
+    用于长周期下钻：把整段 4 个月区间切成单月分片并发取数，缩小单请求数据量、
+    压低墙钟时间，规避「整段区间一次 /report」撑爆整体取数预算。
+    """
+    start = datetime.strptime(ds, "%Y-%m-%d")
+    end = datetime.strptime(de, "%Y-%m-%d")
+    out = []
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        ms = f"{y:04d}-{m:02d}-01"
+        if m == 12:
+            ny, nm = y + 1, 1
+        else:
+            ny, nm = y, m + 1
+        last = datetime(ny, nm, 1) - timedelta(days=1)
+        me = end.strftime("%Y-%m-%d") if (y, m) == (end.year, end.month) else last.strftime("%Y-%m-%d")
+        out.append((ms, me))
+        if m == 12:
+            y, m = y + 1, 1
+        else:
+            m += 1
+    return out
 
 
 def _pct_delta(today: Optional[dict], yesterday: Optional[dict]) -> dict:

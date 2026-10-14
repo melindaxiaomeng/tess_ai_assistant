@@ -488,8 +488,9 @@ def test_advertiser_deepdive_long_span_monthly_aggregation():
     而是一次 /report 聚合后本地按月分组，LLM 能拿到每月代表点答『月度变化』。
     """
     from tess_backend.analytics import fetch_bi_analysis_context
+    conn = _connector()
     ctx = fetch_bi_analysis_context(
-        _connector(), "advertiser_deepdive", token="t",
+        conn, "advertiser_deepdive", token="t",
         params={"advertiser_id": "1000853", "date_start": "2026-07-01", "date_end": "2026-10-31"},
     )
     assert ctx["date_range"] == "2026-07-01 ~ 2026-10-31"
@@ -503,6 +504,22 @@ def test_advertiser_deepdive_long_span_monthly_aggregation():
     assert series[-1]["date"] == "2026-10-31"
     # 转化率字段在 /report 下为 cr（非 cvr），两者皆被保留
     assert "cr" in series[0]
+
+    # 回归：长周期必须按月切片并发取数，绝不能退化成『整段 07-01~10-31 一次 /report』，
+    # 否则后端慢查询会撑爆 80s 预算（线上 1000853 超时根因）。
+    report_calls = [(p, pr) for (p, pr) in conn.calls if p == "/report"
+                    and pr.get("dimensions") == "date,campaign"]
+    assert len(report_calls) == 4, f"应按月切片发 4 次 /report，实际 {len(report_calls)} 次"
+    month_ranges = sorted((pr["date_start"], pr["date_end"]) for _, pr in report_calls)
+    assert month_ranges == [
+        ("2026-07-01", "2026-07-31"),
+        ("2026-08-01", "2026-08-31"),
+        ("2026-09-01", "2026-09-30"),
+        ("2026-10-01", "2026-10-31"),
+    ], f"切片区间不正确：{month_ranges}"
+    # 确认没有『整段一次性』调用
+    assert not any(pr.get("date_start") == "2026-07-01" and pr.get("date_end") == "2026-10-31"
+                   for _, pr in report_calls), "不应出现整段 4 个月一次拉取"
 
 
 def test_process_question_routes_digit_first_advertiser_to_deepdive():
