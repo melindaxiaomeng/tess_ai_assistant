@@ -35,19 +35,57 @@ MIN_REVENUE_USD = float(os.getenv("TESS_MIN_REVENUE_USD", "20"))
 CLIFF_DROP_THRESHOLD = float(os.getenv("TESS_CLIFF_DROP_THRESHOLD", "0.5"))
 
 
+def _ensure_scheme(url: str) -> str:
+    """防御性补全协议：配置/后台可能只填裸域名（如 adminv3.seanear.com），
+
+    缺协议时默认补 https://。注意：**绝不 append 路径**——/api/v1 那段由配置方
+    在 base_url 里写全（该字段还可能被别处原样使用，代码不擅自改它的值）。
+    """
+    if not url:
+        return url
+    if "://" not in url:
+        return "https://" + url
+    return url
+
+
+def _db_base_url(platform_id: str) -> Optional[str]:
+    """从后台平台管理（tess_platforms 表）读取该平台的 base_url。
+
+    让 /tess/admin/platforms 界面配置即时生效（无需改 .env、无需重启）。
+    DB 不可用（测试 / 未初始化 / 表不存在）时静默回退到 .env，不抛异常、不阻断取数。
+    """
+    try:
+        from .platform_registry import get_platform_registry
+        row = get_platform_registry().get_dict(platform_id)
+        if row:
+            bu = row.get("base_url")
+            if bu:
+                return str(bu)
+    except Exception as e:  # noqa: BLE001 —— DB 读取失败不应阻断取数
+        logger.warning("从 tess_platforms 读 base_url 失败，回退 .env：%s", e)
+    return None
+
+
 def get_platform_base_url(platform_id: Optional[str] = None) -> str:
     """按 platform_id 解析 SaaS 数据 API 根地址（支持多平台各自独立源站）。
 
-    优先级：
-      1) TESS_PLATFORM_API_BASE_URLS（JSON: {"Melodong": "...", "Seanear": "..."}）
-      2) 回退全局 TESS_DATA_API_BASE_URL（旧配置，兼容单平台 Melodong）
+    优先级（取第一个非空）：
+      1) 后台平台管理 tess_platforms.base_url（/tess/admin/platforms 配置，即时生效）
+      2) TESS_PLATFORM_API_BASE_URLS（JSON: {"Melodong": "...", "Seanear": "..."}）
+      3) 全局 TESS_DATA_API_BASE_URL（旧配置，兼容单平台 Melodong）
 
-    platform_id 为空 / 映射查不到 / JSON 解析失败 -> 回退全局值（不报错）。
-    返回会统一 rstrip("/")，避免 base_url + path 拼接出双斜杠。
+    - 若只填裸域名（缺协议），自动补 https://；绝不补路径（/api/v1 需配置时写全）。
+    - platform_id 空 / 各层都查不到 -> 回退全局值（不报错）。
+    - 返回统一 rstrip("/")，避免 base_url + path 拼接出双斜杠。
     """
-    default = os.getenv("TESS_DATA_API_BASE_URL", "")
+    default = _ensure_scheme(os.getenv("TESS_DATA_API_BASE_URL", ""))
     if not platform_id:
         return default.rstrip("/")
+    # 1) 后台配置优先（即时生效，无需改 .env / 重启）
+    db_url = _db_base_url(platform_id)
+    if db_url:
+        return _ensure_scheme(db_url).rstrip("/")
+    # 2) .env 的 JSON 映射
     raw = os.getenv("TESS_PLATFORM_API_BASE_URLS", "")
     if raw:
         try:
@@ -57,7 +95,7 @@ def get_platform_base_url(platform_id: Optional[str] = None) -> str:
                 lower_map = {str(k).lower(): v for k, v in mapping.items()}
                 url = lower_map.get(str(platform_id).lower())
                 if url:
-                    return str(url).rstrip("/")
+                    return _ensure_scheme(str(url)).rstrip("/")
         except (ValueError, TypeError):
             logger.warning("TESS_PLATFORM_API_BASE_URLS 解析失败，回退全局 base")
     return default.rstrip("/")
@@ -226,7 +264,7 @@ class TeensingDataConnector:
         api_key: Optional[str] = None,
         timeout: int = 60,
     ):
-        self.base_url = (base_url or os.getenv("TESS_DATA_API_BASE_URL", "")).rstrip("/")
+        self.base_url = _ensure_scheme(base_url or os.getenv("TESS_DATA_API_BASE_URL", "")).rstrip("/")
         self.api_key = api_key if api_key is not None else os.getenv("TESS_DATA_API_KEY", "")
         self.timeout = int(os.getenv("TESS_DATA_API_TIMEOUT", str(timeout)))
         if not self.base_url:

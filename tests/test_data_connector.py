@@ -152,6 +152,33 @@ def test_get_data_connector_passes_platform_id(monkeypatch):
     assert c.base_url == "https://adminv3.seanear.com/api/v1"
 
 
+def test_get_platform_base_url_db_takes_priority(monkeypatch):
+    """后台 tess_platforms 配置的 base_url 应优先于 .env 的 JSON 映射（即时生效）。"""
+    monkeypatch.setenv("TESS_DATA_API_BASE_URL", "https://fallback.example.com/api/v1")
+    monkeypatch.setenv(
+        "TESS_PLATFORM_API_BASE_URLS",
+        '{"Seanear":"https://env-seanear.com/api/v1"}',
+    )
+    # 模拟后台已为该平台配置 base_url
+    monkeypatch.setattr(
+        "tess_backend.data_connector._db_base_url",
+        lambda pid: "https://db-seanear.com/api/v1",
+    )
+    assert get_platform_base_url("Seanear") == "https://db-seanear.com/api/v1"
+
+
+def test_get_platform_base_url_adds_https_scheme(monkeypatch):
+    """裸域名（缺协议）应自动补 https://；绝不补路径（/api/v1 需配置方写全）。"""
+    monkeypatch.setenv("TESS_DATA_API_BASE_URL", "https://adminv3.melodong.com/api/v1")
+    monkeypatch.delenv("TESS_PLATFORM_API_BASE_URLS", raising=False)
+    # DB 返回裸域名（无协议、无路径）
+    monkeypatch.setattr(
+        "tess_backend.data_connector._db_base_url",
+        lambda pid: "adminv3.seanear.com/api/v1",
+    )
+    assert get_platform_base_url("Seanear") == "https://adminv3.seanear.com/api/v1"
+
+
 @pytest.fixture
 def client(monkeypatch):
     # LLM 用 Mock，不触真实模型
