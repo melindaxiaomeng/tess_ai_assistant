@@ -1321,10 +1321,12 @@ def extract_entities(question: str, params: Optional[dict]) -> dict:
                     out["campaign_id"] = m2.group(1)
 
     # 3) Advertiser（adv_数字 / advertiser 数字 / 广告主+名称）
+    #    语序同时支持：关键字在前(广告主1000908) 与 数字在前(1000908这个广告主)
     if not out["advertiser_id"]:
         m = (re.search(r"adv[:_\s]*(\d{4,})", q)
              or re.search(r"(\d{4,})\s*(?:adv|advertiser)\b", q)
-             or re.search(r"(?:adv|advertiser|广告主|客户)[\s_:：\-]{0,5}(\d{4,})", q))
+             or re.search(r"(?:adv|advertiser|广告主|客户)[\s_:：\-]{0,5}(\d{4,})", q)
+             or re.search(r"(\d{4,})\s*(?:这个|的)?\s*(?:广告主|客户)", q))
         if m:
             out["advertiser_id"] = m.group(1)
         else:

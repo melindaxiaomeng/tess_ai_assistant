@@ -58,6 +58,21 @@ class MockConnector:
             # advertiser 维度：按 advertiser_ids 命中预设聚合
             aids = (params or {}).get("advertiser_ids")
             return {"items": self.report_by_ids.get(aids, [])}
+        if path.startswith("/advertisers/"):
+            # /advertisers/{id} 档案查询（advertiser_deepdive 用）
+            aid = path.split("/")[-1]
+            rec = next((a for a in self.advertisers if str(a.get("id")) == str(aid)), None)
+            return rec or {"id": aid, "name": f"Adv {aid}", "status": 1}
+        if path == "/advertisers/campaign-daily-kpi":
+            aid = (params or {}).get("advertiser_id")
+            return {
+                "advertiser_id": aid,
+                "start_date": "2026-10-07",
+                "end_date": "2026-10-13",
+                "total": {"revenue": 1234, "profit": 567},
+                "campaigns": [{"campaign_id": 9001, "revenue": 800},
+                              {"campaign_id": 9002, "revenue": 434}],
+            }
         return None
 
 
@@ -397,6 +412,38 @@ def test_tess_agent_http_client_has_stream():
 # ---------------------------------------------------------------------------
 # 6) /tess/ask 端点：SSE 内容协商 + 帧顺序（HTTP 层）
 # ---------------------------------------------------------------------------
+
+def test_extract_advertiser_id_digit_before_keyword():
+    """回归：『数字 + 这个广告主』应抽出 advertiser_id，而非误当名称。
+
+    复现线上 bug：问『1000908这个广告主…』返回『数据不足』——
+    根因是 extract_entities 只支持『广告主1000908』(关键字在前) 与
+    『1000908 advertiser』(英文)，不支持『数字+中文关键字』语序，
+    导致 advertiser_id 一直为 None、1000908 被当 advertiser_name 走名称解析失败。
+    """
+    from tess_backend.analytics import extract_entities
+    for q in ("1000908这个广告主，最近一周有什么变化？还有什么增长空间？",
+              "1000908的广告主最近有增长空间吗",
+              "1000908 广告主 环比"):
+        e = extract_entities(q, {})
+        assert e.get("advertiser_id") == "1000908", q
+        assert e.get("advertiser_name") is None, q  # 不应误填名称
+
+
+def test_process_question_routes_digit_first_advertiser_to_deepdive():
+    """端到端：『1000908这个广告主…』应路由到 advertiser_deepdive 且带 id，而非降级『数据不足』。"""
+    llm = MockLLM()
+    q = "1000908这个广告主，最近一周有什么变化？还有什么增长空间？"
+    res = process_question(q, _connector(), llm, token="t")
+    cs = res["context_summary"]
+    assert cs["route_source"] == "entity"
+    assert cs["analysis_type"] == "advertiser_deepdive"
+    # 实体抽取带入了 advertiser_id，下游取数不再因缺参数报错（errors 应为空）
+    assert cs.get("errors") == []
+    # LLM 上下文应含该广告主画像，而非『数据不足，暂无法确认』
+    assert "1000908" in llm.last_user
+    assert "数据不足" not in res["answer"]
+
 
 def _parse_sse(text):
     """把 SSE 文本解析成事件 dict 列表（同前端 tessAskStream 的解析逻辑）。"""
