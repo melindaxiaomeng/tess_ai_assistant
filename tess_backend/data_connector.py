@@ -34,6 +34,34 @@ MIN_REVENUE_USD = float(os.getenv("TESS_MIN_REVENUE_USD", "20"))
 # >= 该阈值，仍送诊断（避免漏掉小投放突然崩盘）。可通过 TESS_CLIFF_DROP_THRESHOLD 调整，默认 0.5（50%）。
 CLIFF_DROP_THRESHOLD = float(os.getenv("TESS_CLIFF_DROP_THRESHOLD", "0.5"))
 
+
+def get_platform_base_url(platform_id: Optional[str] = None) -> str:
+    """按 platform_id 解析 SaaS 数据 API 根地址（支持多平台各自独立源站）。
+
+    优先级：
+      1) TESS_PLATFORM_API_BASE_URLS（JSON: {"Melodong": "...", "Seanear": "..."}）
+      2) 回退全局 TESS_DATA_API_BASE_URL（旧配置，兼容单平台 Melodong）
+
+    platform_id 为空 / 映射查不到 / JSON 解析失败 -> 回退全局值（不报错）。
+    返回会统一 rstrip("/")，避免 base_url + path 拼接出双斜杠。
+    """
+    default = os.getenv("TESS_DATA_API_BASE_URL", "")
+    if not platform_id:
+        return default.rstrip("/")
+    raw = os.getenv("TESS_PLATFORM_API_BASE_URLS", "")
+    if raw:
+        try:
+            mapping = json.loads(raw)
+            if isinstance(mapping, dict):
+                # 大小写不敏感：键与查询都归一到 lower 再比对
+                lower_map = {str(k).lower(): v for k, v in mapping.items()}
+                url = lower_map.get(str(platform_id).lower())
+                if url:
+                    return str(url).rstrip("/")
+        except (ValueError, TypeError):
+            logger.warning("TESS_PLATFORM_API_BASE_URLS 解析失败，回退全局 base")
+    return default.rstrip("/")
+
 # 开发/测试用样例原始事件（结构接近 Teensing 预期返回，已可直接归一化为 Context）
 _SAMPLE_RAW = {
     "event_id": "ERR-20260728-0912",
@@ -979,15 +1007,19 @@ def extract_realtime_anomalies(
     return contexts
 
 
-def get_data_connector() -> DataConnector:
+def get_data_connector(platform_id: Optional[str] = None) -> DataConnector:
     """按环境变量 TESS_DATA_CONNECTOR 选择具体实现（默认 mock，零配置可跑）。
 
     - 未设置 / "mock" -> MockDataConnector（开发、测试、离线演示）
-    - "teensing"      -> TeensingDataConnector（生产，需 TESS_DATA_API_BASE_URL）
+    - "teensing"      -> TeensingDataConnector（生产，base_url 按 platform_id 解析；
+                        platform_id=None 回退全局 TESS_DATA_API_BASE_URL 兼容单平台）
+
+    platform_id 透传给 get_platform_base_url，使不同平台（Melodong / Seanear ...）
+    各自打到独立源站；取数 token 仍由调用方逐请求传入（见 _headers）。
     """
     kind = os.getenv("TESS_DATA_CONNECTOR", "mock").lower()
     if kind == "teensing":
-        return TeensingDataConnector()
+        return TeensingDataConnector(base_url=get_platform_base_url(platform_id))
     if kind == "mock":
         return MockDataConnector()
     raise ValueError(f"未知 TESS_DATA_CONNECTOR={kind!r}（支持 mock | teensing）")

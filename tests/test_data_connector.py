@@ -12,6 +12,7 @@ from tess_backend.data_connector import (
     MockDataConnector,
     TeensingDataConnector,
     get_data_connector,
+    get_platform_base_url,
     normalize_to_context,
     extract_realtime_anomalies,
     _severity_for_drop,
@@ -102,6 +103,53 @@ def test_get_data_connector_teensing_unconfigured(monkeypatch):
     monkeypatch.delenv("TESS_DATA_API_BASE_URL", raising=False)
     with pytest.raises(RuntimeError):
         get_data_connector()
+
+
+def test_get_platform_base_url_global_fallback(monkeypatch):
+    """platform_id 为空 / 缺映射 -> 回退全局 TESS_DATA_API_BASE_URL（兼容单平台）。"""
+    monkeypatch.setenv("TESS_DATA_API_BASE_URL", "https://adminv3.melodong.com/api/v1/")
+    monkeypatch.delenv("TESS_PLATFORM_API_BASE_URLS", raising=False)
+    assert get_platform_base_url() == "https://adminv3.melodong.com/api/v1"
+    assert get_platform_base_url(None) == "https://adminv3.melodong.com/api/v1"
+    # 映射里查不到的 platform_id 也回退全局
+    monkeypatch.setenv(
+        "TESS_PLATFORM_API_BASE_URLS",
+        '{"Melodong":"https://adminv3.melodong.com/api/v1"}',
+    )
+    assert get_platform_base_url("Seanear") == "https://adminv3.melodong.com/api/v1"
+
+
+def test_get_platform_base_url_per_platform(monkeypatch):
+    """platform_id 命中映射 -> 返回该平台独立源站，且统一 rstrip('/')。"""
+    monkeypatch.setenv("TESS_DATA_API_BASE_URL", "https://adminv3.melodong.com/api/v1")
+    monkeypatch.setenv(
+        "TESS_PLATFORM_API_BASE_URLS",
+        '{"Melodong":"https://adminv3.melodong.com/api/v1","Seanear":"https://adminv3.seanear.com/api/v1/"}',
+    )
+    assert get_platform_base_url("Seanear") == "https://adminv3.seanear.com/api/v1"
+    # 大小写不敏感
+    assert get_platform_base_url("seanear") == "https://adminv3.seanear.com/api/v1"
+    assert get_platform_base_url("Melodong") == "https://adminv3.melodong.com/api/v1"
+
+
+def test_get_platform_base_url_bad_json_falls_back(monkeypatch):
+    """TESS_PLATFORM_API_BASE_URLS 非 JSON -> 回退全局，不报错。"""
+    monkeypatch.setenv("TESS_DATA_API_BASE_URL", "https://adminv3.melodong.com/api/v1")
+    monkeypatch.setenv("TESS_PLATFORM_API_BASE_URLS", "not-json{")
+    assert get_platform_base_url("Seanear") == "https://adminv3.melodong.com/api/v1"
+
+
+def test_get_data_connector_passes_platform_id(monkeypatch):
+    """teensing 模式下 get_data_connector(platform_id) 要按平台选 base_url。"""
+    monkeypatch.setenv("TESS_DATA_CONNECTOR", "teensing")
+    monkeypatch.setenv("TESS_DATA_API_BASE_URL", "https://adminv3.melodong.com/api/v1")
+    monkeypatch.setenv(
+        "TESS_PLATFORM_API_BASE_URLS",
+        '{"Seanear":"https://adminv3.seanear.com/api/v1"}',
+    )
+    c = get_data_connector("Seanear")
+    assert isinstance(c, TeensingDataConnector)
+    assert c.base_url == "https://adminv3.seanear.com/api/v1"
 
 
 @pytest.fixture

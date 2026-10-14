@@ -512,11 +512,11 @@ def post_analytics(payload: dict, request: Request) -> dict:
     for _k in ("campaign_id", "advertiser_id", "publisher_id"):
         if (payload or {}).get(_k) is not None:
             params[_k] = (payload or {}).get(_k)
+    platform_id = _platform_id(request)
     try:
-        connector = get_data_connector()
+        connector = get_data_connector(platform_id=platform_id)
     except (RuntimeError, ValueError) as e:
         raise HTTPException(status_code=503, detail=f"Tess 未配置 Teensing 数据源：{e}")
-    platform_id = _platform_id(request)
     operator = _operator_id(request) if request else "anonymous"
     effective_token, token_mode = _resolve_access_token(request, platform_id)
     # LLM key 按平台隔离：平台 llm_api_key > 全局 TESS_LLM_API_KEY
@@ -579,11 +579,11 @@ def post_ask(payload: dict, request: Request):
     history_text, history_entities = (None, None)
     if chat_id:
         history_text, history_entities = load_history(chat_id)
+    platform_id = _platform_id(request)
     try:
-        connector = get_data_connector()
+        connector = get_data_connector(platform_id=platform_id)
     except (RuntimeError, ValueError) as e:
         raise HTTPException(status_code=503, detail=f"Tess 未配置 Teensing 数据源：{e}")
-    platform_id = _platform_id(request)
     operator = _operator_id(request) if request else "anonymous"
     effective_token, token_mode = _resolve_access_token(request, platform_id)
     # LLM key 按平台隔离：平台 llm_api_key > 全局 TESS_LLM_API_KEY

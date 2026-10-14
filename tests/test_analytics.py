@@ -710,7 +710,7 @@ def test_ask_sse_stream_emits_ordered_frames():
     from fastapi.testclient import TestClient
 
     app_module._require_ai_entitlement = lambda req: None
-    app_module.get_data_connector = lambda: _connector()
+    app_module.get_data_connector = lambda *a, **k: _connector()
     app_module._get_llm_client = lambda pid: MockLLM()
     app_module._resolve_access_token = lambda req, pid: ("", "system")
     app_module._platform_id = lambda req: "default"
@@ -743,7 +743,7 @@ def test_ask_non_stream_returns_json():
     from fastapi.testclient import TestClient
 
     app_module._require_ai_entitlement = lambda req: None
-    app_module.get_data_connector = lambda: _connector()
+    app_module.get_data_connector = lambda *a, **k: _connector()
     app_module._get_llm_client = lambda pid: MockLLM()
     app_module._resolve_access_token = lambda req, pid: ("", "system")
     app_module._platform_id = lambda req: "default"
@@ -773,7 +773,7 @@ def test_ask_non_stream_json_with_nonstandard_types():
     from decimal import Decimal
 
     app_module._require_ai_entitlement = lambda req: None
-    app_module.get_data_connector = lambda: _connector()
+    app_module.get_data_connector = lambda *a, **k: _connector()
     app_module._get_llm_client = lambda pid: MockLLM()
     app_module._resolve_access_token = lambda req, pid: ("", "system")
     app_module._platform_id = lambda req: "default"

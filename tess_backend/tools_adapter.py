@@ -114,7 +114,7 @@ def _resolve_runtime(request):
     platform_id 不参与取数，仅用于落库打标与 LLM key 解析。
     """
     from .app import (
-        _get_data_connector,
+        get_data_connector,
         _get_llm_client,
         _operator_id,
         _platform_id,
@@ -123,9 +123,11 @@ def _resolve_runtime(request):
     )
     from fastapi import HTTPException
 
-    connector = _get_data_connector()
-    operator = _operator_id(request) if request is not None else "anonymous"
     platform_id = _platform_id(request) if request is not None else None
+    # 每次新建 connector 并透传 platform_id，使 /tess/tool 也按平台打到独立源站
+    # （不能用缓存单例 _get_data_connector，否则多平台共用首个平台的 base_url）
+    connector = get_data_connector(platform_id=platform_id)
+    operator = _operator_id(request) if request is not None else "anonymous"
     # LLM key 按平台隔离：平台 llm_api_key（DeepSeek 按平台开 key）> 全局 TESS_LLM_API_KEY
     llm = _get_llm_client(platform_id)
     effective_token, token_mode = _resolve_access_token(request, platform_id)
