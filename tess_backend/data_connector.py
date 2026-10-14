@@ -233,7 +233,8 @@ class TeensingDataConnector:
         return resp
 
     def _http_get(
-        self, path: str, params: Optional[dict] = None, token: Optional[str] = None
+        self, path: str, params: Optional[dict] = None, token: Optional[str] = None,
+        timeout: Optional[int] = None,
     ) -> dict:
         url = self.base_url + path
         if params:
@@ -242,7 +243,7 @@ class TeensingDataConnector:
             url, headers=self._headers(token), method="GET"
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
                 raw = resp.read().decode("utf-8")
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:500]
@@ -254,9 +255,13 @@ class TeensingDataConnector:
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Teensing 数据 API 返回非 JSON：{e}") from e
 
-    def api_get(self, path: str, params: Optional[dict] = None, token: Optional[str] = None):
-        """公开透传：供 analytics 等模块复用传输层（自动 unwrap Teensing {code,data} 外壳）。"""
-        return self._unwrap(self._http_get(path, params=params, token=token))
+    def api_get(self, path: str, params: Optional[dict] = None, token: Optional[str] = None, timeout: Optional[int] = None):
+        """公开透传：供 analytics 等模块复用传输层（自动 unwrap Teensing {code,data} 外壳）。
+
+        timeout 可选：单次覆盖实例级 self.timeout（用于长周期下钻给慢接口设短超时，
+        避免单个请求拖死整体取数预算），不传则用实例默认值（环境变量 TESS_DATA_API_TIMEOUT）。
+        """
+        return self._unwrap(self._http_get(path, params=params, token=token, timeout=timeout))
 
     # ----- DataConnector 接口实现 -----
 

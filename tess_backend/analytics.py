@@ -96,10 +96,13 @@ BI_SYSTEM_PROMPT = """你叫 Tess，是 Teensing 平台的专属 AdTech 商业�
 # 数据加载器：按分析类型拼装结构化上下文
 # ---------------------------------------------------------------------------
 
-def _safe_api_get(connector, path: str, params: Optional[dict] = None, token: Optional[str] = None):
-    """带容错的 Teensing 接口调用：成功返回 (data, None)，失败返回 (None, error_str)。"""
+def _safe_api_get(connector, path: str, params: Optional[dict] = None, token: Optional[str] = None, timeout: Optional[int] = None):
+    """带容错的 Teensing 接口调用：成功返回 (data, None)，失败返回 (None, error_str)。
+
+    timeout 可选：单次覆盖 connector 的实例级超时（见 TeensingDataConnector.api_get）。
+    """
     try:
-        return connector.api_get(path, params=params, token=token), None
+        return connector.api_get(path, params=params, token=token, timeout=timeout), None
     except Exception as e:  # noqa: BLE001 —— 分析场景宁可返回局部错误也不崩整轮
         return None, f"{path} 调用失败: {type(e).__name__}: {e}"
 
@@ -496,21 +499,22 @@ def fetch_bi_analysis_context(
         de = params.get("date_end") or today.strftime("%Y-%m-%d")
         long_span = (datetime.strptime(de, "%Y-%m-%d") - datetime.strptime(ds, "%Y-%m-%d")).days > 35
         rec, err_r = _safe_api_get(connector, f"/advertisers/{aid}", token=token)
+        # 拿旗下 Campaign 列表：列表只关心『有哪些 campaign』，与历史区间无关。
+        # 长周期（如 7-10 月）绝不用整段区间拉 campaign-daily-kpi —— 大广告主整段慢查询会吃光
+        # 80s 取数预算；直接用短区间（最近 30 天）拉，数据量小必快；整段仅作短区间失败时的极端兜底。
+        # 两路都设 25s 短超时：单请求最多 25s 快速失败，绝不会把 80s 预算拖死。
+        _list_start = (today - timedelta(days=30)).strftime("%Y-%m-%d") if long_span else ds
         daily, err_d = _safe_api_get(
             connector, "/advertisers/campaign-daily-kpi",
-            params={"advertiser_id": aid, "date_start": ds, "date_end": de}, token=token,
+            params={"advertiser_id": aid, "date_start": _list_start, "date_end": de}, token=token,
+            timeout=25,
         )
-        # 整段区间（如 7-10 月）对大广告主可能触发后端读取超时（默认 60s 仍可能不够）：
-        # 兜底缩小到最近 30 天重试，至少拿回活跃 campaign 列表（趋势仍走 /report 按月切片覆盖整段），
-        # 避免整条链路因 campaigns 为空而降级为「数据不足」。
-        if err_d:
-            _fb_start = (today - timedelta(days=30)).strftime("%Y-%m-%d")
-            daily_fb, err_d_fb = _safe_api_get(
+        if err_d:  # 短区间也失败 -> 极端兜底：整段区间（快速失败，不拖死 80s 预算）
+            daily, err_d = _safe_api_get(
                 connector, "/advertisers/campaign-daily-kpi",
-                params={"advertiser_id": aid, "date_start": _fb_start, "date_end": de}, token=token,
+                params={"advertiser_id": aid, "date_start": ds, "date_end": de}, token=token,
+                timeout=25,
             )
-            if daily_fb is not None:
-                daily, err_d = daily_fb, err_d_fb
         rec_d = rec if isinstance(rec, dict) else {}
         daily_d = daily if isinstance(daily, dict) else {}
         # 旗下 Campaign（放宽到前 15 个，避免『其余 Campaign 明细数据不足』截断）
@@ -529,7 +533,8 @@ def fetch_bi_analysis_context(
         def _fetch_one_trend(cid):
             try:
                 t, err = _safe_api_get(connector, "/campaign-kpi-trend",
-                                       params={"campaign_ids": cid, "date_start": ds, "date_end": de}, token=token)
+                                       params={"campaign_ids": cid, "date_start": ds, "date_end": de}, token=token,
+                                       timeout=25)
                 items = (t or {}).get("items", []) if isinstance(t, dict) else []
                 if long_span:
                     series = _monthly_from_daily(items)

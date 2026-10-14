@@ -40,7 +40,7 @@ class MockConnector:
         self.report_by_ids = report_by_ids or {}     # advertiser_ids csv -> list[rows]
         self.calls = []
 
-    def api_get(self, path, params=None, token=None):
+    def api_get(self, path, params=None, token=None, timeout=None):
         self.calls.append((path, dict(params or {})))
         if path == "/advertisers":
             pg = int((params or {}).get("page", 1))
@@ -346,7 +346,7 @@ def test_scan_list_pages_merges_multiple_pages():
 def test_compound_dispatch_survives_subtype_failure():
     """复合分发的任一子类型取数异常时，应被捕获（转 errors）而非让整轮崩溃。"""
     class BoomConnector(MockConnector):
-        def api_get(self, path, params=None, token=None):
+        def api_get(self, path, params=None, token=None, timeout=None):
             raise RuntimeError("upstream boom")
 
     llm = MockLLM()
@@ -578,31 +578,30 @@ def test_advertiser_deepdive_prompt_view_keeps_monthly_trends_before_truncation(
     assert "9015" in view_text, "截断后最后一个 campaign 的月度趋势应存活"
 
 
-def test_advertiser_deepdive_campaign_daily_kpi_timeout_falls_back_to_30d():
-    """回归：campaign-daily-kpi 整段区间（如 7-10 月）触发后端读取超时（TimeoutError）时，
-    应缩小到最近 30 天兜底拿回 campaign 列表，而非整条链路因 campaigns 为空而『数据不足』。
+def test_advertiser_deepdive_campaign_daily_kpi_short_interval_first_then_full_fallback():
+    """回归：长周期下钻拿 campaign 列表应先用短区间（最近 30 天），而非整段 7-10 月。
 
-    这是线上 1000853 长周期查询从『崩溃』转为『优雅降级但缺数据』后，更进一步的根因修复：
-    默认 10s 超时太短，大广告主整段查询必超时。兜底拿到列表后 /report 切片仍能产出趋势。
+    整段区间对大广告主是慢查询，会吃光 80s 取数预算；短区间数据量小必快。
+    仅当短区间也失败时，才回退整段区间兜底（快速失败，不拖死预算）。
     """
     from tess_backend.analytics import fetch_bi_analysis_context
 
-    class TimeoutThenOkConnector(MockConnector):
-        def api_get(self, path, params=None, token=None):
+    class ShortFirstFallbackConnector(MockConnector):
+        def api_get(self, path, params=None, token=None, timeout=None):
             self.calls.append((path, dict(params or {})))
             if path == "/advertisers/campaign-daily-kpi":
                 ds = (params or {}).get("date_start")
-                if ds == "2026-07-01":  # 整段 7-10 月 -> 模拟后端读取超时
-                    raise TimeoutError("The read operation timed out")
-                # 兜底（最近 30 天）-> 返回活跃 campaign 列表
-                return {
-                    "advertiser_id": (params or {}).get("advertiser_id"),
-                    "campaigns": [{"campaign_id": 9001, "revenue": 100}],
-                }
-            return super().api_get(path, params, token)
+                if ds == "2026-07-01":  # 整段兜底 -> 成功返回列表
+                    return {
+                        "advertiser_id": (params or {}).get("advertiser_id"),
+                        "campaigns": [{"campaign_id": 9001, "revenue": 100}],
+                    }
+                # 短区间（最近 30 天）-> 模拟后端读取超时
+                raise TimeoutError("The read operation timed out")
+            return super().api_get(path, params, token, timeout)
 
     base = _connector()
-    conn = TimeoutThenOkConnector(
+    conn = ShortFirstFallbackConnector(
         advertisers=base.advertisers, users=base.users,
         report_by_dim=base.report_by_dim, report_by_ids=base.report_by_ids,
     )
@@ -611,9 +610,12 @@ def test_advertiser_deepdive_campaign_daily_kpi_timeout_falls_back_to_30d():
         params={"advertiser_id": "1000853", "date_start": "2026-07-01", "date_end": "2026-10-31"},
     )
     kpi_calls = [(p, pr) for (p, pr) in conn.calls if p == "/advertisers/campaign-daily-kpi"]
-    assert len(kpi_calls) == 2, f"整段超时后应触发一次 30 天兜底调用，实际 {len(kpi_calls)} 次"
-    # 兜底拿到 campaign 列表后，/report 按月切片应产出趋势（而非因列表空而缺失）
-    assert "9001" in ctx["campaign_trends"], "兜底拿到 campaign 列表后，/report 切片应产出趋势"
+    assert len(kpi_calls) == 2, f"短区间超时后应触发一次整段兜底，实际 {len(kpi_calls)} 次"
+    # 第一次必为短区间（最近 30 天，date_start != 整段），第二次为整段兜底
+    assert kpi_calls[0][1]["date_start"] != "2026-07-01", "长周期应先用短区间拿列表"
+    assert kpi_calls[1][1]["date_start"] == "2026-07-01", "兜底应是整段区间"
+    # 兜底拿到 campaign 列表后，逐 campaign /campaign-kpi-trend 应产出趋势（而非因列表空而缺失）
+    assert "9001" in ctx["campaign_trends"], "兜底拿到 campaign 列表后，应产出趋势"
 
 
 def test_process_question_routes_digit_first_advertiser_to_deepdive():
