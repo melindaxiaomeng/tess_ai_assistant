@@ -120,7 +120,7 @@ def fetch_bi_analysis_context(
       'publisher_deepdive'     -> 渠道质量对比（Publisher 目录 + 扣量/质量率）
       'scaling_capacity'       -> 放量容量评估（Campaign Cap + 近 7 日利润/Margin + 全局 Cap）
       'campaign_detail'        -> 单 Campaign 微观下钻（配置/Cap/质量时序/CTIT-ETIT/指标趋势）
-      'advertiser_deepdive'    -> 广告主维度（档案 + 日 KPI + 旗下 Campaign）
+      'advertiser_deepdive'    -> 广告主维度（档案 + 日 KPI + 旗下 Campaign + 逐 Campaign 趋势）
       'traffic_policy_check'   -> 流量策略核查（渠道映射/替换渠道/屏蔽规则）
       'kpi_compare'            -> 指标趋势与同期对比（KPI 趋势 + 区间对比）
       'campaign_ranking'       -> 跨 Campaign 排名/诊断（涨跌榜 rising/falling，按 revenue_change 排序，答"哪个 Campaign 环比下滑最快"）
@@ -483,7 +483,7 @@ def fetch_bi_analysis_context(
         }
 
     # ---------------------------------------------------------------
-    # 场景 8：广告主维度（档案 + 日 KPI + 旗下 Campaign）
+    # 场景 8：广告主维度（档案 + 日 KPI + 旗下 Campaign + 逐 Campaign 趋势）
     # ---------------------------------------------------------------
     elif analysis_type == "advertiser_deepdive":
         aid = params.get("advertiser_id")
@@ -498,6 +498,34 @@ def fetch_bi_analysis_context(
         )
         rec_d = rec if isinstance(rec, dict) else {}
         daily_d = daily if isinstance(daily, dict) else {}
+        # 旗下 Campaign（放宽到前 15 个，避免『其余 Campaign 明细数据不足』截断）
+        ADV_CAMP_MAX = 15
+        campaigns = (daily_d.get("campaigns") or [])[:ADV_CAMP_MAX]
+        # 逐 Campaign 并发拉趋势，补全 per-campaign 明细（变化/增长空间靠它答）
+        campaign_trends = {}
+        trend_ids = [str(c.get("campaign_id")) for c in campaigns if c.get("campaign_id")][:ADV_CAMP_MAX]
+        trend_errs = []
+
+        def _fetch_one_trend(cid):
+            try:
+                t, err = _safe_api_get(connector, "/campaign-kpi-trend",
+                                       params={"campaign_ids": cid}, token=token)
+                items = (t or {}).get("items", []) if isinstance(t, dict) else []
+                series = _pick_many(items,
+                    ["time_label", "revenue", "clicks", "cvr", "margin_rate", "payout"])[:10]
+                return cid, series, err
+            except Exception as e:  # noqa: BLE001 —— 单 campaign 趋势失败不应拖垮整轮
+                return cid, [], f"trend fetch failed: {type(e).__name__}: {e}"
+
+        if trend_ids:
+            with ThreadPoolExecutor(max_workers=min(len(trend_ids), 8)) as ex:
+                futs = {ex.submit(_fetch_one_trend, cid): cid for cid in trend_ids}
+                for fut in as_completed(futs):
+                    cid, series, err = fut.result()
+                    if series:
+                        campaign_trends[cid] = series
+                    if err:
+                        trend_errs.append(err)
         return {
             "analysis_type": "advertiser_deepdive",
             "advertiser_id": aid,
@@ -507,9 +535,10 @@ def fetch_bi_analysis_context(
                 "start_date": daily_d.get("start_date"),
                 "end_date": daily_d.get("end_date"),
                 "total": daily_d.get("total"),
-                "campaigns": (daily_d.get("campaigns") or [])[:10],
+                "campaigns": campaigns,
             },
-            "errors": [e for e in (err_r, err_d) if e],
+            "campaign_trends": campaign_trends,
+            "errors": [e for e in (err_r, err_d, *trend_errs) if e],
         }
 
     # ---------------------------------------------------------------
@@ -1817,7 +1846,9 @@ def process_question(
             on_progress(analysis_type, _STAGE_LABELS.get(analysis_type, analysis_type), 1, 1)
         ctx = fetch_bi_analysis_context(connector, analysis_type, token=token, params=params)
         ctx = _enrich_names_with_ids(ctx)  # 名称追加 (id)，便于核对实体
-        ctx_text = _trim_for_prompt(ctx, limit=9000)  # 深度上下文更大，放宽截断
+        # advertiser_deepdive 含逐 Campaign 趋势，上下文更大，放宽截断避免『明细被截断』
+        trim_limit = 14000 if analysis_type == "advertiser_deepdive" else 9000
+        ctx_text = _trim_for_prompt(ctx, limit=trim_limit)  # 深度上下文更大，放宽截断
         user_prompt = (
             f"【Teensing 业务数据上下文（深度下钻：{analysis_type}）】\n"
             f"{ctx_text}\n\n"

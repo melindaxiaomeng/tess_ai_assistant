@@ -58,11 +58,6 @@ class MockConnector:
             # advertiser 维度：按 advertiser_ids 命中预设聚合
             aids = (params or {}).get("advertiser_ids")
             return {"items": self.report_by_ids.get(aids, [])}
-        if path.startswith("/advertisers/"):
-            # /advertisers/{id} 档案查询（advertiser_deepdive 用）
-            aid = path.split("/")[-1]
-            rec = next((a for a in self.advertisers if str(a.get("id")) == str(aid)), None)
-            return rec or {"id": aid, "name": f"Adv {aid}", "status": 1}
         if path == "/advertisers/campaign-daily-kpi":
             aid = (params or {}).get("advertiser_id")
             return {
@@ -73,6 +68,19 @@ class MockConnector:
                 "campaigns": [{"campaign_id": 9001, "revenue": 800},
                               {"campaign_id": 9002, "revenue": 434}],
             }
+        if path == "/campaign-kpi-trend":
+            # 逐 Campaign 趋势；campaign_ids 为单 id（advertiser_deepdive 逐条并发拉）
+            cid = (params or {}).get("campaign_ids")
+            base = {"9001": [{"time_label": "10-07", "revenue": 100, "clicks": 50, "cvr": 0.1, "margin_rate": 0.4, "payout": 60},
+                              {"time_label": "10-13", "revenue": 160, "clicks": 80, "cvr": 0.12, "margin_rate": 0.45, "payout": 90}],
+                    "9002": [{"time_label": "10-07", "revenue": 60, "clicks": 30, "cvr": 0.08, "margin_rate": 0.3, "payout": 40},
+                              {"time_label": "10-13", "revenue": 40, "clicks": 20, "cvr": 0.06, "margin_rate": 0.25, "payout": 30}]}
+            return {"items": base.get(str(cid), [])}
+        if path.startswith("/advertisers/"):
+            # /advertisers/{id} 档案查询（advertiser_deepdive 用）
+            aid = path.split("/")[-1]
+            rec = next((a for a in self.advertisers if str(a.get("id")) == str(aid)), None)
+            return rec or {"id": aid, "name": f"Adv {aid}", "status": 1}
         return None
 
 
@@ -443,6 +451,24 @@ def test_process_question_routes_digit_first_advertiser_to_deepdive():
     # LLM 上下文应含该广告主画像，而非『数据不足，暂无法确认』
     assert "1000908" in llm.last_user
     assert "数据不足" not in res["answer"]
+
+
+def test_advertiser_deepdive_includes_campaign_trends():
+    """advertiser_deepdive 应并发拉取旗下每个 Campaign 的趋势，补全 per-campaign 明细。
+
+    回归：此前只返回聚合 KPI + 旗下 campaign 营收，LLM 因缺 per-campaign 明细
+    而报『其余 Campaign 明细数据不足，暂无法确认』。
+    """
+    res = fetch_bi_analysis_context(_connector(), "advertiser_deepdive",
+                                   token="t", params={"advertiser_id": "1000908"})
+    assert res["analysis_type"] == "advertiser_deepdive"
+    trends = res["campaign_trends"]
+    # 旗下 9001/9002 两条 campaign 都应拉到趋势
+    assert "9001" in trends and "9002" in trends
+    assert trends["9001"][-1]["revenue"] == 160  # 末日营收，供 LLM 判断变化方向
+    # daily_kpi 的 campaigns 列表也应保留（不再 [:10] 之外的截断导致整体缺失）
+    cids = [str(c["campaign_id"]) for c in res["daily_kpi"]["campaigns"]]
+    assert "9001" in cids and "9002" in cids
 
 
 def _parse_sse(text):
