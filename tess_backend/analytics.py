@@ -658,35 +658,158 @@ def fetch_bi_analysis_context(
             except Exception as e:  # noqa: BLE001
                 return cid, [], f"trend fetch failed: {type(e).__name__}: {e}"
 
+        campaign_summary = []
+        camp_master = {}
         if long_span:
-            months = _months_between(ds, de)
-            ranked = sorted(campaigns, key=lambda c: _to_float(c.get("revenue")) or 0, reverse=True)
-            ADV_CAMP_MAX = 8  # 头部优先，控制请求数
-            ranked_ids = [str(c.get("campaign_id")) for c in ranked if c.get("campaign_id")][:ADV_CAMP_MAX]
-            jobs = [(cid, y, m) for cid in ranked_ids for (y, m) in months]
-            JOB_CAP = 40
-            if len(jobs) > JOB_CAP:
-                jobs = jobs[:JOB_CAP]
-                trend_errs.append(f"Campaign×月份组合数超 {JOB_CAP}，已截断到前 {JOB_CAP} 个任务（优先头部 Campaign + 近期月份）")
-            if jobs:
-                started = time.monotonic()
-                with ThreadPoolExecutor(max_workers=min(len(jobs), 12)) as ex:
-                    futs = {ex.submit(_fetch_month, cid, y, m): (cid, y, m) for (cid, y, m) in jobs}
-                    for fut in as_completed(futs):
-                        if time.monotonic() - started > 72:  # 全局兜底：绝不拖死 80s 预算
-                            trend_errs.append("取数接近整体预算上限，剩余 Campaign 月份趋势未拉取")
-                            break
-                        cid, items, err = fut.result()
-                        if err:
-                            trend_errs.append(err)
-                        if items:
-                            campaign_trends.setdefault(cid, []).extend(items)
-                # 逐 campaign 把跨月日序列聚合成每月一个代表点
-                for cid, items in list(campaign_trends.items()):
-                    campaign_trends[cid] = _monthly_from_daily(items)
+            # 长周期：优先用 /report 批量聚合（一次覆盖 30 个 campaign 全区间），
+            # 若上游 /report 无数据或失败，回退到旧的逐 campaign 逐月拉取，保证兼容性。
+            def _fetch_summary_page(page):
+                return _safe_api_get(
+                    connector, "/report",
+                    params={
+                        "advertiser_ids": aid,
+                        "dimensions": "campaign",
+                        "date_start": ds,
+                        "date_end": de,
+                        "page": page,
+                        "page_size": 100,
+                    },
+                    token=token, timeout=45,
+                )
+
+            summary_items = []
+            err_summary = None
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                futs = {ex.submit(_fetch_summary_page, p): p for p in (1, 2)}
+                for fut in as_completed(futs):
+                    r, err = fut.result()
+                    if err:
+                        err_summary = err
+                    if isinstance(r, dict) and r.get("items"):
+                        summary_items.extend(r["items"])
+            if err_summary:
+                trend_errs.append(err_summary)
+
+            if summary_items:
+                # 新路径：/report 批量聚合
+                ADV_CAMP_MAX = 30
+                ranked = sorted(
+                    summary_items,
+                    key=lambda c: _to_float(c.get("revenue")) or 0,
+                    reverse=True,
+                )
+                top_items = ranked[:ADV_CAMP_MAX]
+                campaign_summary = top_items
+                # 去重：上游分页偶发重复行时，避免同一 campaign 被请求两次
+                top_ids, _seen = [], set()
+                for c in top_items:
+                    cid = c.get("campaign_id")
+                    if cid and str(cid) not in _seen:
+                        _seen.add(str(cid))
+                        top_ids.append(str(cid))
+                jobs = top_ids  # 供下方『无数据』判断复用
+
+                # 步骤1.5：用 /campaigns 一次性拉取 top30 的主数据（含 campaign_status_name / name），
+                # 避免长周期用短区间 campaign-daily-kpi 漏掉近期无活动的头部 campaign 而导致 status 全 null。
+                camp_master = {}
+                if top_ids:
+                    cm, err_cm = _safe_api_get(
+                        connector, "/campaigns",
+                        params={"campaign_ids": ",".join(top_ids), "page": 1, "page_size": 100},
+                        token=token, timeout=30,
+                    )
+                    if isinstance(cm, dict) and cm.get("items"):
+                        for c in cm["items"]:
+                            camp_master[str(c.get("campaign_id"))] = c
+                    if err_cm:
+                        trend_errs.append(err_cm)
+
+                # 步骤2：批量取 top campaign 的日明细，本地按月聚合（替代 campaign-kpi-trend 逐月）。
+                if top_ids:
+                    def _fetch_detail_page(page):
+                        return _safe_api_get(
+                            connector, "/report",
+                            params={
+                                "campaign_ids": ",".join(top_ids),
+                                "dimensions": "campaign,date",
+                                "date_start": ds,
+                                "date_end": de,
+                                "page": page,
+                                "page_size": 100,
+                            },
+                            token=token, timeout=60,
+                        )
+
+                    MAX_DETAIL_PAGES = 30  # 30 camp × 100 天 ≈ 30 页，覆盖常见情况
+                    detail_items = []
+                    err_detail = None
+                    started = time.monotonic()
+                    with ThreadPoolExecutor(max_workers=min(MAX_DETAIL_PAGES, 8)) as ex:
+                        futs = {ex.submit(_fetch_detail_page, p): p for p in range(1, MAX_DETAIL_PAGES + 1)}
+                        for fut in as_completed(futs):
+                            if time.monotonic() - started > 70:  # 全局兜底：不拖死 80s 预算
+                                trend_errs.append("取数接近整体预算上限，剩余明细未拉取")
+                                break
+                            r, err = fut.result()
+                            if err:
+                                err_detail = err
+                            if isinstance(r, dict) and r.get("items"):
+                                detail_items.extend(r["items"])
+                    if err_detail:
+                        trend_errs.append(err_detail)
+
+                    raw_trends = defaultdict(list)
+                    for it in detail_items:
+                        cid = str(it.get("campaign_id"))
+                        if not cid:
+                            continue
+                        raw_trends[cid].append({
+                            "time_label": it.get("date"),
+                            "revenue": it.get("revenue"),
+                            "clicks": it.get("clicks"),
+                            "cvr": it.get("cr"),
+                            "margin_rate": it.get("margin"),
+                            "payout": it.get("payout"),
+                        })
+                    for cid, items in raw_trends.items():
+                        campaign_trends[cid] = _monthly_from_daily(items)
+            else:
+                # 回退路径：/report 不可用（测试 Mock 或上游失败）时走旧逻辑
+                months = _months_between(ds, de)
+                ranked = sorted(
+                    campaigns,
+                    key=lambda c: _to_float(c.get("revenue") or (c.get("total") or {}).get("revenue")) or 0,
+                    reverse=True,
+                )
+                ADV_CAMP_MAX = 8  # 头部优先，控制请求数
+                ranked_ids = [str(c.get("campaign_id")) for c in ranked if c.get("campaign_id")][:ADV_CAMP_MAX]
+                jobs = [(cid, y, m) for cid in ranked_ids for (y, m) in months]
+                JOB_CAP = 40
+                if len(jobs) > JOB_CAP:
+                    jobs = jobs[:JOB_CAP]
+                    trend_errs.append(f"Campaign×月份组合数超 {JOB_CAP}，已截断到前 {JOB_CAP} 个任务（优先头部 Campaign + 近期月份）")
+                if jobs:
+                    started = time.monotonic()
+                    with ThreadPoolExecutor(max_workers=min(len(jobs), 12)) as ex:
+                        futs = {ex.submit(_fetch_month, cid, y, m): (cid, y, m) for (cid, y, m) in jobs}
+                        for fut in as_completed(futs):
+                            if time.monotonic() - started > 72:  # 全局兜底：绝不拖死 80s 预算
+                                trend_errs.append("取数接近整体预算上限，剩余 Campaign 月份趋势未拉取")
+                                break
+                            cid, items, err = fut.result()
+                            if err:
+                                trend_errs.append(err)
+                            if items:
+                                campaign_trends.setdefault(cid, []).extend(items)
+                    # 逐 campaign 把跨月日序列聚合成每月一个代表点
+                    for cid, items in list(campaign_trends.items()):
+                        campaign_trends[cid] = _monthly_from_daily(items)
         else:
+            # 短周期：用 /advertisers/campaign-daily-kpi 返回的 campaigns 直接取趋势
+            # 注：该接口的 campaign 结构里 revenue 在 total.revenue，不要误用顶层 revenue
+            ranked = sorted(campaigns, key=lambda c: _to_float((c.get("total") or {}).get("revenue")) or 0, reverse=True)
             ADV_CAMP_MAX = 15
-            trend_ids = [str(c.get("campaign_id")) for c in campaigns if c.get("campaign_id")][:ADV_CAMP_MAX]
+            trend_ids = [str(c.get("campaign_id")) for c in ranked if c.get("campaign_id")][:ADV_CAMP_MAX]
             if trend_ids:
                 with ThreadPoolExecutor(max_workers=min(len(trend_ids), 8)) as ex:
                     futs = {ex.submit(_fetch_full, cid): cid for cid in trend_ids}
@@ -714,6 +837,8 @@ def fetch_bi_analysis_context(
                 "campaigns": campaigns,
             },
             "campaign_trends": campaign_trends,
+            "campaign_summary": campaign_summary,
+            "campaign_master": camp_master,
             "errors": [e for e in (err_r, err_d, *trend_errs) if e],
         }
 
@@ -1290,6 +1415,22 @@ def _month_window(y: int, m: int, de_str: str):
     return f"{y}-{m:02d}-01", end.strftime("%Y-%m-%d")
 
 
+def _camp_status(c):
+    """从 campaign 主数据抽取人类可读状态名，兼容多种上游字段命名。
+
+    上游不同接口对状态的命名不一致：/advertisers/campaign-daily-kpi 用
+    campaign_status_name，/campaigns 可能用 status/status_name。统一抽取，
+    避免 LLM 看到的 status 全为 null。
+    """
+    if not isinstance(c, dict):
+        return None
+    for k in ("campaign_status_name", "status_name", "campaign_status", "status"):
+        v = c.get(k)
+        if v is not None and v != "":
+            return v
+    return None
+
+
 def _advertiser_deepdive_prompt_view(ctx: dict) -> dict:
     """为 LLM prompt 精简 advertiser_deepdive 上下文：月度趋势优先、日 KPI 压缩。
 
@@ -1301,25 +1442,70 @@ def _advertiser_deepdive_prompt_view(ctx: dict) -> dict:
     """
     daily_kpi = ctx.get("daily_kpi") or {}
     campaigns = daily_kpi.get("campaigns") or []
-    name_map = {
-        str(c.get("campaign_id")): (c.get("name") or c.get("campaign_name"))
-        for c in campaigns if c.get("campaign_id")
-    }
-    # 压缩后的近期快照：仅保留名称/id/状态/区间汇总，丢弃日级明细行
-    compact_campaigns = [
-        {
-            "campaign_id": c.get("campaign_id"),
-            "name": c.get("name") or c.get("campaign_name"),
-            "status": c.get("status"),
-            "revenue": c.get("revenue"),
-            "clicks": c.get("clicks"),
-            "conversions": c.get("conversions"),
-            "payout": c.get("payout"),
-        }
-        for c in campaigns
-    ]
-    # 月度趋势：把 campaign 名称并入每个点，便于 LLM 关联阅读（这是答案主体）
+    summary = ctx.get("campaign_summary") or []
+    master = ctx.get("campaign_master") or {}
     trends = ctx.get("campaign_trends") or {}
+    trend_ids = set(str(k) for k in trends.keys())
+
+    # 三类来源按 id 归并：master(/campaigns, 权威 status/name) > campaigns(/advertisers/campaign-daily-kpi, 近期活动) > summary(/report 全区间汇总)
+    camp_by_id = {str(c.get("campaign_id")): c for c in campaigns if c.get("campaign_id")}
+    sum_by_id = {str(c.get("campaign_id")): c for c in summary if c.get("campaign_id")}
+    mst_by_id = {str(k): v for k, v in master.items()} if isinstance(master, dict) else {}
+
+    # 名称 / 状态映射：master 优先，保证头部 campaign 的 status 不再为 null
+    name_map, status_map = {}, {}
+    for src in (mst_by_id, camp_by_id, sum_by_id):
+        for cid, c in src.items():
+            nm = c.get("name") or c.get("campaign_name")
+            if cid not in name_map and nm:
+                name_map[cid] = nm
+            if cid not in status_map:
+                st = _camp_status(c)
+                if st is not None:
+                    status_map[cid] = st
+
+    def _pick_fields(src_c, fallback_c):
+        return {
+            "revenue": src_c.get("revenue") if src_c.get("revenue") is not None
+                        else (fallback_c or {}).get("revenue"),
+            "clicks": src_c.get("clicks") if src_c.get("clicks") is not None
+                       else (fallback_c or {}).get("clicks"),
+            "conversions": src_c.get("conversions") if src_c.get("conversions") is not None
+                           else (fallback_c or {}).get("conversions"),
+            "payout": src_c.get("payout") if src_c.get("payout") is not None
+                       else (fallback_c or {}).get("payout"),
+        }
+
+    # 快照只保留有月度趋势的 campaign，避免 2000+ 行撑爆 prompt。
+    # 优先用 summary（长周期新路径主数据源，含全区间 revenue），再补 master/campaigns 的 status 与明细。
+    compact_campaigns = []
+    seen = set()
+    for cid, s in sum_by_id.items():
+        if cid not in trend_ids or cid in seen:
+            continue
+        base = mst_by_id.get(cid) or camp_by_id.get(cid) or {}
+        compact_campaigns.append({
+            "campaign_id": s.get("campaign_id"),
+            "name": name_map.get(cid) or s.get("campaign_name"),
+            "status": status_map.get(cid),
+            **_pick_fields(s, base),
+        })
+        seen.add(cid)
+    # 其余趋势 campaign 从 master / campaigns 兜底（回退路径或 summary 未覆盖者）
+    for cid in trend_ids:
+        if cid in seen:
+            continue
+        c = mst_by_id.get(cid) or camp_by_id.get(cid)
+        if not c:
+            continue
+        compact_campaigns.append({
+            "campaign_id": c.get("campaign_id"),
+            "name": name_map.get(cid) or c.get("name") or c.get("campaign_name"),
+            "status": status_map.get(cid),
+            **_pick_fields(c, c.get("total") or {}),
+        })
+        seen.add(cid)
+    # 月度趋势：把 campaign 名称并入每个点，便于 LLM 关联阅读（这是答案主体）
     compact_trends = {}
     for cid, series in trends.items():
         nm = name_map.get(str(cid))

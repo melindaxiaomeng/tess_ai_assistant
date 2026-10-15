@@ -527,42 +527,98 @@ def test_extract_date_range_last_n_months():
     assert (datetime.now() - ds).days >= 85
 
 
-def test_advertiser_deepdive_long_span_monthly_aggregation():
-    """长周期（>35天）下钻：逐 Campaign × 逐月并发切片拉 /campaign-kpi-trend，
+class ReportFirstConnector(MockConnector):
+    """模拟真实上游对长周期下钻的支持：/report 批量聚合全区间汇总 + 日明细，
+    并用 /campaigns 提供权威 campaign_status_name（修复 status 全 null）。"""
 
-    本地 _monthly_from_daily 聚合成月度点，而非依赖 /report(date,campaign)——
-    线上验证该维度组合（date,campaign + 多 campaign_ids）上游直接返回 HTTP 500；
-    且上游 /campaign-kpi-trend 对超长区间（如 7-10 月）只回最近 ~7 天，整段拉会让
-    7/8/9 月全空。故必须按月切片（单月 ≤31 天不触发截断），头部 8 个 Campaign 优先。
+    def api_get(self, path, params=None, token=None, timeout=None):
+        self.calls.append((path, dict(params or {})))
+        p = params or {}
+        if path == "/advertisers/campaign-daily-kpi":
+            aid = p.get("advertiser_id")
+            camps = [{"campaign_id": 9000 + i, "name": f"Camp {9000 + i}",
+                      "campaign_status_name": "Active" if i % 2 == 0 else "Paused",
+                      "revenue": 100 * (16 - i)} for i in range(1, 16)]
+            return {"advertiser_id": aid, "campaigns": camps,
+                    "total": {"revenue": 1234, "profit": 567}}
+        if path == "/campaigns":
+            cids = [c for c in (p.get("campaign_ids") or "").split(",") if c]
+            items = [{"campaign_id": int(c), "campaign_name": f"Camp {c}",
+                      "campaign_status_name": "Active"} for c in cids]
+            return {"items": items}
+        if path == "/report":
+            dim = p.get("dimensions")
+            if dim == "campaign" and p.get("advertiser_ids"):
+                # 全区间汇总：top30 campaign（含 9001），按 revenue 排序；尊重分页（避免重复）
+                items = [{"campaign_id": 9000 + i, "campaign_name": f"Camp {9000 + i}",
+                          "revenue": 100 * (16 - i), "profit": 10 * (16 - i),
+                          "payout": 5 * (16 - i), "clicks": 50, "conversions": 5}
+                         for i in range(1, 31)]
+                pg = int(p.get("page", 1))
+                sz = int(p.get("page_size", 100))
+                return {"items": items[(pg - 1) * sz: pg * sz]}
+            if dim == "campaign,date" and p.get("campaign_ids"):
+                cids = [c for c in p.get("campaign_ids").split(",") if c]
+                months = ["2026-07-31", "2026-08-31", "2026-09-30", "2026-10-31"]
+                items = []
+                for ci, cc in enumerate(cids):
+                    for d in months:
+                        items.append({"date": d, "campaign_id": int(cc),
+                                      "revenue": 100 + ci, "clicks": 50,
+                                      "cr": 0.1, "margin": 0.4, "payout": 60})
+                pg = int(p.get("page", 1))
+                sz = int(p.get("page_size", 100))
+                return {"items": items[(pg - 1) * sz: pg * sz]}
+            return {"items": []}
+        if path == "/campaign-kpi-trend":
+            return {"items": []}  # 新策略长周期不再用，返回空以验证未被调用
+        return super().api_get(path, params, token, timeout)
+
+
+def test_advertiser_deepdive_long_span_monthly_aggregation():
+    """长周期（>35天）下钻：用 /report 批量聚合（一次覆盖头部 ~30 campaign 全区间），
+
+    本地 _monthly_from_daily 把日明细聚合成月度点，并用 /campaigns 主数据补权威
+    campaign_status_name。修复线上『只出 8 个 campaign』与『status 全 null』两个痛点。
     """
-    from tess_backend.analytics import fetch_bi_analysis_context
-    conn = _connector()
+    from tess_backend.analytics import (
+        fetch_bi_analysis_context,
+        _advertiser_deepdive_prompt_view,
+    )
+    conn = ReportFirstConnector(
+        advertisers=_connector().advertisers,
+        users=_connector().users,
+        report_by_dim=_connector().report_by_dim,
+        report_by_ids=_connector().report_by_ids,
+    )
     ctx = fetch_bi_analysis_context(
         conn, "advertiser_deepdive", token="t",
         params={"advertiser_id": "1000853", "date_start": "2026-07-01", "date_end": "2026-10-31"},
     )
     assert ctx["date_range"] == "2026-07-01 ~ 2026-10-31"
     assert ctx["long_span"] is True
-    # 长周期走 /campaign-kpi-trend 逐 Campaign × 逐月切片拉取，本地按月聚合
+    # 长周期走 /report 批量聚合，头部 ~30 个 campaign 全部进入趋势（不再是旧的 8 个截断）
     assert "9001" in ctx["campaign_trends"], "应含头部 campaign 9001 的月度趋势"
+    assert len(ctx["campaign_trends"]) >= 30, f"应聚合头部 ~30 个 campaign，实际 {len(ctx['campaign_trends'])}"
     series = ctx["campaign_trends"]["9001"]
-    # 趋势按月聚合（4 个月 -> 4 个代表点），字段来自 /campaign-kpi-trend 日序列
+    # 趋势按月聚合（4 个月 -> 4 个代表点）
     assert len(series) == 4, f"长周期趋势应聚合为 4 个月点，实际 {len(series)}"
     assert series[0]["time_label"] == "2026-07-31"
     assert series[-1]["time_label"] == "2026-10-31"
 
-    # 回归：长周期严禁调用 /report(date,campaign) —— 该组合线上直接 HTTP 500，
-    # 会导致整段月度对比全空。必须走 /campaign-kpi-trend 逐 Campaign × 逐月切片。
+    # 回归：长周期必须走 /report 批量聚合（一次覆盖 30 campaign 全区间），
+    # 不再逐 campaign 逐月打 /campaign-kpi-trend（旧策略会因上游只回最近 7 天而 7/8/9 月全空）。
     report_calls = [(p, pr) for (p, pr) in conn.calls if p == "/report"]
-    assert report_calls == [], f"长周期不应调用 /report，实际 {report_calls}"
     trend_calls = [(p, pr) for (p, pr) in conn.calls if p == "/campaign-kpi-trend"]
-    # 头部 8 个 campaign × 4 个月（逐月切片），而非整段一次拉 15 个
-    assert len(trend_calls) == 32, f"应逐 campaign×逐月各发一次 /campaign-kpi-trend（8×4=32），实际 {len(trend_calls)}"
-    # 每个切片都必须是单月（≤31 天），绝不能整段 7-10 月一次拉（否则上游只回最近 7 天）
-    for (_, pr) in trend_calls:
-        ds_, de_ = pr["date_start"], pr["date_end"]
-        span = (datetime.strptime(de_, "%Y-%m-%d") - datetime.strptime(ds_, "%Y-%m-%d")).days
-        assert span <= 31, f"逐月切片应 ≤31 天，实际 {ds_}~{de_}（{span}天）"
+    assert report_calls, "长周期应调用 /report 批量聚合"
+    assert trend_calls == [], f"长周期新策略不应调用 /campaign-kpi-trend 逐月，实际 {len(trend_calls)}"
+
+    # 回归（用户截图痛点）：头部 campaign 的 status 不应再为 null —— 来自 /campaigns 主数据
+    view = _advertiser_deepdive_prompt_view(ctx)
+    snap = {str(c["campaign_id"]): c for c in view["campaigns_snapshot"]}
+    assert "9001" in snap
+    assert snap["9001"]["status"] is not None and snap["9001"]["status"] != "", \
+        "头部 campaign status 不应为 null"
 
 
 def test_advertiser_deepdive_prompt_view_keeps_monthly_trends_before_truncation():
@@ -641,6 +697,9 @@ def test_advertiser_deepdive_campaign_daily_kpi_short_interval_first_then_full_f
     class ShortFirstFallbackConnector(MockConnector):
         def api_get(self, path, params=None, token=None, timeout=None):
             self.calls.append((path, dict(params or {})))
+            if path == "/report":
+                # 强制 /report 无数据 -> 走回退路径（campaign-daily-kpi 列表 + /campaign-kpi-trend）
+                return {"items": []}
             if path == "/advertisers/campaign-daily-kpi":
                 ds = (params or {}).get("date_start")
                 if ds == "2026-07-01":  # 整段兜底 -> 成功返回列表
