@@ -528,14 +528,25 @@ def test_extract_date_range_last_n_months():
 
 
 class ReportFirstConnector(MockConnector):
-    """模拟真实上游对长周期下钻的支持：/report 批量聚合全区间汇总 + 日明细，
-    并用 /campaigns 提供权威 campaign_status_name（修复 status 全 null）。"""
+    """模拟真实上游对长周期下钻的支持：/report 批量聚合全区间汇总 + 日明细；
+
+    campaign-daily-kpi 走 advertiser_id 只回近期活跃 campaign（9001-9015），
+    其余头部 campaign（9016-9030）由步骤3 的 campaign_ids 过滤回补 campaign_status_name
+    （修复『只出 8 个』与『status 全 null』两个痛点）。"""
 
     def api_get(self, path, params=None, token=None, timeout=None):
         self.calls.append((path, dict(params or {})))
         p = params or {}
         if path == "/advertisers/campaign-daily-kpi":
             aid = p.get("advertiser_id")
+            p_ids = [c for c in (p.get("campaign_ids") or "").split(",") if c]
+            if p_ids:
+                # campaign_ids 过滤（步骤3 状态回填专用）：返回这些 campaign 的逐日行，
+                # 每行带人类可读 campaign_status_name —— 模拟真实上游对该接口的行为。
+                camps = [{"campaign_id": int(c), "campaign_name": f"Camp {c}",
+                          "campaign_status_name": "Stop" if int(c) % 2 else "Active"}
+                         for c in p_ids]
+                return {"advertiser_id": aid, "campaigns": camps, "total": {"revenue": 1}}
             camps = [{"campaign_id": 9000 + i, "name": f"Camp {9000 + i}",
                       "campaign_status_name": "Active" if i % 2 == 0 else "Paused",
                       "revenue": 100 * (16 - i)} for i in range(1, 16)]
@@ -543,8 +554,9 @@ class ReportFirstConnector(MockConnector):
                     "total": {"revenue": 1234, "profit": 567}}
         if path == "/campaigns":
             cids = [c for c in (p.get("campaign_ids") or "").split(",") if c]
+            # 模拟真实 /campaigns：只回 status 数字（status_name 恒空），由 _camp_status_label 映射
             items = [{"campaign_id": int(c), "campaign_name": f"Camp {c}",
-                      "campaign_status_name": "Active"} for c in cids]
+                      "status": 1 if int(c) % 2 == 0 else 3} for c in cids]
             return {"items": items}
         if path == "/report":
             dim = p.get("dimensions")
@@ -613,12 +625,13 @@ def test_advertiser_deepdive_long_span_monthly_aggregation():
     assert report_calls, "长周期应调用 /report 批量聚合"
     assert trend_calls == [], f"长周期新策略不应调用 /campaign-kpi-trend 逐月，实际 {len(trend_calls)}"
 
-    # 回归（用户截图痛点）：头部 campaign 的 status 不应再为 null —— 来自 /campaigns 主数据
+    # 回归（用户截图痛点）：头部全部 campaign 的 status 不应再为 null ——
+    # 近期活跃者来自 campaign-daily-kpi 快照，停投但有营收者由步骤3 campaign_ids 回填补上。
     view = _advertiser_deepdive_prompt_view(ctx)
     snap = {str(c["campaign_id"]): c for c in view["campaigns_snapshot"]}
-    assert "9001" in snap
-    assert snap["9001"]["status"] is not None and snap["9001"]["status"] != "", \
-        "头部 campaign status 不应为 null"
+    assert len(snap) >= 30, f"快照应含全部头部 ~30 campaign，实际 {len(snap)}"
+    null_status = [cid for cid, c in snap.items() if not c.get("status")]
+    assert not null_status, f"头部 campaign status 不应为 null，仍有 null 的: {null_status}"
 
 
 def test_advertiser_deepdive_prompt_view_keeps_monthly_trends_before_truncation():
@@ -686,15 +699,15 @@ def test_advertiser_deepdive_prompt_view_keeps_monthly_trends_before_truncation(
     assert "9015" in view_text, "截断后最后一个 campaign 的月度趋势应存活"
 
 
-def test_advertiser_deepdive_campaign_daily_kpi_short_interval_first_then_full_fallback():
-    """回归：长周期下钻拿 campaign 列表应先用短区间（最近 30 天），而非整段 7-10 月。
+def test_advertiser_deepdive_campaign_daily_kpi_full_interval_first_then_short_fallback():
+    """回归：长周期下钻的 campaign-daily-kpi 快照源应优先全区间（ds~de，覆盖 7-10 月全部头部
 
-    整段区间对大广告主是慢查询，会吃光 80s 取数预算；短区间数据量小必快。
-    仅当短区间也失败时，才回退整段区间兜底（快速失败，不拖死预算）。
+    campaign 的 campaign_status_name），全区间超时才回退短区间（最近 30 天）兜底。
+    验证回退路径：全区间主调用超时后，短区间兜底仍能拿到 campaign 列表并产出趋势（不丢 campaign）。
     """
     from tess_backend.analytics import fetch_bi_analysis_context
 
-    class ShortFirstFallbackConnector(MockConnector):
+    class FullFirstFallbackConnector(MockConnector):
         def api_get(self, path, params=None, token=None, timeout=None):
             self.calls.append((path, dict(params or {})))
             if path == "/report":
@@ -702,17 +715,17 @@ def test_advertiser_deepdive_campaign_daily_kpi_short_interval_first_then_full_f
                 return {"items": []}
             if path == "/advertisers/campaign-daily-kpi":
                 ds = (params or {}).get("date_start")
-                if ds == "2026-07-01":  # 整段兜底 -> 成功返回列表
-                    return {
-                        "advertiser_id": (params or {}).get("advertiser_id"),
-                        "campaigns": [{"campaign_id": 9001, "revenue": 100}],
-                    }
-                # 短区间（最近 30 天）-> 模拟后端读取超时
-                raise TimeoutError("The read operation timed out")
+                if ds == "2026-07-01":  # 全区间主调用 -> 模拟后端读取超时
+                    raise TimeoutError("The read operation timed out")
+                # 短区间兜底（最近 30 天）-> 成功返回列表
+                return {
+                    "advertiser_id": (params or {}).get("advertiser_id"),
+                    "campaigns": [{"campaign_id": 9001, "revenue": 100}],
+                }
             return super().api_get(path, params, token, timeout)
 
     base = _connector()
-    conn = ShortFirstFallbackConnector(
+    conn = FullFirstFallbackConnector(
         advertisers=base.advertisers, users=base.users,
         report_by_dim=base.report_by_dim, report_by_ids=base.report_by_ids,
     )
@@ -721,10 +734,10 @@ def test_advertiser_deepdive_campaign_daily_kpi_short_interval_first_then_full_f
         params={"advertiser_id": "1000853", "date_start": "2026-07-01", "date_end": "2026-10-31"},
     )
     kpi_calls = [(p, pr) for (p, pr) in conn.calls if p == "/advertisers/campaign-daily-kpi"]
-    assert len(kpi_calls) == 2, f"短区间超时后应触发一次整段兜底，实际 {len(kpi_calls)} 次"
-    # 第一次必为短区间（最近 30 天，date_start != 整段），第二次为整段兜底
-    assert kpi_calls[0][1]["date_start"] != "2026-07-01", "长周期应先用短区间拿列表"
-    assert kpi_calls[1][1]["date_start"] == "2026-07-01", "兜底应是整段区间"
+    assert len(kpi_calls) == 2, f"全区间超时后应触发一次短区间兜底，实际 {len(kpi_calls)} 次"
+    # 第一次必为全区间（date_start == 整段），第二次为短区间兜底
+    assert kpi_calls[0][1]["date_start"] == "2026-07-01", "长周期应优先全区间拿快照"
+    assert kpi_calls[1][1]["date_start"] != "2026-07-01", "兜底应是短区间"
     # 兜底拿到 campaign 列表后，逐 campaign /campaign-kpi-trend 应产出趋势（而非因列表空而缺失）
     assert "9001" in ctx["campaign_trends"], "兜底拿到 campaign 列表后，应产出趋势"
 

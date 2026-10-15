@@ -611,17 +611,19 @@ def fetch_bi_analysis_context(
         # 长周期（如 7-10 月）绝不用整段区间拉 campaign-daily-kpi —— 大广告主整段慢查询会吃光
         # 80s 取数预算；直接用短区间（最近 30 天）拉，数据量小必快；整段仅作短区间失败时的极端兜底。
         # 两路都设 25s 短超时：单请求最多 25s 快速失败，绝不会把 80s 预算拖死。
-        _list_start = (today - timedelta(days=30)).strftime("%Y-%m-%d") if long_span else ds
+        # 快照来源：优先全区间（ds~de）拿 campaign-daily-kpi，覆盖 7-10 月全部头部
+        # campaign 的 campaign_status_name（修复长周期下『近期无活动的头部 campaign』status 全 null）；
+        # 全区间对大广告主可能偏慢，故 25s 超时后回退短区间（最近 30 天），保证不拖死 80s 预算。
         daily, err_d = _safe_api_get(
             connector, "/advertisers/campaign-daily-kpi",
-            params={"advertiser_id": aid, "date_start": _list_start, "date_end": de}, token=token,
+            params={"advertiser_id": aid, "date_start": ds, "date_end": de}, token=token,
             timeout=25,
         )
-        if err_d:  # 短区间也失败 -> 极端兜底：整段区间（快速失败，不拖死 80s 预算）
+        if err_d:  # 全区间超时 -> 回退短区间（最近 30 天），status 可能不全但不拖死预算
             daily, err_d = _safe_api_get(
                 connector, "/advertisers/campaign-daily-kpi",
-                params={"advertiser_id": aid, "date_start": ds, "date_end": de}, token=token,
-                timeout=25,
+                params={"advertiser_id": aid, "date_start": (today - timedelta(days=30)).strftime("%Y-%m-%d"),
+                        "date_end": de}, token=token, timeout=25,
             )
         rec_d = rec if isinstance(rec, dict) else {}
         daily_d = daily if isinstance(daily, dict) else {}
@@ -709,21 +711,6 @@ def fetch_bi_analysis_context(
                         top_ids.append(str(cid))
                 jobs = top_ids  # 供下方『无数据』判断复用
 
-                # 步骤1.5：用 /campaigns 一次性拉取 top30 的主数据（含 campaign_status_name / name），
-                # 避免长周期用短区间 campaign-daily-kpi 漏掉近期无活动的头部 campaign 而导致 status 全 null。
-                camp_master = {}
-                if top_ids:
-                    cm, err_cm = _safe_api_get(
-                        connector, "/campaigns",
-                        params={"campaign_ids": ",".join(top_ids), "page": 1, "page_size": 100},
-                        token=token, timeout=30,
-                    )
-                    if isinstance(cm, dict) and cm.get("items"):
-                        for c in cm["items"]:
-                            camp_master[str(c.get("campaign_id"))] = c
-                    if err_cm:
-                        trend_errs.append(err_cm)
-
                 # 步骤2：批量取 top campaign 的日明细，本地按月聚合（替代 campaign-kpi-trend 逐月）。
                 if top_ids:
                     def _fetch_detail_page(page):
@@ -773,6 +760,36 @@ def fetch_bi_analysis_context(
                         })
                     for cid, items in raw_trends.items():
                         campaign_trends[cid] = _monthly_from_daily(items)
+
+                    # 步骤3：为快照未覆盖的 top campaign 补状态。
+                    # campaign-daily-kpi 走 advertiser_id 只回『近期活跃』campaign（且忽略
+                    # campaign_ids 过滤），故停投但有营收的头部 campaign 不在其中 -> status 会 null。
+                    # 改用 /campaigns?campaign_ids= 按 id 精确回目录（不受活跃度限制），其 status
+                    # 为数字且 status_name 恒空，故用 _camp_status_label 把数字映射成 Active/Stop…。
+                    snap_ids = {str(c.get("campaign_id")) for c in campaigns if c.get("campaign_id")}
+                    miss_ids = [cid for cid in top_ids if cid not in snap_ids]
+                    if miss_ids:
+                        sb, err_sb = _safe_api_get(
+                            connector, "/campaigns",
+                            params={"campaign_ids": ",".join(miss_ids), "page": 1, "page_size": 100},
+                            token=token, timeout=30,
+                        )
+                        if err_sb:
+                            trend_errs.append(err_sb)
+                        else:
+                            sb_d = sb if isinstance(sb, dict) else {}
+                            for c in (sb_d.get("items") or []):
+                                cid = c.get("campaign_id") or c.get("id")
+                                if not cid:
+                                    continue
+                                cid_s = str(cid)
+                                if cid_s not in miss_ids or cid_s in camp_master:
+                                    continue
+                                camp_master[cid_s] = {
+                                    "campaign_id": cid,
+                                    "campaign_status_name": _camp_status_label(c.get("status")),
+                                    "campaign_name": c.get("campaign_name") or c.get("name"),
+                                }
             else:
                 # 回退路径：/report 不可用（测试 Mock 或上游失败）时走旧逻辑
                 months = _months_between(ds, de)
@@ -1429,6 +1446,24 @@ def _camp_status(c):
         if v is not None and v != "":
             return v
     return None
+
+
+# campaign 状态数字 -> 人类可读名（实测映射：1=Active / 3=Stop；0/2 等按常见语义兜底）。
+# /campaigns 目录接口只回 status 数字且 status_name 恒为空，故需此映射把数字转成
+# 与 campaign-daily-kpi 的 campaign_status_name（Active/Stop…）一致的可读值。
+_CAMPAIGN_STATUS_LABELS = {0: "Unknown", 1: "Active", 2: "Paused", 3: "Stop"}
+
+
+def _camp_status_label(st):
+    """把 /campaigns 返回的 status 数字（或已有的可读名）统一成可读状态字符串。"""
+    if st is None:
+        return None
+    if isinstance(st, str):
+        return st if st != "" else None  # 已是可读名（如 Active/Stop）
+    try:
+        return _CAMPAIGN_STATUS_LABELS.get(int(st), f"status_{int(st)}")
+    except (TypeError, ValueError):
+        return None
 
 
 def _advertiser_deepdive_prompt_view(ctx: dict) -> dict:
