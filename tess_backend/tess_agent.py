@@ -10,6 +10,7 @@
 import json
 import logging
 import re
+import threading
 import time
 from typing import Iterator, List, Optional, Protocol, runtime_checkable
 
@@ -27,28 +28,11 @@ class LLMUnavailableError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# 全局 LLM 熔断器：上游连续/近期失败则快速失败，避免被不响应的 DeepSeek 拖死
-# （例如返回 503 后下一秒又连接挂死，逐次等满 socket timeout）。
+# 每个 LLM 供应商实例自带独立熔断器（见 HttpLLMClient / FallbackLLMClient）：
+# 某供应商 5xx/超时后进入冷却期，期间跳过它、自动切下一个，避免被不响应的
+# 上游（如 DeepSeek 繁忙）拖死。
 # ---------------------------------------------------------------------------
-import threading
-
-_LLM_CB_LOCK = threading.Lock()
-_LLM_CB_COOLDOWN_UNTIL = 0.0  # 绝对 monotonic 时间戳：在此之前视为不可用
 LLM_CB_COOLDOWN_SEC = 30.0
-
-
-def _llm_record_failure() -> None:
-    global _LLM_CB_COOLDOWN_UNTIL
-    with _LLM_CB_LOCK:
-        _LLM_CB_COOLDOWN_UNTIL = time.monotonic() + LLM_CB_COOLDOWN_SEC
-
-
-def _llm_check_cooldown() -> None:
-    with _LLM_CB_LOCK:
-        if time.monotonic() < _LLM_CB_COOLDOWN_UNTIL:
-            raise LLMUnavailableError(
-                "LLM 服务近期连续失败，已进入熔断冷却期，跳过本次调用（请稍后重试）"
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -173,13 +157,32 @@ class HttpLLMClient:
     """
 
     def __init__(self, base_url: str, api_key: str, model: str,
-                 timeout: float = 30.0, json_mode: bool = True) -> None:
+                 timeout: float = 30.0, json_mode: bool = True,
+                 cooldown_sec: float = LLM_CB_COOLDOWN_SEC,
+                 name: str = "llm") -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
         self.json_mode = json_mode
+        self.provider_name = name
         self.last_usage = None  # 最近一次 complete() 的用量（prompt/completion/total tokens）
+        # 独立熔断器状态（每个供应商互不影响）
+        self._cb_lock = threading.Lock()
+        self._cb_cooldown_until = 0.0
+        self._cooldown_sec = cooldown_sec
+
+    def _cb_check(self) -> None:
+        with self._cb_lock:
+            if time.monotonic() < self._cb_cooldown_until:
+                raise LLMUnavailableError(
+                    f"LLM 供应商 {self.provider_name} 近期连续失败，已进入熔断冷却期"
+                    f"（{self._cooldown_sec:.0f}s），跳过本次调用（请稍后重试）"
+                )
+
+    def _cb_record_failure(self) -> None:
+        with self._cb_lock:
+            self._cb_cooldown_until = time.monotonic() + self._cooldown_sec
 
     def complete(self, system: str, user: str, json_mode: Optional[bool] = None) -> str:
         if not self.api_key:
@@ -302,6 +305,69 @@ class HttpLLMClient:
         except Exception as e:  # 连接超时 / 无法连接 / 其他网络异常 → 熔断
             _llm_record_failure()
             raise LLMUnavailableError(f"LLM 流式连接失败：{type(e).__name__}: {e}") from e
+
+
+class FallbackLLMClient:
+    """按优先级尝试多个 LLM 供应商；每个供应商独立熔断。
+
+    主供应商（如 DeepSeek）出现 5xx / 超时 / 连接失败时，自动切到下一个
+    （如硅基流动）。全部不可用才抛出 LLMUnavailableError，由上层降级为
+    INCONCLUSIVE。complete / stream 接口与 HttpLLMClient 完全一致，可直接替换。
+    """
+
+    def __init__(self, providers: List[HttpLLMClient]) -> None:
+        if not providers:
+            raise ValueError("FallbackLLMClient 至少需要一个供应商")
+        self._providers = providers
+        self.last_usage = None
+        self.json_mode = providers[0].json_mode
+
+    def _active(self):
+        """逐个产出未处于熔断冷却期的供应商。"""
+        for p in self._providers:
+            try:
+                p._cb_check()
+            except LLMUnavailableError:
+                continue
+            yield p
+
+    def complete(self, system: str, user: str, json_mode: Optional[bool] = None) -> str:
+        last_err: Exception | None = None
+        for p in self._active():
+            try:
+                out = p.complete(system, user, json_mode=json_mode)
+                self.last_usage = p.last_usage
+                return out
+            except LLMUnavailableError as e:
+                last_err = e
+                continue
+        if last_err is None:
+            raise LLMUnavailableError("所有 LLM 供应商均处于熔断冷却期，请稍后重试")
+        raise LLMUnavailableError(f"所有 LLM 供应商均不可用：{last_err}")
+
+    def stream(self, system: str, user: str) -> Iterator[str]:
+        errors: List[str] = []
+        for p in self._active():
+            yielded = False
+            try:
+                for piece in p.stream(system, user):
+                    yielded = True
+                    yield piece
+                if yielded:
+                    self.last_usage = p.last_usage
+                    return
+                errors.append(f"{p.provider_name}: 空流")
+            except LLMUnavailableError as e:
+                errors.append(str(e))
+                if yielded:
+                    raise  # 已吐出部分 token，不再切换，直接上报
+                continue
+            except Exception as e:  # 其他异常同样视为该供应商失败
+                errors.append(f"{p.provider_name}: {type(e).__name__}: {e}")
+                if yielded:
+                    raise
+                continue
+        raise LLMUnavailableError("所有 LLM 供应商流式调用均不可用：" + " | ".join(errors[-3:]))
 
 
 def llm_last_usage(llm) -> Optional[dict]:

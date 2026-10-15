@@ -26,7 +26,7 @@ from fastapi.encoders import jsonable_encoder
 from sqlalchemy import text
 
 from .orchestrator import run_diagnosis
-from .tess_agent import HttpLLMClient, LLMClient
+from .tess_agent import HttpLLMClient, FallbackLLMClient, LLMClient
 from .feedback import FeedbackStore
 from .thresholds import load_policy, reset_policy, default_policy
 from .self_heal import propose_thresholds, apply_proposal
