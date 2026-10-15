@@ -27,6 +27,31 @@ class LLMUnavailableError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
+# 全局 LLM 熔断器：上游连续/近期失败则快速失败，避免被不响应的 DeepSeek 拖死
+# （例如返回 503 后下一秒又连接挂死，逐次等满 socket timeout）。
+# ---------------------------------------------------------------------------
+import threading
+
+_LLM_CB_LOCK = threading.Lock()
+_LLM_CB_COOLDOWN_UNTIL = 0.0  # 绝对 monotonic 时间戳：在此之前视为不可用
+LLM_CB_COOLDOWN_SEC = 30.0
+
+
+def _llm_record_failure() -> None:
+    global _LLM_CB_COOLDOWN_UNTIL
+    with _LLM_CB_LOCK:
+        _LLM_CB_COOLDOWN_UNTIL = time.monotonic() + LLM_CB_COOLDOWN_SEC
+
+
+def _llm_check_cooldown() -> None:
+    with _LLM_CB_LOCK:
+        if time.monotonic() < _LLM_CB_COOLDOWN_UNTIL:
+            raise LLMUnavailableError(
+                "LLM 服务近期连续失败，已进入熔断冷却期，跳过本次调用（请稍后重试）"
+            )
+
+
+# ---------------------------------------------------------------------------
 # System Prompt（PRD §5，含红线 + 置信度评分指南 + Schema 绑定）
 # ---------------------------------------------------------------------------
 
@@ -162,6 +187,7 @@ class HttpLLMClient:
         import urllib.request
         import urllib.error
 
+        _llm_check_cooldown()
         use_json = self.json_mode if json_mode is None else json_mode
         body: dict = {
             "model": self.model,
@@ -190,8 +216,12 @@ class HttpLLMClient:
             detail = e.read().decode("utf-8", "ignore")
             msg = f"LLM HTTP {e.code}: {detail[:500]}"
             if e.code >= 500:
+                _llm_record_failure()
                 raise LLMUnavailableError(msg) from e
             raise RuntimeError(msg) from e
+        except Exception as e:  # 连接超时 / 无法连接 / 其他网络异常 → 熔断
+            _llm_record_failure()
+            raise LLMUnavailableError(f"LLM 连接失败：{type(e).__name__}: {e}") from e
         # 用量统计（OpenAI 兼容响应的 usage 字段）：供每轮问答落库计费/成本分析
         u = data.get("usage") or {}
         self.last_usage = {
@@ -213,6 +243,7 @@ class HttpLLMClient:
         import urllib.request
         import urllib.error
 
+        _llm_check_cooldown()
         body: dict = {
             "model": self.model,
             "messages": [
@@ -265,8 +296,12 @@ class HttpLLMClient:
             detail = e.read().decode("utf-8", "ignore")
             msg = f"LLM HTTP {e.code}: {detail[:500]}"
             if e.code >= 500:
+                _llm_record_failure()
                 raise LLMUnavailableError(msg) from e
             raise RuntimeError(msg) from e
+        except Exception as e:  # 连接超时 / 无法连接 / 其他网络异常 → 熔断
+            _llm_record_failure()
+            raise LLMUnavailableError(f"LLM 流式连接失败：{type(e).__name__}: {e}") from e
 
 
 def llm_last_usage(llm) -> Optional[dict]:
