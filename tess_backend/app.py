@@ -135,13 +135,37 @@ def _get_llm_client(platform_id: Optional[str] = None) -> LLMClient:
             status_code=503,
             detail=f"Tess LLM 未配置{hint}",
         )
-    return HttpLLMClient(
-        base_url, api_key, model,
-        json_mode=True,
-        # 非流式 complete() 用 urlopen(timeout=...)，默认 30s 对「带逐 Campaign 明细」的长答案
-        # 太小会 premature 502；放宽到 120s 并可通过 TESS_LLM_TIMEOUT 调整（流式路径不受此限）。
-        timeout=float(os.getenv("TESS_LLM_TIMEOUT", "120")),
-    )
+    timeout = float(os.getenv("TESS_LLM_TIMEOUT", "120"))
+    providers = [
+        HttpLLMClient(
+            base_url, api_key, model,
+            json_mode=True,
+            # 非流式 complete() 用 urlopen(timeout=...)，默认 30s 对「带逐 Campaign 明细」的长答案
+            # 太小会 premature 502；放宽到 120s 并可通过 TESS_LLM_TIMEOUT 调整（流式路径不受此限）。
+            timeout=timeout,
+            name=f"primary({model})",
+        )
+    ]
+
+    # 兜底供应商（配置驱动：运营按出网位置改下面 env 即可，无需改代码）。
+    # 主供应商 5xx/超时后自动切到此处，全部失败才降级 INCONCLUSIVE。
+    fb_key = os.getenv("TESS_LLM_FALLBACK_API_KEY", "")
+    if fb_key:
+        fb_base = os.getenv("TESS_LLM_FALLBACK_BASE_URL", "https://api.siliconflow.cn/v1")
+        fb_model = os.getenv("TESS_LLM_FALLBACK_MODEL", "deepseek-ai/DeepSeek-V3")
+        fb_timeout = float(os.getenv("TESS_LLM_FALLBACK_TIMEOUT", "60"))
+        providers.append(
+            HttpLLMClient(
+                fb_base, fb_key, fb_model,
+                json_mode=True,
+                timeout=fb_timeout,
+                name=f"fallback({fb_model})",
+            )
+        )
+
+    if len(providers) == 1:
+        return providers[0]
+    return FallbackLLMClient(providers)
 
 
 # P5 数据接入层：惰性初始化（避免 import 期因未配置 teensing 而崩溃）。
