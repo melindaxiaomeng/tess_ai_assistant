@@ -1323,7 +1323,7 @@ def _build_user_prompt(analysis_type: str, ctx: dict) -> str:
     intro = {
         "daily_summary": "以下是昨日/今日大盘与排名数据，请输出绩效复盘简报。",
         "scaling_opportunity": "以下是近 7 天按利润排序的 Campaign/Publisher 报表与质量数据，请挖掘放量潜力。",
-        "finance_check": "以下是本月月度报表（含 revenue 与 calc_revenue 对账字段），请分析对账差异与毛利趋势。",
+        "finance_check": "以下是本月月度报表（含 revenue、payout、calc_revenue 等字段），请按用户问题作答：若问营收与支出/收支趋势，先给本月总计与环比变化，再列明细；若问对账，则分析对账差异与毛利趋势。",
         "account_overview": "以下是 Campaign/Advertiser 主数据目录与广告主维度排名，请输出账户全景概览。注意：campaign 总量达数百万，下方 active/inactive/missing_cap 仅来自首页 100 条抽样，不能代表全局占比；全局规模请看 campaign_total/advertiser_total，头部广告主请看 top_advertisers_by_revenue。",
         "publisher_deepdive": "以下是 Publisher 渠道目录与扣量/质量率数据，请对比各渠道质量风险（reject/q1/q2 扣量、回传缺口），指出需核查的渠道。",
         "scaling_capacity": "以下是近 7 日各 Campaign 利润/Margin 与各自的 Cap 设置，请评估哪些 Campaign 有放量空间（盈利高 Margin 但 Cap 偏低）、哪些 Cap 被浪费（亏损仍挂 Cap）。",
@@ -1448,7 +1448,9 @@ _ANALYSIS_KEYWORDS: list = [
     ("advertisers_missing_owner", ["没有配置am", "未配置am", "哪些广告主没有", "未分配am",
                                    "am为空", "没有负责人", "没有配置负责人", "缺am", "没有am"]),
     ("scaling_capacity", ["容量", "cap", "放量空间", "还能放", "预算上限", "放量容量", "容量评估"]),
-    ("finance_check", ["对账", "毛利", "结算", "营收核对", "对账差异", "月报", "财务", "month", "invoice"]),
+    ("finance_check", ["对账", "毛利", "结算", "营收核对", "对账差异", "月报", "财务", "month", "invoice",
+                       "本月营收", "本月支出", "月度营收", "月度支出", "营收与支出", "营收趋势",
+                       "支出趋势", "营收支出", "收支趋势", "月度收支"]),
     ("publisher_deepdive", ["渠道详情", "渠道明细", "渠道下钻", "这个渠道", "某个渠道",
                             "渠道表现", "渠道趋势", "publisher", "媒体质量", "扣量", "作弊", "渠道质量"]),
     ("account_overview", ["账户全景", "整体大盘", "总览", "概览", "全景", "account overview",
@@ -1476,7 +1478,7 @@ _ANALYSIS_KEYWORDS: list = [
     # 注意：故意不含「环比」——"利润环比下滑最快"等排名问法的"环比"会被 kpi_compare
     # 误伤，导致被判成多子目标并强制 LLM 答未问的子目标。排名类已由 campaign_ranking 覆盖；
     # kpi_compare 仅用于有明确对比/趋势意图（且通常需要具体 campaign_id 走实体路由）。
-    ("kpi_compare", ["对比", "波动", "暴跌", "暴涨", "趋势", "trend", "对比昨日"]),
+    ("kpi_compare", ["对比", "波动", "暴跌", "暴涨", "trend", "对比昨日"]),
 ]
 
 # 通用实体下钻类型：仅作"给我这个实体的明细"兜底。复合问题去重时，

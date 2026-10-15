@@ -335,24 +335,32 @@ class TeensingDataConnector:
     # ----- DataConnector 接口实现 -----
 
     def _fluctuation(self, token: Optional[str] = None) -> object:
-        """取 fluctuation 涨跌榜，运营个人 token 被 RBAC 截断时回退全局兜底 token。
+        """取 fluctuation 涨跌榜，运营个人 token 被 RBAC 截断/失效时回退全局兜底 token。
 
         与 analytics._safe_fluctuation_get 同源逻辑：仅当主 token 缺榜（rising/falling
-        任一为空）且配置了全局兜底 token 时才补取，已完整的一侧不动。
+        任一为空，或主 token 直接 401/报错）且配置了全局兜底 token 时才补取，已完整的一侧不动。
         """
-        data = self._unwrap(self._http_get("/overview/ranking/fluctuation", token=token))
+        try:
+            data = self._unwrap(self._http_get("/overview/ranking/fluctuation", token=token))
+        except Exception:
+            data = None
         if isinstance(data, dict):
             r = data.get("rising") or []
             f = data.get("falling") or []
-            if (not r or not f) and self.fallback_token and self.fallback_token != (token or ""):
+        else:
+            r, f, data = [], [], {}
+        if (not r or not f) and self.fallback_token and self.fallback_token != (token or ""):
+            try:
                 data2 = self._unwrap(self._http_get("/overview/ranking/fluctuation", token=self.fallback_token))
-                if isinstance(data2, dict):
-                    merged = dict(data)
-                    if not r and (data2.get("rising") or []):
-                        merged["rising"] = data2["rising"]
-                    if not f and (data2.get("falling") or []):
-                        merged["falling"] = data2["falling"]
-                    data = merged
+            except Exception:
+                data2 = None
+            if isinstance(data2, dict):
+                merged = dict(data)
+                if not r and (data2.get("rising") or []):
+                    merged["rising"] = data2["rising"]
+                if not f and (data2.get("falling") or []):
+                    merged["falling"] = data2["falling"]
+                data = merged
         return data
 
     def fetch_recent_anomalies(
