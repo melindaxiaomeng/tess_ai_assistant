@@ -18,6 +18,11 @@ services:
       TESS_LLM_API_KEY: "${TESS_LLM_API_KEY}"
       TESS_LLM_BASE_URL: "${TESS_LLM_BASE_URL:-https://api.deepseek.com}"
       TESS_LLM_MODEL: "${TESS_LLM_MODEL:-deepseek-chat}"
+      TESS_LLM_TIMEOUT: "${TESS_LLM_TIMEOUT:-45}"
+      TESS_LLM_FALLBACK_API_KEY: "${TESS_LLM_FALLBACK_API_KEY:-}"
+      TESS_LLM_FALLBACK_BASE_URL: "${TESS_LLM_FALLBACK_BASE_URL:-https://api.siliconflow.cn/v1}"
+      TESS_LLM_FALLBACK_MODEL: "${TESS_LLM_FALLBACK_MODEL:-deepseek-ai/DeepSeek-V3}"
+      TESS_LLM_FALLBACK_TIMEOUT: "${TESS_LLM_FALLBACK_TIMEOUT:-60}"
       # JSONL 持久化路径（落在挂载卷内，容器重建不丢数据）
       TESS_FEEDBACK_PATH: "/data/feedback.jsonl"
       TESS_REMEDIATION_PATH: "/data/remediation.jsonl"

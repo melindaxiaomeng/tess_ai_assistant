@@ -108,6 +108,37 @@ def _safe_api_get(connector, path: str, params: Optional[dict] = None, token: Op
         return None, f"{path} 调用失败: {type(e).__name__}: {e}"
 
 
+def _safe_fluctuation_get(connector, token: Optional[str] = None, timeout: Optional[int] = None):
+    """取 fluctuation 涨跌榜，带全局兜底 token 回退。
+
+    运营个人 token（X-Teensing-Token）在 adminv3 上可能被 RBAC 截断，导致
+    rising/falling 缺一半（最常见：falling 为空）。接口返回 200 不报错，但下游
+    ranking 类问题因 falling_top 为空会报「数据不足」。
+
+    回退规则：主 token 结果缺榜（rising/falling 任一为空）且连接器配了全局兜底
+    token（与主 token 不同）时，用兜底 token 补取全量账户涨跌榜（与 saas_v3 前端
+    看到的一致）。仅补缺的一侧，已完整的一侧不动，避免覆盖运营合法的数据范围。
+    """
+    data, err = _safe_api_get(connector, "/overview/ranking/fluctuation", token=token, timeout=timeout)
+    m = data if isinstance(data, dict) else {}
+    rising = m.get("rising") or []
+    falling = m.get("falling") or []
+    fb = getattr(connector, "fallback_token", "") or ""
+    if fb and fb != (token or "") and (not rising or not falling):
+        data2, _err2 = _safe_api_get(connector, "/overview/ranking/fluctuation", token=fb, timeout=timeout)
+        m2 = data2 if isinstance(data2, dict) else {}
+        r2 = m2.get("rising") or []
+        f2 = m2.get("falling") or []
+        if not rising and r2:
+            rising = r2
+        if not falling and f2:
+            falling = f2
+        if rising or falling:
+            err = None  # 兜底已补齐，原错误（若有）作废
+            data = {"rising": rising, "falling": falling}
+    return data, err
+
+
 def fetch_bi_analysis_context(
     connector,
     analysis_type: str,
@@ -148,7 +179,7 @@ def fetch_bi_analysis_context(
             params={"date": yesterday.strftime("%Y-%m-%d")}, token=token,
         )
         ranking, err_rank = _safe_api_get(connector, "/overview/ranking", token=token)
-        fluc, err_fluc = _safe_api_get(connector, "/overview/ranking/fluctuation", token=token)
+        fluc, err_fluc = _safe_fluctuation_get(connector, token=token)
 
         # 取最近两日（today / yesterday）做环比
         kpi_list = daily_kpi if isinstance(daily_kpi, list) else []
@@ -681,7 +712,7 @@ def fetch_bi_analysis_context(
         # /report 不带 campaign_ids 等过滤时返回空，无法单独算全量榜。
         # 因此：先用 fluctuation 拿全量榜（id + rising 完整信息），再用 /report?campaign_ids
         # 回补真实 revenue/profit 算 profit_change 并补全 campaign_name（取昨日 vs 前日两完整日）。
-        fluc, err_fluc = _safe_api_get(connector, "/overview/ranking/fluctuation", token=token, timeout=30)
+        fluc, err_fluc = _safe_fluctuation_get(connector, token=token, timeout=30)
         fluc_map = fluc if isinstance(fluc, dict) else {}
         rising_raw = fluc_map.get("rising") or []
         falling_raw = fluc_map.get("falling") or []
