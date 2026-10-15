@@ -33,6 +33,7 @@ class LLMUnavailableError(RuntimeError):
 # 上游（如 DeepSeek 繁忙）拖死。
 # ---------------------------------------------------------------------------
 LLM_CB_COOLDOWN_SEC = 30.0
+LLM_STREAM_MAX_CONTENT_GAP_SEC = 20.0  # 流式输出时，超过此秒数未收到实际内容则视为供应商卡死，触发切换/兜底
 
 
 # ---------------------------------------------------------------------------
@@ -159,13 +160,15 @@ class HttpLLMClient:
     def __init__(self, base_url: str, api_key: str, model: str,
                  timeout: float = 30.0, json_mode: bool = True,
                  cooldown_sec: float = LLM_CB_COOLDOWN_SEC,
-                 name: str = "llm") -> None:
+                 name: str = "llm",
+                 max_content_gap: float = LLM_STREAM_MAX_CONTENT_GAP_SEC) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
         self.json_mode = json_mode
         self.provider_name = name
+        self.max_content_gap = max_content_gap
         self.last_usage = None  # 最近一次 complete() 的用量（prompt/completion/total tokens）
         # 独立熔断器状态（每个供应商互不影响）
         self._cb_lock = threading.Lock()
@@ -269,9 +272,15 @@ class HttpLLMClient:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 usage: dict = {}
+                last_content_at = time.monotonic()
                 for raw in resp:
                     line = raw.decode("utf-8", "ignore").strip()
                     if not line.startswith("data:"):
+                        # 只有 keepalive/空行，没有实际内容：检查是否已卡住过久
+                        if time.monotonic() - last_content_at > self.max_content_gap:
+                            raise LLMUnavailableError(
+                                f"LLM 流式响应超过 {self.max_content_gap:.0f}s 未输出实际内容（可能供应商 keepalive 挂死），切换供应商"
+                            )
                         continue
                     data_str = line[5:].strip()
                     if data_str == "[DONE]":
@@ -288,7 +297,13 @@ class HttpLLMClient:
                         continue
                     piece = (choices[0].get("delta") or {}).get("content")
                     if piece:
+                        last_content_at = time.monotonic()
                         yield piece
+                    elif time.monotonic() - last_content_at > self.max_content_gap:
+                        # 收到 SSE 数据但 delta.content 为空，且长时间无内容
+                        raise LLMUnavailableError(
+                            f"LLM 流式响应超过 {self.max_content_gap:.0f}s 未输出实际内容（delta 持续为空），切换供应商"
+                        )
                 if usage:
                     self.last_usage = {
                         "prompt_tokens": usage.get("prompt_tokens"),
@@ -302,6 +317,9 @@ class HttpLLMClient:
                 self._cb_record_failure()
                 raise LLMUnavailableError(msg) from e
             raise RuntimeError(msg) from e
+        except LLMUnavailableError:
+            # 内容间隙超时等已明确标识为不可用的异常，直接向上抛（FallbackLLMClient 会切换）
+            raise
         except Exception as e:  # 连接超时 / 无法连接 / 其他网络异常 → 熔断
             self._cb_record_failure()
             raise LLMUnavailableError(f"LLM 流式连接失败：{type(e).__name__}: {e}") from e
