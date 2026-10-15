@@ -2220,16 +2220,16 @@ def process_question(
                     # 复合问题：一句话含多个意图，逐类型取数并合并上下文
                     route_source = "inferred_multi"
                     multi_types = all_inferred
-            else:
-                analysis_type = inferred
-                route_source = "inferred"
-                # finance_check 接到「趋势/走势/环比变化」类问题时，默认拉最近 3 个月月度报表，
-                # 避免「本月」数据未出（如当前月刚过半）导致回答全 0。
-                if analysis_type == "finance_check" and any(
-                    kw in question for kw in ("趋势", "走势", "环比变化", "变化趋势", "逐月")
-                ):
-                    params = params or {}
-                    params["trend_months"] = params.get("trend_months") or 3
+                else:
+                    analysis_type = inferred
+                    route_source = "inferred"
+                    # finance_check 接到「趋势/走势/环比变化」类问题时，默认拉最近 3 个月月度报表，
+                    # 避免「本月」数据未出（如当前月刚过半）导致回答全 0。
+                    if analysis_type == "finance_check" and any(
+                        kw in question for kw in ("趋势", "走势", "环比变化", "变化趋势", "逐月")
+                    ):
+                        params = params or {}
+                        params["trend_months"] = params.get("trend_months") or 3
 
     if route_source == "inferred_multi":
         # 复合问题：并发取数各子类型 + 整体超时预算 + 单类型超时，避免任一类型慢拖垮整次请求（曾触发 125s 504）。
