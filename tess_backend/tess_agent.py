@@ -22,6 +22,10 @@ from .thresholds import ThresholdPolicy, default_policy
 MAX_RETRIES = 2  # 额外重试次数；实际最多尝试 MAX_RETRIES + 1 次
 
 
+class LLMUnavailableError(RuntimeError):
+    """LLM 服务明确不可用（HTTP 5xx/空 choices 等），调用方应直接降级而非重试。"""
+
+
 # ---------------------------------------------------------------------------
 # System Prompt（PRD §5，含红线 + 置信度评分指南 + Schema 绑定）
 # ---------------------------------------------------------------------------
@@ -184,7 +188,10 @@ class HttpLLMClient:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "ignore")
-            raise RuntimeError(f"LLM HTTP {e.code}: {detail[:500]}") from e
+            msg = f"LLM HTTP {e.code}: {detail[:500]}"
+            if e.code >= 500:
+                raise LLMUnavailableError(msg) from e
+            raise RuntimeError(msg) from e
         # 用量统计（OpenAI 兼容响应的 usage 字段）：供每轮问答落库计费/成本分析
         u = data.get("usage") or {}
         self.last_usage = {
@@ -256,7 +263,10 @@ class HttpLLMClient:
                     }
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "ignore")
-            raise RuntimeError(f"LLM HTTP {e.code}: {detail[:500]}") from e
+            msg = f"LLM HTTP {e.code}: {detail[:500]}"
+            if e.code >= 500:
+                raise LLMUnavailableError(msg) from e
+            raise RuntimeError(msg) from e
 
 
 def llm_last_usage(llm) -> Optional[dict]:
@@ -343,6 +353,10 @@ class TessAgent:
                 parsed = _parse_json(raw)
                 # 出口必须是 Gatekeeper：LLM 说的话在此被死锁校验
                 return validate_tess_output(parsed, input_data, self.policy)
+            except LLMUnavailableError as e:
+                logger.warning("LLM 服务不可用，停止重试：%r", e)
+                last_err = e
+                break
             except Exception as e:  # 网络 / 解析异常 -> 重试
                 last_err = e
                 logger.warning("LLM 调用第 %d 次失败：%r", attempt + 1, e)

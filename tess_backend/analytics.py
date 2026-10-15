@@ -55,7 +55,7 @@ import json
 import re
 import calendar
 
-from .tess_agent import llm_last_usage
+from .tess_agent import LLMUnavailableError, llm_last_usage
 
 # ---------------------------------------------------------------------------
 # BI 分析系统提示词（观点先行 / 数据支撑 / 动作导向）
@@ -2255,6 +2255,7 @@ def process_question(
 
     # LLM 生成：若提供 on_token 且客户端支持流式（有 stream 方法），则逐块吐字；
     # 否则回退普通 complete。流式过程任意异常都回退 complete，保证总能产出答案。
+    _llm_busy_msg = "当前 AI 回答生成服务（DeepSeek）暂时不可用（503/服务繁忙），请稍后重试。"
     if on_token and hasattr(llm, "stream"):
         _chunks: list = []
         try:
@@ -2262,10 +2263,18 @@ def process_question(
                 _chunks.append(_tok)
                 on_token(_tok)
             answer = "".join(_chunks)
+        except LLMUnavailableError:
+            answer = _llm_busy_msg
         except Exception:  # noqa: BLE001
-            answer = llm.complete(ASK_SYSTEM_PROMPT, user_prompt, json_mode=False)
+            try:
+                answer = llm.complete(ASK_SYSTEM_PROMPT, user_prompt, json_mode=False)
+            except LLMUnavailableError:
+                answer = _llm_busy_msg
     else:
-        answer = llm.complete(ASK_SYSTEM_PROMPT, user_prompt, json_mode=False)
+        try:
+            answer = llm.complete(ASK_SYSTEM_PROMPT, user_prompt, json_mode=False)
+        except LLMUnavailableError:
+            answer = _llm_busy_msg
     context_summary = {
         "endpoint": "/tess/ask",
         "errors": ctx.get("errors", []),

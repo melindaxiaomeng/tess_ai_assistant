@@ -24,7 +24,7 @@ from .contracts import (
 from .orchestrator import enrich_with_rule_engine
 from .rule_engine import aggregate_loss_per_hour, aggregate_severity
 from .gatekeeper import validate_joint_output
-from .tess_agent import MAX_RETRIES
+from .tess_agent import LLMUnavailableError, MAX_RETRIES
 from .thresholds import ThresholdPolicy, default_policy
 
 
@@ -179,6 +179,9 @@ def run_joint_diagnosis(events: List[dict], llm, policy: ThresholdPolicy = None)
                     "event_ids": joint_context["event_ids"],
                 },
             }
+        except LLMUnavailableError as e:
+            last_err = e
+            break
         except Exception as e:  # 网络 / 解析异常 -> 重试
             last_err = e
             time.sleep(min(0.1 * (attempt + 1), 1.0))

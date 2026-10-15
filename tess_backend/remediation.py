@@ -26,7 +26,7 @@ from .contracts import (
     REMEDIATION_FAILED,
 )
 from .gatekeeper import validate_remediation
-from .tess_agent import _parse_json, MAX_RETRIES
+from .tess_agent import LLMUnavailableError, _parse_json, MAX_RETRIES
 
 REMEDIATION_SYSTEM_PROMPT = """你叫 Tess，是 Teensing 平台的专属 AdTech 智能数据分析与风控专家。\
 现在需要你针对**已确诊**的异常根因，建议一项**处置动作**（remediation）。
@@ -159,6 +159,9 @@ def propose_remediation(diagnosis: dict, context: dict, llm) -> dict:
             result["severity"] = severity
             result["diagnosis_status"] = status
             return result
+        except LLMUnavailableError as e:
+            last_err = e
+            break
         except Exception as e:  # 网络 / 解析异常 -> 重试
             last_err = e
             time.sleep(min(0.1 * (attempt + 1), 1.0))
