@@ -240,43 +240,119 @@ def fetch_bi_analysis_context(
         }
 
     # ---------------------------------------------------------------
-    # 场景 3：月度对账与财务扣量分析
+    # 场景 3：月度对账与财务扣量分析 / 账户级月度营收支出趋势
     # ---------------------------------------------------------------
     elif analysis_type == "finance_check":
         # 调用方契约（前端/文档）：可传 report_month="2026-06"（YYYY-MM，单月），
         # 或显式传 start_date/end_date（YYYYMM，支持自定义区间，如一个季度）。
         # 注意：Teensing /report/month 真实参数名为 start_date/end_date，且接受 YYYYMM（无横杠）格式；
         # 之前误传 report_month=2026-06 会被接口忽略 -> 返回全 0，现已修正。
+        # 另：实测 /report/month 不支持 start_date != end_date 的区间（422），
+        # 因此 trend_months 需逐月单请求后本地聚合。
+        trend_months = params.get("trend_months")
         if params.get("start_date") and params.get("end_date"):
             sd, ed = str(params["start_date"]), str(params["end_date"])
             month_label = f"{sd}~{ed}"
+            months_to_fetch = [sd] if sd == ed else []
+            if not months_to_fetch:
+                # 尝试兼容区间，但已知大概率 422；拆成逐月
+                y0, m0 = int(sd[:4]), int(sd[4:6])
+                y1, m1 = int(ed[:4]), int(ed[4:6])
+                months_to_fetch = []
+                y, m = y0, m0
+                while (y, m) <= (y1, m1):
+                    months_to_fetch.append(f"{y}{m:02d}")
+                    m += 1
+                    if m > 12:
+                        m = 1
+                        y += 1
+        elif trend_months:
+            end_y, end_m = today.year, today.month
+            start_ym = end_y * 12 + end_m - (int(trend_months) - 1)
+            start_y, start_m = start_ym // 12, start_ym % 12
+            if start_m == 0:
+                start_y -= 1
+                start_m = 12
+            months_to_fetch = []
+            y, m = start_y, start_m
+            for _ in range(int(trend_months)):
+                months_to_fetch.append(f"{y}{m:02d}")
+                m += 1
+                if m > 12:
+                    m = 1
+                    y += 1
+            month_label = f"{start_y}-{start_m:02d} ~ {end_y}-{end_m:02d}"
         else:
             month = params.get("report_month") or today.strftime("%Y-%m")  # "2026-06"
-            sd = ed = month.replace("-", "")  # "202606"
+            months_to_fetch = [month.replace("-", "")]  # "202606"
             month_label = month
-        month_res, err_month = _safe_api_get(
-            connector, "/report/month",
-            params={"start_date": sd, "end_date": ed, "page_size": 50},
-            token=token,
-        )
-        if not isinstance(month_res, dict):
-            month_res = {}
 
-        items = month_res.get("items", [])
-        total_data = month_res.get("total_data", {})
+        all_items: list = []
+        monthly_totals: dict = {}
+        errors: list = []
+        for ym in months_to_fetch:
+            res, err = _safe_api_get(
+                connector, "/report/month",
+                params={"start_date": ym, "end_date": ym, "page_size": 50},
+                token=token,
+            )
+            if err:
+                errors.append(err)
+            if isinstance(res, dict):
+                all_items.extend(res.get("items", []))
+                # 按月份聚合（items 里应含 date/month 字段；若无则用请求 ym）
+                for it in res.get("items", []):
+                    label = str(it.get("date") or it.get("month") or ym)
+                    if len(label) == 6 and label.isdigit():
+                        label = f"{label[:4]}-{label[4:6]}"
+                    bucket = monthly_totals.setdefault(label, {
+                        "revenue": 0.0, "calc_revenue": 0.0, "payout": 0.0,
+                        "calc_payout": 0.0, "conversions": 0, "items_count": 0,
+                    })
+                    bucket["revenue"] += _to_float(it.get("revenue"))
+                    bucket["calc_revenue"] += _to_float(it.get("calc_revenue"))
+                    bucket["payout"] += _to_float(it.get("payout"))
+                    bucket["calc_payout"] += _to_float(it.get("calc_payout"))
+                    bucket["conversions"] += int(_to_float(it.get("conversions")))
+                    bucket["items_count"] += 1
+
         # 计算营收 (calc_revenue) 与 原始/实结营收 (revenue) 差异较大的记录
         reconcile_diffs = [
-            it for it in items
+            it for it in all_items
             if abs(_to_float(it.get("calc_revenue")) - _to_float(it.get("revenue"))) > 500
         ]
+
+        # 整体汇总：用最近一个月（或唯一月）的 total_data；多个月则自行合计
+        total_data = {}
+        if months_to_fetch and not total_data:
+            # 优先取最后一个月的 total_data
+            last_res, _ = _safe_api_get(
+                connector, "/report/month",
+                params={"start_date": months_to_fetch[-1], "end_date": months_to_fetch[-1], "page_size": 50},
+                token=token,
+            )
+            if isinstance(last_res, dict):
+                total_data = last_res.get("total_data", {})
 
         return {
             "analysis_type": "finance_check",
             "report_month": month_label,
             "total_summary": total_data,
+            "monthly_trend": {
+                "months": list(monthly_totals.keys()),
+                "by_month": {k: {
+                    "revenue": round(v["revenue"], 2),
+                    "calc_revenue": round(v["calc_revenue"], 2),
+                    "payout": round(v["payout"], 2),
+                    "calc_payout": round(v["calc_payout"], 2),
+                    "profit": round(v["revenue"] - v["payout"], 2),
+                    "conversions": v["conversions"],
+                    "items_count": v["items_count"],
+                } for k, v in monthly_totals.items()},
+            },
             "discrepancy_items": reconcile_diffs[:10],
-            "sample_items": items[:5],
-            "errors": [err_month] if err_month else [],
+            "sample_items": all_items[:5],
+            "errors": errors,
         }
 
     # ---------------------------------------------------------------
@@ -1323,7 +1399,7 @@ def _build_user_prompt(analysis_type: str, ctx: dict) -> str:
     intro = {
         "daily_summary": "以下是昨日/今日大盘与排名数据，请输出绩效复盘简报。",
         "scaling_opportunity": "以下是近 7 天按利润排序的 Campaign/Publisher 报表与质量数据，请挖掘放量潜力。",
-        "finance_check": "以下是本月月度报表（含 revenue、payout、calc_revenue 等字段），请按用户问题作答：若问营收与支出/收支趋势，先给本月总计与环比变化，再列明细；若问对账，则分析对账差异与毛利趋势。",
+        "finance_check": "以下是月度报表（含 revenue、payout、calc_revenue 等字段；若用户问趋势，还会提供近 N 个月聚合的 monthly_trend）。请按用户问题作答：若问营收与支出/收支趋势，先看 monthly_trend 给出逐月总计、环比变化与走势，再列明细；若问对账，则分析对账差异与毛利趋势。",
         "account_overview": "以下是 Campaign/Advertiser 主数据目录与广告主维度排名，请输出账户全景概览。注意：campaign 总量达数百万，下方 active/inactive/missing_cap 仅来自首页 100 条抽样，不能代表全局占比；全局规模请看 campaign_total/advertiser_total，头部广告主请看 top_advertisers_by_revenue。",
         "publisher_deepdive": "以下是 Publisher 渠道目录与扣量/质量率数据，请对比各渠道质量风险（reject/q1/q2 扣量、回传缺口），指出需核查的渠道。",
         "scaling_capacity": "以下是近 7 日各 Campaign 利润/Margin 与各自的 Cap 设置，请评估哪些 Campaign 有放量空间（盈利高 Margin 但 Cap 偏低）、哪些 Cap 被浪费（亏损仍挂 Cap）。",
@@ -2144,9 +2220,16 @@ def process_question(
                     # 复合问题：一句话含多个意图，逐类型取数并合并上下文
                     route_source = "inferred_multi"
                     multi_types = all_inferred
-                else:
-                    analysis_type = inferred
-                    route_source = "inferred"
+            else:
+                analysis_type = inferred
+                route_source = "inferred"
+                # finance_check 接到「趋势/走势/环比变化」类问题时，默认拉最近 3 个月月度报表，
+                # 避免「本月」数据未出（如当前月刚过半）导致回答全 0。
+                if analysis_type == "finance_check" and any(
+                    kw in question for kw in ("趋势", "走势", "环比变化", "变化趋势", "逐月")
+                ):
+                    params = params or {}
+                    params["trend_months"] = params.get("trend_months") or 3
 
     if route_source == "inferred_multi":
         # 复合问题：并发取数各子类型 + 整体超时预算 + 单类型超时，避免任一类型慢拖垮整次请求（曾触发 125s 504）。
