@@ -1534,6 +1534,10 @@ _ANALYSIS_KEYWORDS: list = [
                           "渠道大盘", "渠道数据", "渠道排名", "渠道排行", "渠道列表",
                           "campaign大盘", "campaign数据", "campaign排名", "campaign排行",
                           "活动数据", "活动大盘", "全盘", "全盘数据"]),
+    # campaign_ranking 必须排在 daily_summary 之前：「昨天/昨日 + 排名意图」会被 daily_summary 的
+    # 时间词（昨日/昨天）抢占，导致"昨天哪个campaign下滑最快"误判成每日复盘。排名类是更具体的意图，
+    # 优先命中；纯"昨天营收怎么样"（不含排名词）仍走 daily_summary。
+    ("campaign_ranking", ["利润环比下滑", "利润下滑", "营收下滑", "环比下滑", "下滑最快", "跌幅最大", "掉得最快", "降幅最大", "哪个campaign", "哪个活动", "哪个 campaign", "谁掉得最快", "利润下降最快", "营收下降最快"]),
     ("daily_summary", ["复盘", "每日", "昨日", "昨天", "日报", "今日表现", "daily summary"]),
     ("account_profit_rollup", ["最近两周", "近两周", "近两周利润", "最近两周利润", "两周利润",
                                "两周的", "近期利润", "利润汇总", "总利润",
@@ -1546,7 +1550,6 @@ _ANALYSIS_KEYWORDS: list = [
     ("advertiser_deepdive", ["广告主详情", "广告主明细", "广告主下钻", "这个广告主", "某个广告主",
                              "广告主表现", "广告主趋势", "advertiser", "主户", "客户详情", "这个客户"]),
     ("traffic_policy_check", ["替换渠道", "切量", "切流量", "流量策略", "屏蔽", "block", "replace", "映射", "渠道映射"]),
-    ("campaign_ranking", ["利润环比下滑", "利润下滑", "营收下滑", "环比下滑", "下滑最快", "跌幅最大", "掉得最快", "降幅最大", "哪个campaign", "哪个活动", "哪个 campaign", "谁掉得最快", "利润下降最快", "营收下降最快"]),
     ("metric_ranking", ["点击最大", "点击最高", "转化率最低", "转化最低", "高点击低转化",
                         "点击和转化", "点击榜", "转化榜", "点击最多转化最差"]),
     ("pkg_deepdive", ["包名", "这个包", "应用包", "包的表现", "包跑量", "package", "pkg"]),
@@ -1592,9 +1595,11 @@ def infer_analysis_type(question: str) -> Optional[str]:
     if not question:
         return None
     q = question.lower()
+    qn = re.sub(r"\s+", "", q)  # 去空格版本：兼容「哪个 AM」vs「哪个am」等带空格写法
     for atype, kws in _ANALYSIS_KEYWORDS:
         for kw in kws:
-            if kw.lower() in q:
+            k = kw.lower()
+            if k in q or k.replace(" ", "") in qn:
                 return atype
     return None
 
@@ -1608,10 +1613,12 @@ def infer_all_analysis_types(question: str) -> list:
     if not question:
         return []
     q = question.lower()
+    qn = re.sub(r"\s+", "", q)  # 去空格版本：兼容「哪个 AM」vs「哪个am」等带空格写法
     seen, kept_domains, out = set(), set(), []
     for atype, kws in _ANALYSIS_KEYWORDS:
         for kw in kws:
-            if kw.lower() in q and atype not in seen:
+            k = kw.lower()
+            if (k in q or k.replace(" ", "") in qn) and atype not in seen:
                 seen.add(atype)
                 dom = _ANALYSIS_DOMAIN.get(atype)
                 # 通用实体下钻：同域已命中更具体类型时抑制
