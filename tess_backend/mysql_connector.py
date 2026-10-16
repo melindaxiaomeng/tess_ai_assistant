@@ -109,10 +109,11 @@ class MysqlDataConnector:
         self.fill_top_n = int(fill_top_n or 500)
         # 重聚合查询结果进程内缓存，避免长周期下钻对同一 (campaign_ids,ds,de) 重复跑分页查询。
         self._agg_cache: dict = {}
-        # 试点期跨库回退：默认开（=1）。当默认库（按 platform_id 选）查不到某广告主时，
-        # 自动尝试 TESS_MYSQL_DATABASES 中其它库（如 Melodong 运营误查到 seanear 数据）。
-        # 上线前建议置 0，避免跨平台数据串档（运营隔离由 platform_id 决定）。
-        self.cross_db = str(os.getenv("TESS_MYSQL_CROSS_DB", "1") or "1").strip() not in (
+        # 跨库回退：默认关（=0，生产默认）。仅当默认库（按 platform_id 选）查不到时，
+        # 才允许自动尝试 TESS_MYSQL_DATABASES 中其它库。开启会导致平台串档
+        # （如 seanear 的榜单借到 Melodong 的 campaign/利润）——运营隔离由 platform_id 决定，
+        # 不应被回退掩盖。需要时用 TESS_MYSQL_CROSS_DB=1 临时开启。
+        self.cross_db = str(os.getenv("TESS_MYSQL_CROSS_DB", "0") or "0").strip() not in (
             "0", "false", "no", "off"
         )
         # 路由审计：记录每个被调用的 path 由 MySQL 实现还是回退到真实 API（供对拍/可观测用）。
