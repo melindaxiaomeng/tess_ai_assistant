@@ -92,40 +92,48 @@ def get_platform_base_url(platform_id: Optional[str] = None) -> str:
 
     优先级（取第一个非空）：
       1) 后台平台管理 tess_platforms.base_url（/tess/admin/platforms 配置，即时生效）
-      2) TESS_PLATFORM_API_BASE_URLS（JSON: {"Melodong": "...", "Seanear": "..."}）
-      3) 全局 TESS_DATA_API_BASE_URL（旧配置，兼容单平台 Melodong）
+      2) TESS_PLATFORM_API_BASE_URLS（JSON: {"seanear": "...", ...}，大小写不敏感）
+      3) 单平台部署容错：未带 platform 且恰好一个启用平台 -> 用该平台 base_url
+      4) 仅当 platform_id 显式为 "melodong"（大小写不敏感）时，才允许用全局
+         TESS_DATA_API_BASE_URL（melodong 专属端点）——**不作为其它未解析平台的兜底**
 
     - 若只填裸域名（缺协议），自动补 https://；绝不补路径（/api/v1 需配置时写全）。
-    - platform_id 空 / 各层都查不到 -> 回退全局值（不报错）。
-    - 返回统一 rstrip("/")，避免 base_url + path 拼接出双斜杠。
+    - platform_id 空 / 各层都查不到（无 header 且非单平台 / 平台未注册）-> 返回 ""，
+      调用方据此返回空结果，**绝不回退全局 melodong 端点**，避免跨平台串档。
+    - 返回统一 rstrip("/")。
     """
-    default = _ensure_scheme(os.getenv("TESS_DATA_API_BASE_URL", ""))
     if not platform_id:
-        # 单平台部署容错：未带 platform 时默认走唯一启用平台，避免回退全局 melodong 端点串档。
+        # 单平台部署容错：未带 platform 时默认走唯一启用平台（seanear 等），
+        # 缺失则空（不回退 melodong）。
         single = get_single_active_platform_id()
         if single:
             db_url = _db_base_url(single)
             if db_url:
                 return _ensure_scheme(db_url).rstrip("/")
-        return default.rstrip("/")
+        return ""
     # 1) 后台配置优先（即时生效，无需改 .env / 重启）
     db_url = _db_base_url(platform_id)
     if db_url:
         return _ensure_scheme(db_url).rstrip("/")
-    # 2) .env 的 JSON 映射
+    # 2) .env 的 JSON 映射（大小写不敏感）
     raw = os.getenv("TESS_PLATFORM_API_BASE_URLS", "")
     if raw:
         try:
             mapping = json.loads(raw)
             if isinstance(mapping, dict):
-                # 大小写不敏感：键与查询都归一到 lower 再比对
                 lower_map = {str(k).lower(): v for k, v in mapping.items()}
                 url = lower_map.get(str(platform_id).lower())
                 if url:
                     return _ensure_scheme(str(url)).rstrip("/")
         except (ValueError, TypeError):
-            logger.warning("TESS_PLATFORM_API_BASE_URLS 解析失败，回退全局 base")
-    return default.rstrip("/")
+            logger.warning("TESS_PLATFORM_API_BASE_URLS 解析失败")
+    # 3) 显式 melodong 平台才允许用全局 melodong 端点（不作为其它平台的兜底）
+    if str(platform_id).lower() == "melodong":
+        m = _ensure_scheme(os.getenv("TESS_DATA_API_BASE_URL", ""))
+        if m:
+            return m.rstrip("/")
+    # 未解析到任何平台 -> 空（绝不回退 melodong）
+    return ""
 
 # 开发/测试用样例原始事件（结构接近 Teensing 预期返回，已可直接归一化为 Context）
 _SAMPLE_RAW = {
@@ -292,7 +300,8 @@ class TeensingDataConnector:
         timeout: int = 60,
         platform_token: Optional[str] = None,
     ):
-        self.base_url = _ensure_scheme(base_url or os.getenv("TESS_DATA_API_BASE_URL", "")).rstrip("/")
+        # 不再回退全局 melodong 端点：未传 base_url 即为空，由调用方改用 EmptyDataConnector。
+        self.base_url = _ensure_scheme(base_url or "").rstrip("/")
         self.api_key = api_key if api_key is not None else os.getenv("TESS_DATA_API_KEY", "")
         self.timeout = int(os.getenv("TESS_DATA_API_TIMEOUT", str(timeout)))
         # 取数 token 三级回落：① 平台专属 token（tess_platforms.token，按 platform_id 路由到各自 SaaS 端点）
@@ -1102,6 +1111,34 @@ def extract_realtime_anomalies(
     return contexts
 
 
+class EmptyDataConnector:
+    """无平台上下文（未带 X-Platform-Id 且非单平台 / 平台未注册）时的空连接器。
+
+    所有 fetch 返回空结果，**绝不去连全局 melodong 端点**，避免跨平台串档。
+    调用方拿到空结果后按「无数据」处理（UI 显示空 / 定时诊断不落库），
+    而不是被 melodong 数据污染。与 DataConnector 同接口，可无缝替换。
+    """
+
+    def fetch_recent_anomalies(self, limit: int = 20, token: Optional[str] = None) -> list[dict]:
+        return []
+
+    def fetch_anomaly_event(self, event_id: str, token: Optional[str] = None) -> Optional[dict]:
+        return None
+
+    def fetch_realtime_kpi(self, token: Optional[str] = None) -> dict:
+        return {"items": []}
+
+    def fetch_campaign_time_series(
+        self, campaign_id, token=None, days=7, granularity="day",
+        publisher_id=None,
+    ) -> dict:
+        return {
+            "campaign_id": str(campaign_id),
+            "granularity": granularity,
+            "time_series": [],
+        }
+
+
 def get_data_connector(platform_id: Optional[str] = None, operator_id: Optional[str] = None) -> DataConnector:
     """按环境变量 TESS_DATA_CONNECTOR 选择具体实现（默认 mock，零配置可跑）。
 
@@ -1117,11 +1154,15 @@ def get_data_connector(platform_id: Optional[str] = None, operator_id: Optional[
     """
     kind = os.getenv("TESS_DATA_CONNECTOR", "mock").lower()
     if kind == "teensing" or kind == "api":
-        # 单平台部署容错：未带 platform_id 时默认走唯一启用平台（base_url + token 同时默认），
-        # 避免回退全局 melodong 端点/全局 token 造成串档。多平台部署下保持 None（沿用全局兜底）。
+        # 单平台部署容错：未带 platform_id 时默认走唯一启用平台（base_url + token 同时默认）。
+        # 解析不到任何平台（无 header 且非单平台 / 平台未注册）→ 返回空连接器，
+        # 绝不回退全局 melodong 端点造成串档。
         pid = platform_id or get_single_active_platform_id()
+        base_url = get_platform_base_url(pid) if pid else ""
+        if not base_url:
+            return EmptyDataConnector()
         return TeensingDataConnector(
-            base_url=get_platform_base_url(pid),
+            base_url=base_url,
             platform_token=_db_data_token(pid) if pid else None,
         )
     if kind == "mysql":

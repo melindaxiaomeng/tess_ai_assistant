@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from tess_backend.data_connector import (
     MockDataConnector,
     TeensingDataConnector,
+    EmptyDataConnector,
     get_data_connector,
     get_platform_base_url,
     normalize_to_context,
@@ -99,24 +100,55 @@ def test_get_data_connector_default_is_mock(monkeypatch):
 
 
 def test_get_data_connector_teensing_unconfigured(monkeypatch):
+    """未配置任何平台（无 header 且非单平台）时 teensing 模式应返回空连接器，
+    绝不回退全局 melodong 端点、也不抛错。"""
     monkeypatch.setenv("TESS_DATA_CONNECTOR", "teensing")
     monkeypatch.delenv("TESS_DATA_API_BASE_URL", raising=False)
-    with pytest.raises(RuntimeError):
-        get_data_connector()
+    monkeypatch.delenv("TESS_PLATFORM_API_BASE_URLS", raising=False)
+    # 无注册平台时 single_active 解析不到 -> get_data_connector() 返回空连接器
+    monkeypatch.setattr(
+        "tess_backend.data_connector.get_single_active_platform_id", lambda: None
+    )
+    c = get_data_connector()
+    assert isinstance(c, EmptyDataConnector)
+    # 空连接器所有 fetch 返回空，不触达任何端点
+    assert c.fetch_recent_anomalies() == []
+    assert c.fetch_realtime_kpi() == {"items": []}
+    assert c.fetch_campaign_time_series("123") == {
+        "campaign_id": "123", "granularity": "day", "time_series": []
+    }
 
 
-def test_get_platform_base_url_global_fallback(monkeypatch):
-    """platform_id 为空 / 缺映射 -> 回退全局 TESS_DATA_API_BASE_URL（兼容单平台）。"""
+def test_get_platform_base_url_no_melodong_fallback(monkeypatch):
+    """platform_id 为空 / 缺映射 -> 返回空字符串（绝不回退全局 melodong 端点）。"""
     monkeypatch.setenv("TESS_DATA_API_BASE_URL", "https://adminv3.melodong.com/api/v1/")
     monkeypatch.delenv("TESS_PLATFORM_API_BASE_URLS", raising=False)
-    assert get_platform_base_url() == "https://adminv3.melodong.com/api/v1"
-    assert get_platform_base_url(None) == "https://adminv3.melodong.com/api/v1"
-    # 映射里查不到的 platform_id 也回退全局
+    assert get_platform_base_url() == ""
+    assert get_platform_base_url(None) == ""
+    # 映射里查不到的 platform_id 也返回空（不回退 melodong）
     monkeypatch.setenv(
         "TESS_PLATFORM_API_BASE_URLS",
         '{"Melodong":"https://adminv3.melodong.com/api/v1"}',
     )
-    assert get_platform_base_url("Seanear") == "https://adminv3.melodong.com/api/v1"
+    assert get_platform_base_url("Seanear") == ""
+    # 但显式请求 melodong 平台仍允许用其专属端点（非兜底，而是明确指向）
+    assert get_platform_base_url("melodong") == "https://adminv3.melodong.com/api/v1"
+    assert get_platform_base_url("Melodong") == "https://adminv3.melodong.com/api/v1"
+
+
+def test_get_data_connector_returns_empty_when_no_platform(monkeypatch):
+    """get_data_connector(platform_id=None) 在无法解析平台时返回 EmptyDataConnector。"""
+    monkeypatch.setenv("TESS_DATA_CONNECTOR", "teensing")
+    monkeypatch.setenv("TESS_DATA_API_BASE_URL", "https://adminv3.melodong.com/api/v1")
+    monkeypatch.setattr(
+        "tess_backend.data_connector.get_single_active_platform_id", lambda: None
+    )
+    # 无 header 且非单平台 -> 空连接器，绝不清到 melodong
+    c = get_data_connector(platform_id=None)
+    assert isinstance(c, EmptyDataConnector)
+    # 显式一个未注册的平台 -> 同样空（不回退 melodong）
+    c2 = get_data_connector(platform_id="GhostPlatform")
+    assert isinstance(c2, EmptyDataConnector)
 
 
 def test_get_platform_base_url_per_platform(monkeypatch):
@@ -132,11 +164,11 @@ def test_get_platform_base_url_per_platform(monkeypatch):
     assert get_platform_base_url("Melodong") == "https://adminv3.melodong.com/api/v1"
 
 
-def test_get_platform_base_url_bad_json_falls_back(monkeypatch):
-    """TESS_PLATFORM_API_BASE_URLS 非 JSON -> 回退全局，不报错。"""
+def test_get_platform_base_url_bad_json_returns_empty(monkeypatch):
+    """TESS_PLATFORM_API_BASE_URLS 非 JSON -> 返回空（不回退 melodong），不报错。"""
     monkeypatch.setenv("TESS_DATA_API_BASE_URL", "https://adminv3.melodong.com/api/v1")
     monkeypatch.setenv("TESS_PLATFORM_API_BASE_URLS", "not-json{")
-    assert get_platform_base_url("Seanear") == "https://adminv3.melodong.com/api/v1"
+    assert get_platform_base_url("Seanear") == ""
 
 
 def test_get_data_connector_passes_platform_id(monkeypatch):
