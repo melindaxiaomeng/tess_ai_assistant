@@ -190,21 +190,32 @@ def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None,
 
     platform_id 指定时只跑该平台；为 None 时遍历所有启用平台；
     若未注册任何平台，跑一遍全局（platform_id="default"，旧行为）。
-    取数 token：定时诊断无请求上下文（没有运营个人 token），统一用全局 TESS_SYSTEM_TOKEN。
+    取数 token：定时诊断无请求上下文（没有运营个人 token），优先用各平台专属 token
+    （tess_platforms.token，按 platform_id 路由到各自 SaaS 端点），再回退全局
+    TESS_SYSTEM_TOKEN（token 缺失时）。
     LLM key 仍按平台隔离：优先平台 llm_api_key（DeepSeek 按平台开 key、账单分开算），
     回退全局 TESS_LLM_API_KEY；显式传入 llm 时（测试/内部调用）直接用。
-    各平台共用同一 Teensing base_url，故单 connector 复用。
+    每个平台按 platform_id 独立解析 base_url 与 token、独立构造 connector，避免共用
+    melodong 端点导致的跨平台串档（如 seanear 借到 melodong 数据）。
     返回本轮所有平台汇总诊断结果列表（meta 含 source 标签）。
     """
-    connector = connector or _get_data_connector()
     policy = load_policy()
 
-    # 构造待跑平台清单：(platform_id, token) —— 平台仅用于打标与 LLM key 区分，
-    # 取数 token 统一全局 TESS_SYSTEM_TOKEN（平台 token 已废弃）
+    # 构造待跑平台清单：(platform_id, token) —— 每个平台用各自 connector（base_url 按
+    # platform_id 解析，避免共用 melodong 端点跨平台串档）；取数 token 优先平台专属
+    # token（resolve_data_token），再回退全局 TESS_SYSTEM_TOKEN。
     sys_token = os.getenv("TESS_SYSTEM_TOKEN") or ""
+
+    def _data_token(pid: str) -> str:
+        try:
+            t = get_platform_registry().resolve_data_token(pid)
+        except Exception:
+            t = None
+        return t or sys_token
+
     targets: list = []
     if platform_id:
-        targets.append((platform_id, sys_token))
+        targets.append((platform_id, _data_token(platform_id)))
     else:
         try:
             plats = get_platform_registry().active_platforms()
@@ -212,14 +223,18 @@ def run_scheduled_diagnosis(limit: int = 20, connector=None, llm=None,
             plats = []
         if plats:
             for p in plats:
-                targets.append((p["id"], sys_token))
+                pid = p["id"]
+                targets.append((pid, _data_token(pid)))
         else:
             targets.append(("default", sys_token))
 
     all_results: list = []
     for pid, token in targets:
+        # 每个平台独立构造 connector（base_url 按 platform_id 解析）；调用方显式传入
+        # connector（测试）时复用之。
+        plat_connector = connector or get_data_connector(platform_id=pid)
         platform_llm = llm or _get_llm_client(pid)  # 平台 key > 全局 key
-        results = _diagnose_one_platform(connector, platform_llm, token, pid, limit, policy)
+        results = _diagnose_one_platform(plat_connector, platform_llm, token, pid, limit, policy)
         if results:
             ALERTS.save_batch(results, platform_id=pid)
         all_results.extend(results)
@@ -377,6 +392,15 @@ def _resolve_access_token(request: Optional[Request], platform_id: Optional[str]
     user_token = _teensing_token(request)
     if user_token:
         return user_token, "user"
+    # 无运营 token：优先平台专属 token（按 platform_id 路由到各自 SaaS 端点），
+    # 再回退全局 TESS_SYSTEM_TOKEN。token_mode="platform" 表示走了平台专属 token。
+    if platform_id:
+        try:
+            platform_token = get_platform_registry().resolve_data_token(platform_id)
+        except Exception:
+            platform_token = None
+        if platform_token:
+            return platform_token, "platform"
     system_token = os.getenv("TESS_SYSTEM_TOKEN") or None
     return (system_token or ""), "system"
 
@@ -775,8 +799,15 @@ def diagnose_from_source(payload: dict = None, request: Request = None) -> dict:
     effective_token, _mode = _resolve_access_token(request, platform_id)
     payload = payload or {}
     limit = max(1, min(int(payload.get("limit", 5)), 50))
+    # 生产（teensing/mysql）且带 platform_id 时按平台构造 connector（base_url/token 按
+    # 平台解析，保证隔离）；mock 模式（开发/测试/演示）或不含 platform_id 时复用全局
+    # 缓存的 connector（避免破坏单测对全局 connector 的 monkeypatch）。
+    connector_mode = os.getenv("TESS_DATA_CONNECTOR", "mock").lower()
     try:
-        connector = _get_data_connector()
+        if platform_id and connector_mode in ("teensing", "mysql", "api"):
+            connector = get_data_connector(platform_id=platform_id, operator_id=operator)
+        else:
+            connector = _get_data_connector()
     except Exception as e:  # 接入层未配置（如 teensing 缺 base_url）
         raise HTTPException(status_code=503, detail=f"数据接入层初始化失败：{e}")
     # 生产模式必须有运营/平台/全局任一 token，否则无法取数

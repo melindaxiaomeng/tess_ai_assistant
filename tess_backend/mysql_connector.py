@@ -297,7 +297,7 @@ class MysqlDataConnector:
         # 未实现：回退到真实 Teensing API（绝不静默返回空，避免数据丢失）。
         self.served_routes.append((path, "api"))
         if self._api_fallback is None:
-            from tess_backend.data_connector import TeensingDataConnector, get_platform_base_url
+            from tess_backend.data_connector import TeensingDataConnector, get_platform_base_url, _db_data_token
             self._api_fallback = TeensingDataConnector(
                 base_url=get_platform_base_url(self.platform_id))
         return self._api_fallback.api_get(path, params, token, timeout)
@@ -923,7 +923,7 @@ class MysqlDataConnector:
         except Exception:
             # seanear 等无 click 表或 event_postback_info 结构不同 → 委托真实 API
             if self._api_fallback is None:
-                from tess_backend.data_connector import TeensingDataConnector, get_platform_base_url
+                from tess_backend.data_connector import TeensingDataConnector, get_platform_base_url, _db_data_token
                 self._api_fallback = TeensingDataConnector(base_url=get_platform_base_url(self.platform_id))
             return self._api_fallback.api_get("/campaign-ctit-etit", params, None, None)
         return {"ctit": ctit, "etit": etit}

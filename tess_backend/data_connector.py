@@ -66,6 +66,25 @@ def _db_base_url(platform_id: str) -> Optional[str]:
     return None
 
 
+def _db_data_token(platform_id: str) -> Optional[str]:
+    """从后台平台管理（tess_platforms 表）读取该平台的专属取数 token。
+
+    让 /tess/admin/platforms 界面配置即时生效（无需改 .env、无需重启）。
+    DB 不可用（测试 / 未初始化 / 表不存在）时静默回退到全局 token，不抛异常、不阻断取数。
+    返回 None 表示该平台未配置专属 token（调用方回退全局 TESS_SYSTEM_TOKEN）。
+    """
+    try:
+        from .platform_registry import get_platform_registry
+        row = get_platform_registry().get_dict(platform_id)
+        if row:
+            t = row.get("token")
+            if t:
+                return str(t)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("从 tess_platforms 读 data_token 失败，回退全局：%s", e)
+    return None
+
+
 def get_platform_base_url(platform_id: Optional[str] = None) -> str:
     """按 platform_id 解析 SaaS 数据 API 根地址（支持多平台各自独立源站）。
 

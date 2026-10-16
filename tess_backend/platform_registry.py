@@ -11,7 +11,8 @@ alerts）打 platform_id 隔离报表，Tess 调 LLM 时优先用该平台的 ll
 表 tess_platforms：
   id          : 稳定字符串主键（如 "melodong"），前端在 X-Platform-Id 携带
   name        : 展示名（运营可读）
-  token       : 历史遗留（原平台级取数 token，已废弃，不再用于鉴权）
+  token       : 平台专属取数 token（可选，仅用于按平台路由到各自 SaaS 端点鉴权；
+                缺失时回退全局 TESS_SYSTEM_TOKEN；运营个人 token 仍优先于此）
   llm_api_key : 可选，该平台专用的 LLM（DeepSeek）API key —— Tess 调 LLM 时优先用它，
                 为空则回退全局 TESS_LLM_API_KEY
   base_url    : 历史遗留（各平台共用全局 TESS_DATA_API_BASE_URL）
@@ -106,7 +107,7 @@ class PlatformRegistry:
             now = _now()
             row = Platform(
                 id=platform_id, name=name or platform_id,
-                token=(token or ""),  # 历史遗留字段，取数不再使用
+                token=(token or ""),  # 平台专属取数 token（可选；缺失回退全局）
                 llm_api_key=(llm_api_key or None),
                 base_url=base_url, is_active=is_active,
                 expires_at=_normalize_expires(expires_at),
