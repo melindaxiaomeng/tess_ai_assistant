@@ -41,7 +41,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 logger = logging.getLogger("tess_backend.mysql_connector")
@@ -115,6 +115,10 @@ class MysqlDataConnector:
         self.cross_db = str(os.getenv("TESS_MYSQL_CROSS_DB", "1") or "1").strip() not in (
             "0", "false", "no", "off"
         )
+        # 路由审计：记录每个被调用的 path 由 MySQL 实现还是回退到真实 API（供对拍/可观测用）。
+        self.served_routes: list = []
+        # 试点期回退实例（惰性创建，避免与 data_connector 循环 import）。
+        self._api_fallback = None
 
     # ----- 传输层（替代 Teensing 的 HTTP） -----
 
@@ -254,21 +258,48 @@ class MysqlDataConnector:
         token: Optional[str] = None,
         timeout: Optional[int] = None,
     ) -> dict:
-        """公开透传：与 TeensingDataConnector.api_get 同签名，返回已「解包」的业务 dict。"""
+        """公开透传：与 TeensingDataConnector.api_get 同签名，返回已「解包」的业务 dict。
+
+        已实现的路径（report/campaigns/advertiser/daily-kpi/kpi-trend）由 MySQL 直出；
+        未实现的路径**回退到真实 Teensing API**（试点期零风险，绝不静默返回空导致数据丢失）。
+        每次调用都记一笔 served_routes，便于对拍时区分「MySQL 校验」与「API 委托」。
+        """
         params = params or {}
         if path == "/advertisers/campaign-daily-kpi":
+            self.served_routes.append((path, "mysql"))
             return self._campaign_daily_kpi(params)
         if path.startswith("/advertisers/"):
+            self.served_routes.append((path, "mysql"))
             aid = path.split("/advertisers/", 1)[1]
             return self._advertiser_profile(aid)
         if path == "/report":
+            self.served_routes.append((path, "mysql"))
             return self._report(params)
         if path == "/campaigns":
+            self.served_routes.append((path, "mysql"))
             return self._campaigns(params)
         if path == "/campaign-kpi-trend":
+            self.served_routes.append((path, "mysql"))
             return self._campaign_kpi_trend(params)
-        logger.warning("MysqlDataConnector 未实现的路径 %s，返回空结构", path)
-        return {"items": []}
+        if path == "/publishers":
+            self.served_routes.append((path, "mysql"))
+            return self._publishers(params)
+        if path == "/campaign-quality/publisher":
+            self.served_routes.append((path, "mysql"))
+            return self._publisher_quality(params)
+        if path == "/campaign-quality":
+            self.served_routes.append((path, "mysql"))
+            return self._campaign_quality(params)
+        if path == "/campaign-ctit-etit":
+            self.served_routes.append((path, "mysql"))
+            return self._ctit_etit(params)
+        # 未实现：回退到真实 Teensing API（绝不静默返回空，避免数据丢失）。
+        self.served_routes.append((path, "api"))
+        if self._api_fallback is None:
+            from tess_backend.data_connector import TeensingDataConnector, get_platform_base_url
+            self._api_fallback = TeensingDataConnector(
+                base_url=get_platform_base_url(self.platform_id))
+        return self._api_fallback.api_get(path, params, token, timeout)
 
     # ----- 实体 / 报表实现 -----
 
@@ -523,9 +554,13 @@ class MysqlDataConnector:
         return {"items": all_rows[start: start + page_size]}
 
     def _campaigns(self, params: dict) -> dict:
-        """模拟 GET /campaigns：按 id 精确回目录（用于补缺失 campaign 的 status）。
+        """模拟 GET /campaigns：按 id 精确回目录（用于补缺失 campaign 的 status / config）。
 
         campaign 表 status 为数字、status_name 恒空，由调用方 _camp_status_label 映射。
+        campaign_detail 取 id/name/advertiser_id/country/cap/click_cap/status/kpi 与线上
+        /campaigns 目录对齐。**关键**：campaign 表无 publisher_id 列（多对多经 publisher_campaign），
+        且线上 /campaigns 也不回 publisher_id 字段（已实测 7160172 → key 不存在），故这里一致
+        不产出该字段，保证 campaign_config 逐字段 0 差异（_pick 两侧都得 None）。
         """
         cids = [x for x in str(params.get("campaign_ids") or "").split(",") if x]
         if not cids:
@@ -535,13 +570,23 @@ class MysqlDataConnector:
         except (TypeError, ValueError):
             ids = tuple(cids)
         ph = ",".join(["%s"] * len(ids))
-        rows = self._query(f"SELECT id, name, status FROM campaign WHERE id IN ({ph})", ids)
+        rows = self._query(
+            f"SELECT id, name, advertiser_id, country, cap, click_cap, "
+            f"status, kpi FROM campaign WHERE id IN ({ph})", ids)
         return {
             "items": [
                 {
+                    "id": r.get("id"),
                     "campaign_id": r.get("id"),
-                    "status": r.get("status"),
+                    "name": r.get("name"),
                     "campaign_name": r.get("name"),
+                    "advertiser_id": r.get("advertiser_id"),
+                    "country": r.get("country"),
+                    "cap": self._f(r.get("cap")),
+                    "click_cap": r.get("click_cap"),
+                    "status": r.get("status"),
+                    "status_name": campaign_status_label(r.get("status")),
+                    "kpi": r.get("kpi"),
                 }
                 for r in rows
             ]
@@ -551,40 +596,342 @@ class MysqlDataConnector:
         """模拟 GET /campaign-kpi-trend：单/多 campaign 日级趋势（短周期 / 回退路径用）。
 
         读 report_hour_new 日级明细（scoped，走索引），与线上接口逐字段吻合。
+        字段对齐：revenue/payout/clicks/conversions/cvr/reject_count/reject_rate/
+        completed/margin_rate/profit + 顶栏 total_*。
         """
         cids = [x for x in str(params.get("campaign_ids") or "").split(",") if x]
         ds = params.get("date_start")
         de = params.get("date_end")
-        if not cids or not ds or not de:
-            return {"items": []}
+        if not cids:
+            return {"items": [], "total_revenue": 0, "total_clicks": 0,
+                    "total_conversions": 0, "total_profit": 0}
+        # campaign_detail 调它时只传 campaign_ids、不传日期 → 与线上接口一致回退「近 7 天
+        # 结束于昨天」的默认窗口（已实测线上 kpi-trend 无日期 = 10-09..10-15 共 7 天），否则
+        # 返回空会让 campaign_detail 的 kpi_trend 缺数。
+        if not ds or not de:
+            ds, de = self._recent_window(7)
         # report_hour_new.campaign_id 是 VARCHAR(64)，必须按字符串传入 IN 以命中 camp_adv_date_hour 索引
         ids = tuple(str(c) for c in cids)
         ph = ",".join(["%s"] * len(ids))
         sql = (
             f"SELECT campaign_id, date, SUM(revenue) rev, SUM(payout) pay, "
-            f"SUM(clicks) clk, SUM(conversions) conv "
+            f"SUM(clicks) clk, SUM(conversions) conv, SUM(reject_count) rj "
             f"FROM report_hour_new WHERE campaign_id IN ({ph}) "
             f"AND date BETWEEN %s AND %s GROUP BY campaign_id, date ORDER BY campaign_id, date"
         )
-        rows = self._query_across(sql, (*ids, ds, de))
+        rows = self._query(sql, (*ids, ds, de))
         out = []
+        t_rev = t_pay = t_clk = t_conv = 0.0
         for r in rows:
             rev = self._f(r.get("rev"))
             pay = self._f(r.get("pay"))
-            clk = self._f(r.get("clk"))
-            conv = self._f(r.get("conv"))
+            clk = int(self._f(r.get("clk")))
+            conv = int(self._f(r.get("conv")))
+            rj = int(self._f(r.get("rj")))
+            # 与线上接口对齐：revenue/payout 先 2 位四舍五入，margin_rate/cvr/profit 均按 2 位输出
+            rev_r = round(rev, 2)
+            pay_r = round(pay, 2)
             cvr = (conv / clk * 100) if clk > 0 else 0.0
-            margin_rate = ((rev - pay) / rev * 100) if rev > 0 else 0.0
+            margin_rate = ((rev_r - pay_r) / rev_r * 100) if rev_r > 0 else 0.0
             out.append({
                 "time_label": r.get("date"),
-                "revenue": round(rev, 4),
-                "payout": round(pay, 4),
-                "clicks": int(clk),
-                "conversions": int(conv),
-                "cvr": round(cvr, 4),
-                "margin_rate": round(margin_rate, 4),
+                "revenue": rev_r,
+                "payout": pay_r,
+                "clicks": clk,
+                "conversions": conv,
+                "cvr": round(cvr, 2),
+                "reject_count": rj,
+                "reject_rate": round(rj / conv * 100, 2) if conv else 0.0,
+                "completed": 0.0,
+                "margin_rate": round(margin_rate, 2),
+                "profit": round(rev_r - pay_r, 2),
             })
-        return {"items": out}
+            t_rev += rev_r; t_pay += pay_r; t_clk += clk; t_conv += conv
+        return {
+            "items": out,
+            "total_revenue": round(t_rev, 2),
+            "total_clicks": int(t_clk),
+            "total_conversions": round(t_conv, 2),
+            "total_profit": round(t_rev - t_pay, 2),
+        }
+
+    # ----- publisher / quality / ctit 实现（publisher_deepdive + campaign_detail 所需） -----
+
+    @staticmethod
+    def _ctit_buckets() -> list:
+        """CTIT/ETIT 分桶（秒区间），与线上接口 30 桶对齐。"""
+        return [
+            ("5s", 0, 5), ("5-30s", 5, 30), ("30-60s", 30, 60),
+            ("1-5min", 60, 300), ("5-30min", 300, 1800), ("30-60min", 1800, 3600),
+            ("1-2h", 3600, 7200), ("2-3h", 7200, 10800), ("3-4h", 10800, 14400),
+            ("4-5h", 14400, 18000), ("5-6h", 18000, 21600), ("6-7h", 21600, 25200),
+            ("7-8h", 25200, 28800), ("8-9h", 28800, 32400), ("9-10h", 32400, 36000),
+            ("10-11h", 36000, 39600), ("11-12h", 39600, 43200), ("12-13h", 43200, 46800),
+            ("13-14h", 46800, 50400), ("14-15h", 50400, 54000), ("15-16h", 54000, 57600),
+            ("16-17h", 57600, 61200), ("17-18h", 61200, 64800), ("18-19h", 64800, 68400),
+            ("19-20h", 68400, 72000), ("20-21h", 72000, 75600), ("21-22h", 75600, 79200),
+            ("22-23h", 79200, 82800), ("23-24h", 82800, 86400), ("24h+", 86400, 10 ** 12),
+        ]
+
+    def _recent_window(self, days: int = 7):
+        """近 N 天窗口，但与线上接口对齐：结束于「昨天」（线上 quality/kpi-trend 默认窗口
+        不含当天，因当天为部分日）。host today=T 时返回 [T-days, T-1]。"""
+        now = datetime.now()
+        de = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        ds = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+        return ds, de
+
+    def _publishers(self, params: dict) -> dict:
+        """模拟 GET /publishers：publisher 表直出（平台隔离，按 self.database）。
+
+        注意：analytics 仅取 /publishers 首页（page_size=100）构建 pub_map 查 status/margin，
+        但 /campaign-quality/publisher 会返回全量（>100）渠道。若按分页只回首页，pub_map 不全
+        → 部分渠道 status 缺失。故这里返回全量（按 id 排序），保证 pub_map 完整。
+        """
+        rows = self._query(
+            "SELECT id, name, user_name, status, margin, bd, pm, jointime FROM publisher ORDER BY id")
+        total = len(rows)
+        items = []
+        for r in rows:
+            items.append({
+                "id": r.get("id"),
+                "name": r.get("name"),
+                "user_name": r.get("user_name"),
+                "status": r.get("status"),
+                "status_name": "",
+                "margin": self._f(r.get("margin")),
+                "bd": r.get("bd"),
+                "pm": r.get("pm"),
+                "jointime": str(r.get("jointime")) if r.get("jointime") is not None else None,
+            })
+        return {"total": total, "page": 1, "page_size": total, "items": items}
+
+    def _quality_hour_agg(self, dim: str, dim_value, ds: str, de: str) -> dict:
+        """report_hour_new 按维度聚合质量时序（可靠字段）。返回 {date:{conversions,postback_conversions,clicks,reject_count}}。"""
+        if dim == "campaign_id":
+            col, val = "campaign_id", str(dim_value)
+        else:
+            col, val = "publisher_id", int(dim_value)
+        sql = (
+            f"SELECT date, SUM(conversions) conv, SUM(postback_conversions) pb, "
+            f"SUM(clicks) clk, SUM(reject_count) rj FROM report_hour_new "
+            f"WHERE {col} = %s AND date BETWEEN %s AND %s GROUP BY date ORDER BY date"
+        )
+        rows = self._query(sql, (val, ds, de))
+        out = {}
+        for r in rows:
+            out[r["date"]] = {
+                "conversions": self._f(r.get("conv")),
+                "postback_conversions": self._f(r.get("pb")),
+                "clicks": int(self._f(r.get("clk"))),
+                "reject_count": int(self._f(r.get("rj"))),
+            }
+        return out
+
+    def _quality_item(self, label, conv, pb, clk, rj, q1, q2):
+        conv = float(conv); pb = float(pb); clk = float(clk); rj = float(rj)
+        return {
+            "time_label": label,
+            "conversions": round(conv, 2),
+            "postback_conversions": round(pb, 2),
+            "clicks": int(clk),
+            "q1_count": int(q1), "q1_rate": round(q1 / conv * 100, 2) if conv else 0.0,
+            "q2_count": int(q2), "q2_rate": round(q2 / conv * 100, 2) if conv else 0.0,
+            "reject_count": int(rj), "reject_rate": round(rj / conv * 100, 2) if conv else None,
+            "completed": 0.0,
+        }
+
+    def _quality_total(self, conv, pb, clk, rj, q1, q2):
+        conv = float(conv); pb = float(pb); clk = float(clk); rj = float(rj)
+        return {
+            "conversions": round(conv, 2),
+            "postback_conversions": round(pb, 2),
+            "clicks": int(clk),
+            "q1_count": int(q1), "q1_rate": round(q1 / conv * 100, 2) if conv else 0.0,
+            "q2_count": int(q2), "q2_rate": round(q2 / conv * 100, 2) if conv else 0.0,
+            "reject_count": int(rj), "reject_rate": round(rj / conv * 100, 2) if conv else None,
+            "completed": 0.0,
+        }
+
+    def _event_quality(self, cid, q1_event, q2_event, ds, de) -> dict:
+        """event_postback_info 按 event_name 匹配 q1/q2 事件，统计每日起因数（best-effort）。"""
+        try:
+            sql = ("SELECT date, event_name, COUNT(*) n FROM event_postback_info "
+                   "WHERE campaign_id=%s AND date BETWEEN %s AND %s GROUP BY date, event_name")
+            rows = self._query(sql, (cid, ds, de))
+        except Exception:
+            return {}
+        out = {}
+        for r in rows:
+            en = (r.get("event_name") or "")
+            n = int(r.get("n") or 0)
+            d = r["date"]
+            bucket = out.setdefault(d, {"q1": 0, "q2": 0})
+            if q1_event and en == q1_event:
+                bucket["q1"] += n
+            elif q2_event and en == q2_event:
+                bucket["q2"] += n
+        return out
+
+    def _campaign_quality(self, params: dict) -> dict:
+        """模拟 GET /campaign-quality（campaign 级日质量时序）。q1/q2 尽力补。"""
+        cids = [x for x in str(params.get("campaign_ids") or "").split(",") if x]
+        if not cids:
+            return {"items": [], "total": {}, "q1_event": None, "q2_event": None}
+        cid = cids[0]
+        ds, de = self._recent_window(7)
+        agg = self._quality_hour_agg("campaign_id", cid, ds, de)
+        q1_event = q2_event = None
+        try:
+            r = self._query("SELECT campaign_q1_event, campaign_q2_event FROM campaign WHERE id=%s", (int(cid),))
+            if r:
+                q1_event, q2_event = r[0].get("campaign_q1_event"), r[0].get("campaign_q2_event")
+        except Exception:
+            pass
+        ev = self._event_quality(str(cid), q1_event, q2_event, ds, de) if (q1_event or q2_event) else {}
+        items = []
+        tc = tp = tk = tr = tq1 = tq2 = 0.0
+        for d in sorted(agg):
+            a = agg[d]
+            ec = ev.get(d, {})
+            conv, pb, clk, rj = a["conversions"], a["postback_conversions"], a["clicks"], a["reject_count"]
+            q1, q2 = ec.get("q1", 0), ec.get("q2", 0)
+            items.append(self._quality_item(d, conv, pb, clk, rj, q1, q2))
+            tc += conv; tp += pb; tk += clk; tr += rj; tq1 += q1; tq2 += q2
+        total = self._quality_total(tc, tp, tk, tr, tq1, tq2)
+        return {"items": items, "total": total, "q1_event": q1_event, "q2_event": q2_event}
+
+    def _publisher_quality(self, params: dict) -> dict:
+        """模拟 GET /campaign-quality/publisher（全渠道质量，默认近 7 天）。"""
+        ds, de = self._recent_window(7)
+        sql = (
+            "SELECT publisher_id, date, SUM(conversions) conv, SUM(postback_conversions) pb, "
+            "SUM(clicks) clk, SUM(reject_count) rj FROM report_hour_new "
+            "WHERE date BETWEEN %s AND %s GROUP BY publisher_id, date"
+        )
+        rows = self._query(sql, (ds, de))
+        by_pub = {}
+        for r in rows:
+            pid = r["publisher_id"]
+            by_pub.setdefault(pid, {})[r["date"]] = {
+                "conversions": self._f(r.get("conv")),
+                "postback_conversions": self._f(r.get("pb")),
+                "clicks": int(self._f(r.get("clk"))),
+                "reject_count": int(self._f(r.get("rj"))),
+            }
+        pub_rows = self._query("SELECT id, name, status FROM publisher")
+        pub_meta = {r["id"]: {"name": r.get("name"), "status": r.get("status")} for r in pub_rows}
+        items = []
+        for pid, dates in by_pub.items():
+            meta = pub_meta.get(pid, {})
+            per_date = {}
+            tc = tp = tk = tr = 0.0
+            for d, a in dates.items():
+                per_date[d] = self._quality_item(d, a["conversions"], a["postback_conversions"], a["clicks"], a["reject_count"], 0, 0)
+                tc += a["conversions"]; tp += a["postback_conversions"]; tk += a["clicks"]; tr += a["reject_count"]
+            total = self._quality_total(tc, tp, tk, tr, 0, 0)
+            items.append({
+                "publisher_id": pid,
+                "publisher_name": meta.get("name"),
+                "publisher_status": meta.get("status"),
+                "total": total,
+                **per_date,
+            })
+        return {"items": items}
+
+    @staticmethod
+    def _parse_dt(value):
+        """容错解析时间：网盟 install_time 实际为 'YYYY:MM:DD HH:MM:SS'（冒号分隔日期），
+        与标准 'YYYY-MM-DD' 并存，两种都要支持；可选微秒；也接受已解析的 datetime 对象。"""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        s = str(value).strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y:%m:%d %H:%M:%S",
+                   "%Y-%m-%d %H:%M:%S.%f", "%Y:%m:%d %H:%M:%S.%f"):
+            try:
+                return datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        return None
+
+    # 噪声事件：APP_OPEN 是安装后用户「打开 App」的常规行为，ETIT（事件→安装间隔）对其
+    # 无意义（用户可能数天后才打开），CTIT/ETIT 仅统计转化类事件。
+    _CTIT_NOISE_EVENTS = ("APP_OPEN",)
+
+    def _ctit_etit(self, params: dict) -> dict:
+        """模拟 GET /campaign-ctit-etit：CTIT/ETIT 分布。
+
+        - CTIT = 安装时间 − 点击时间（需 click 表；melocpi 有，seanear 无 click 表 → 委托 API）。
+        - ETIT = 事件时间 − 安装时间（取 event_postback_info 的 create_time − install_time，
+          **不依赖 click 表**，故即便无点击匹配也能算）。
+
+        ⚠️ 已知偏差（2026-10-15 实测）：线上 /campaign-ctit-etit **忽略 date 参数**（固定全量、
+        且对部分 campaign 退化为只吐 1 个桶），并非可靠对照基准。本实现按真实数据计算，结果
+        以 MySQL 为准；ds/de 缺省时走全量，与线上「忽略日期」行为对齐。
+        """
+        cid = str(params.get("campaign_id") or params.get("campaign_ids") or "")
+        if not cid:
+            return {"ctit": {}, "etit": {}}
+        ds = params.get("date_start")
+        de = params.get("date_end")
+        ctit = {b[0]: 0 for b in self._ctit_buckets()}
+        etit = {b[0]: 0 for b in self._ctit_buckets()}
+        try:
+            # ETIT：直接从 event_postback_info 算（install_time → create_time），排除噪声事件
+            sql_e = (
+                "SELECT install_time, create_time, event_name FROM event_postback_info "
+                "WHERE campaign_id=%s"
+            )
+            eargs = [cid]
+            if ds and de:
+                sql_e += " AND date BETWEEN %s AND %s"
+                eargs += [ds, de]
+            sql_e += " AND install_time IS NOT NULL AND install_time <> ''"
+            for r in self._query(sql_e, tuple(eargs)):
+                it = self._parse_dt(r.get("install_time"))
+                et = self._parse_dt(r.get("create_time"))
+                if not it or not et:
+                    continue
+                if r.get("event_name") in self._CTIT_NOISE_EVENTS:
+                    continue
+                d = max(0, int((et - it).total_seconds()))
+                lab = self._bucket_label(d)
+                etit[lab] = etit.get(lab, 0) + 1
+            # CTIT：install_time − click_time（需 click 表关联）
+            sql_c = (
+                "SELECT e.install_time, c.create_time clk_time "
+                "FROM event_postback_info e JOIN click c ON e.click_uuid = c.clickid "
+                "WHERE e.campaign_id=%s"
+            )
+            cargs = [cid]
+            if ds and de:
+                sql_c += " AND e.date BETWEEN %s AND %s"
+                cargs += [ds, de]
+            sql_c += " AND e.install_time IS NOT NULL AND e.install_time <> ''"
+            for r in self._query(sql_c, tuple(cargs)):
+                it = self._parse_dt(r.get("install_time"))
+                clk = r.get("clk_time")
+                clk = self._parse_dt(clk) if not isinstance(clk, (int, float)) else datetime.fromtimestamp(clk)
+                if not it or not clk:
+                    continue
+                d = max(0, int((it - clk).total_seconds()))
+                lab = self._bucket_label(d)
+                ctit[lab] = ctit.get(lab, 0) + 1
+        except Exception:
+            # seanear 等无 click 表或 event_postback_info 结构不同 → 委托真实 API
+            if self._api_fallback is None:
+                from tess_backend.data_connector import TeensingDataConnector, get_platform_base_url
+                self._api_fallback = TeensingDataConnector(base_url=get_platform_base_url(self.platform_id))
+            return self._api_fallback.api_get("/campaign-ctit-etit", params, None, None)
+        return {"ctit": ctit, "etit": etit}
+
+    def _bucket_label(self, secs: int) -> str:
+        for lab, lo, hi in self._ctit_buckets():
+            if lo <= secs < hi:
+                return lab
+        return "24h+"
 
     def _am_clause(self) -> tuple:
         """运营级隔离：operator_id 给定时，仅返回该运营（am）拥有的广告主。"""

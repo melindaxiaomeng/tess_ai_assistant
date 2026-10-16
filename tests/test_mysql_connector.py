@@ -171,9 +171,14 @@ def test_campaigns_status_int():
         assert isinstance(it["status"], int)  # 数字，由调用方 _camp_status_label 映射
 
 
-def test_unknown_path_returns_empty():
+def test_unknown_path_delegates_to_api():
+    # 未知 path 不再静默返回空（会丢数据），而是回退到真实 Teensing API。
+    # 单测环境无 TESS_DATA_API_BASE_URL，故用 stub 验证「委托」语义。
     c = FakeMysqlDataConnector()
-    assert c.api_get("/overview/ranking") == {"items": []}
+    sentinel = {"items": [{"delegated": True}]}
+    c._api_fallback = type("S", (), {"api_get": staticmethod(lambda *a, **k: sentinel)})()
+    assert c.api_get("/overview/ranking") == sentinel
+    assert ("/overview/ranking", "api") in c.served_routes
 
 
 # --------------------------------------------------------------------------

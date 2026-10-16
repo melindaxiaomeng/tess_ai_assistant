@@ -402,12 +402,30 @@ def fetch_bi_analysis_context(
     # 场景 5：渠道质量对比（Publisher 目录 + 扣量/质量率）
     # ---------------------------------------------------------------
     elif analysis_type == "publisher_deepdive":
-        pubs, err_p = _safe_api_get(
-            connector, "/publishers", params={"page": 1, "page_size": 100}, token=token,
-        )
+        # /publishers 分页拉全量（线上 API 单页上限 100，publisher 总数 663）。若只取首页，
+        # pub_map 仅含前 100 个 → 其余 publisher 的 status/margin 落为 None，与 MySQL 直连
+        # （一次回全量）结果不一致。分页拉全保证两侧一致且无静默缺字段。
+        pubs_list = []
+        err_p = None
+        pub_total = None
+        for pg in range(1, 30):
+            p, e = _safe_api_get(
+                connector, "/publishers",
+                params={"page": pg, "page_size": 100}, token=token,
+            )
+            if e:
+                err_p = e
+                break
+            if not isinstance(p, dict):
+                break
+            items = p.get("items", [])
+            if pub_total is None:
+                pub_total = p.get("total")
+            pubs_list.extend(items)
+            if len(items) < 100:
+                break
         quality, err_q = _safe_api_get(connector, "/campaign-quality/publisher", token=token)
 
-        pubs_list = (pubs or {}).get("items", []) if isinstance(pubs, dict) else []
         q_items = (quality or {}).get("items", []) if isinstance(quality, dict) else []
         pub_map = {_to_float(p.get("id")): p for p in pubs_list}
 
@@ -452,7 +470,7 @@ def fetch_bi_analysis_context(
 
         return {
             "analysis_type": "publisher_deepdive",
-            "publisher_total": (pubs or {}).get("total") if isinstance(pubs, dict) else None,
+            "publisher_total": pub_total,
             "quality_publisher_count": len(q_items),
             "top_publishers_by_clicks": enriched[:8],
             "flagged_quality_issues": flagged[:10],
