@@ -79,8 +79,24 @@ class PlatformRegistry:
 
     # —— 基础读写 ——
     def get(self, platform_id: str) -> Optional[Platform]:
+        """按 id 取平台行；大小写不敏感（精确优先，失配再按 lower 兜底）。
+
+        背景：前端传入的 X-Platform-Id（如 "seanear"）常与注册 id（"Senaear"）
+        大小写不一致；若严格区分会导致解析不到、回退到全局 melodong 端点串档。
+        改为不敏感后，seanear / Senaear / SEANEAR 均命中同一行。
+        """
+        if not platform_id:
+            return None
+        pid = str(platform_id).strip()
         with self.Session() as s:
-            return s.get(Platform, platform_id)
+            row = s.get(Platform, pid)
+            if row is not None:
+                return row
+            low = pid.lower()
+            for r in s.query(Platform).all():
+                if r.id and r.id.lower() == low:
+                    return r
+            return None
 
     def get_dict(self, platform_id: str) -> Optional[dict]:
         """按 id 取平台并序列化为 dict；不存在返回 None。"""
@@ -94,6 +110,20 @@ class PlatformRegistry:
                 q = q.filter(Platform.is_active == True)  # noqa: E712
             rows = q.order_by(Platform.id).all()
             return [_to_dict(r) for r in rows]
+
+    def single_active_id(self) -> Optional[str]:
+        """若恰好只有一个启用平台，返回其 id；否则（0 个 / 多个）返回 None。
+
+        用于单平台部署的容错：请求未带 X-Platform-Id 时，默认路由到唯一平台，
+        避免回退到全局 melodong 端点造成串档。多平台部署下保持 None（沿用全局兜底）。
+        """
+        try:
+            active = self.list(only_active=True)
+        except Exception:  # noqa: BLE001
+            return None
+        if len(active) == 1:
+            return active[0].get("id")
+        return None
 
     def create(self, platform_id: str, name: str, token: str = "",
                base_url: Optional[str] = None, is_active: bool = True,
@@ -334,3 +364,11 @@ def get_platform_registry() -> PlatformRegistry:
     if _REGISTRY is None:
         _REGISTRY = PlatformRegistry()
     return _REGISTRY
+
+
+def get_single_active_platform_id() -> Optional[str]:
+    """模块级便捷封装：恰好一个启用平台时返回其 id，否则 None（见 PlatformRegistry.single_active_id）。"""
+    try:
+        return get_platform_registry().single_active_id()
+    except Exception:  # noqa: BLE001
+        return None

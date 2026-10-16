@@ -51,7 +51,7 @@ from .tools_adapter import dispatch_tool, load_tool_schemas
 from .gaid_vault import VAULT, RedactFilter
 from .audit_log import QueryLogStore
 from .alerts_store import AlertStore
-from .platform_registry import get_platform_registry, format_expiry
+from .platform_registry import get_platform_registry, get_single_active_platform_id, format_expiry
 from .dev_seed import DEMO_EVENT_IDS
 
 app = FastAPI(title="Tess Diagnose API", version="2.3.0")
@@ -392,11 +392,14 @@ def _resolve_access_token(request: Optional[Request], platform_id: Optional[str]
     user_token = _teensing_token(request)
     if user_token:
         return user_token, "user"
+    # 单平台部署容错：未带 platform 时默认唯一启用平台，避免回退全局 melodong token 与
+    # 端点错配（seanear 端点 + melodong token => 401）。多平台部署下保持 None（沿用全局兜底）。
+    pid = platform_id or get_single_active_platform_id()
     # 无运营 token：优先平台专属 token（按 platform_id 路由到各自 SaaS 端点），
     # 再回退全局 TESS_SYSTEM_TOKEN。token_mode="platform" 表示走了平台专属 token。
-    if platform_id:
+    if pid:
         try:
-            platform_token = get_platform_registry().resolve_data_token(platform_id)
+            platform_token = get_platform_registry().resolve_data_token(pid)
         except Exception:
             platform_token = None
         if platform_token:

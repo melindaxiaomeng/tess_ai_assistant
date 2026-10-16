@@ -24,6 +24,8 @@ import urllib.request
 from datetime import datetime, timedelta
 from typing import Optional, Protocol
 
+from .platform_registry import get_single_active_platform_id
+
 logger = logging.getLogger("tess_backend.data_connector")
 
 # campaign 级告警的最低营收门槛：低于该值的低价值 campaign 不送诊断（降噪）。
@@ -99,6 +101,12 @@ def get_platform_base_url(platform_id: Optional[str] = None) -> str:
     """
     default = _ensure_scheme(os.getenv("TESS_DATA_API_BASE_URL", ""))
     if not platform_id:
+        # 单平台部署容错：未带 platform 时默认走唯一启用平台，避免回退全局 melodong 端点串档。
+        single = get_single_active_platform_id()
+        if single:
+            db_url = _db_base_url(single)
+            if db_url:
+                return _ensure_scheme(db_url).rstrip("/")
         return default.rstrip("/")
     # 1) 后台配置优先（即时生效，无需改 .env / 重启）
     db_url = _db_base_url(platform_id)
@@ -1109,9 +1117,12 @@ def get_data_connector(platform_id: Optional[str] = None, operator_id: Optional[
     """
     kind = os.getenv("TESS_DATA_CONNECTOR", "mock").lower()
     if kind == "teensing" or kind == "api":
+        # 单平台部署容错：未带 platform_id 时默认走唯一启用平台（base_url + token 同时默认），
+        # 避免回退全局 melodong 端点/全局 token 造成串档。多平台部署下保持 None（沿用全局兜底）。
+        pid = platform_id or get_single_active_platform_id()
         return TeensingDataConnector(
-            base_url=get_platform_base_url(platform_id),
-            platform_token=_db_data_token(platform_id) if platform_id else None,
+            base_url=get_platform_base_url(pid),
+            platform_token=_db_data_token(pid) if pid else None,
         )
     if kind == "mysql":
         from .mysql_connector import MysqlDataConnector
