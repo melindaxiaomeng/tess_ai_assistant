@@ -364,11 +364,21 @@ def _platform_id(request: Request) -> Optional[str]:
     """取平台标识：优先请求头 X-Platform-Id，其次查询参数 ?platform=；缺省 None。
 
     用于把一次请求归属到具体平台（LLM key 解析 + 落库打标 + 报表隔离）。
+
+    归一化：经 PlatformRegistry.get 做大小写不敏感解析，返回注册表里的规范 id
+    （如前端传 "Seanear" → 返回 "seanear"）。否则告警/报表按原样大小写去查库对不上、
+    返回 0 条、前端拿不到数据又不刷新，会一直停在旧缓存（含串档脏数据）。
+    未注册平台保留原值，交由下游按未知平台处理（不静默串档）。
     """
     pid = request.headers.get("X-Platform-Id", "") or ""
     if not pid and getattr(request, "query_params", None):
         pid = request.query_params.get("platform", "") or ""
-    return pid.strip() or None
+    pid = pid.strip()
+    if not pid:
+        return None
+    # 归一化到注册表规范 id（大小写不敏感）；未注册则保留原值（下游判未知平台）
+    row = get_platform_registry().get(pid)
+    return row.id if row else pid
 
 
 def _teensing_token(request: Optional[Request]) -> str:
