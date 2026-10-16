@@ -56,6 +56,16 @@ services:
       # P9 平台管理密钥：专管 /tess/admin/platforms 增删改查，与对外 X-API-Key 隔离。
       # 留空=平台管理接口禁用（403）。生产必填，调用方请求头带 X-Admin-Key。
       TESS_ADMIN_API_KEY: "${TESS_ADMIN_API_KEY:-}"
+      # === P5 直连网盟 MySQL（TESS_DATA_CONNECTOR=mysql 时启用，替代 HTTP 接口层）===
+      # 密码走宿主 env / .env（TESS_MYSQL_PASSWORD），绝不写死镜像。
+      # 容器需能连 172.22.0.6：部署后执行 `docker network connect bridge tess-diagnose`。
+      TESS_MYSQL_HOST: "${TESS_MYSQL_HOST:-172.22.0.6}"
+      TESS_MYSQL_PORT: "${TESS_MYSQL_PORT:-3306}"
+      TESS_MYSQL_USER: "${TESS_MYSQL_USER:-melo}"
+      TESS_MYSQL_PASSWORD: "${TESS_MYSQL_PASSWORD}"
+      TESS_MYSQL_DATABASES: "${TESS_MYSQL_DATABASES:-{\"Melodong\":\"melocpi\",\"seanear\":\"seanear\"}}"
+      # 试点期跨库回退（默认 1=开）：默认库查不到某广告主时自动试其它库，避免跨平台串档误判「无数据」。
+      TESS_MYSQL_CROSS_DB: "${TESS_MYSQL_CROSS_DB:-1}"
     volumes:
       - tess-data:/data
     # 让容器内 host.docker.internal 解析到宿主网关（生产用宿主原生 PG 时必填，

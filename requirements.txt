@@ -9,3 +9,5 @@ cryptography>=42.0
 # P7 预警存储：SQLAlchemy 访问层（后端可切 Postgres）；psycopg[binary] 自带 libpq，免系统依赖
 sqlalchemy>=2.0
 psycopg[binary]>=3.1
+# P5 直连网盟 MySQL 取数（TESS_DATA_CONNECTOR=mysql 时启用，替代 HTTP 接口层）
+pymysql>=1.1

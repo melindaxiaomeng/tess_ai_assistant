@@ -1073,19 +1073,25 @@ def extract_realtime_anomalies(
     return contexts
 
 
-def get_data_connector(platform_id: Optional[str] = None) -> DataConnector:
+def get_data_connector(platform_id: Optional[str] = None, operator_id: Optional[str] = None) -> DataConnector:
     """按环境变量 TESS_DATA_CONNECTOR 选择具体实现（默认 mock，零配置可跑）。
 
     - 未设置 / "mock" -> MockDataConnector（开发、测试、离线演示）
-    - "teensing"      -> TeensingDataConnector（生产，base_url 按 platform_id 解析；
+    - "teensing" / "api" -> TeensingDataConnector（生产，base_url 按 platform_id 解析；
                         platform_id=None 回退全局 TESS_DATA_API_BASE_URL 兼容单平台）
+    - "mysql"            -> MysqlDataConnector（直连网盟 MySQL，跳过 HTTP 接口层；
+                        platform_id 选库、operator_id 做运营级隔离）
 
-    platform_id 透传给 get_platform_base_url，使不同平台（Melodong / Seanear ...）
-    各自打到独立源站；取数 token 仍由调用方逐请求传入（见 _headers）。
+    platform_id 透传给 get_platform_base_url / MysqlDataConnector，使不同平台
+    （Melodong / Seanear ...）各自打到独立源站；operator_id 仅供 mysql 模式做
+    运营级数据隔离（api 模式由 token 携带，teensing 模式透传给接口）。
     """
     kind = os.getenv("TESS_DATA_CONNECTOR", "mock").lower()
-    if kind == "teensing":
+    if kind == "teensing" or kind == "api":
         return TeensingDataConnector(base_url=get_platform_base_url(platform_id))
+    if kind == "mysql":
+        from .mysql_connector import MysqlDataConnector
+        return MysqlDataConnector(platform_id=platform_id, operator_id=operator_id)
     if kind == "mock":
         return MockDataConnector()
-    raise ValueError(f"未知 TESS_DATA_CONNECTOR={kind!r}（支持 mock | teensing）")
+    raise ValueError(f"未知 TESS_DATA_CONNECTOR={kind!r}（支持 mock | teensing | mysql）")

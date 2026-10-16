@@ -124,10 +124,10 @@ def _resolve_runtime(request):
     from fastapi import HTTPException
 
     platform_id = _platform_id(request) if request is not None else None
+    operator = _operator_id(request) if request is not None else "anonymous"
     # 每次新建 connector 并透传 platform_id，使 /tess/tool 也按平台打到独立源站
     # （不能用缓存单例 _get_data_connector，否则多平台共用首个平台的 base_url）
-    connector = get_data_connector(platform_id=platform_id)
-    operator = _operator_id(request) if request is not None else "anonymous"
+    connector = get_data_connector(platform_id=platform_id, operator_id=operator)
     # LLM key 按平台隔离：平台 llm_api_key（DeepSeek 按平台开 key）> 全局 TESS_LLM_API_KEY
     llm = _get_llm_client(platform_id)
     effective_token, token_mode = _resolve_access_token(request, platform_id)
