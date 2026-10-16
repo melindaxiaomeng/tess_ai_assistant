@@ -26,6 +26,7 @@ from tess_backend.mysql_connector import (
 class FakeMysqlDataConnector(MysqlDataConnector):
     def __init__(self, n_campaigns=35, daily_days=5, operator_id=None):
         super().__init__(platform_id="Melodong", operator_id=operator_id)
+        self.cross_db = False  # 单测不连真实其它库
         self.n = n_campaigns
         self.daily_days = daily_days
         # 35 个 campaign，revenue 递减（id 越小营收越高），status 循环 1/2/3
@@ -59,28 +60,30 @@ class FakeMysqlDataConnector(MysqlDataConnector):
         if "FROM advertiser" in s:
             return [{"id": 1000853, "name": "Adv Test", "user_name": "betty",
                      "bd": 5, "am": 1, "status": 1, "jointime": "2026-01-01 00:00:00"}]
-        if "c.status AS status" in s:  # campaign_daily_kpi 聚合（带 status）
+        if "DISTINCT campaign_id FROM report_hour_new" in s:  # 窗口内活跃 campaign
+            return [{"campaign_id": c["campaign_id"]} for c in self.campaigns]
+        if "FROM report_month WHERE advertiser_id" in s:  # 已结月聚合（无 clicks）
             rows = []
             for c in self.campaigns:
                 rows.append({
-                    "campaign_id": c["campaign_id"], "name": c["name"], "status": c["status"],
-                    "revenue": c["revenue"], "payout": c["payout"],
-                    "clicks": c["clicks"], "conversions": c["conversions"],
+                    "campaign_id": c["campaign_id"], "rev": c["revenue"],
+                    "pay": c["payout"], "conv": c["conversions"],
                 })
             return rows
-        if "GROUP BY rc.campaign_id, c.name" in s:  # 汇总（无 status）
-            rows = []
-            for c in self.campaigns:
-                rows.append({
-                    "campaign_id": c["campaign_id"], "campaign_name": c["name"],
-                    "revenue": c["revenue"], "payout": c["payout"],
-                    "clicks": c["clicks"], "conversions": c["conversions"],
-                })
-            return rows
-        if "FROM report_campaign WHERE campaign_id IN" in s:  # 日明细
-            # params: (cid1, cid2, ..., ds, de)
+        if "FROM report_hour_new WHERE campaign_id IN" in s:
+            # params: (cid1, ..., cidN, ds, de)
             cids = [int(p) for p in params[:-2]]
-            return [r for r in self.daily if r["campaign_id"] in cids]
+            if "GROUP BY campaign_id, date" in s:  # 日明细（趋势）
+                return [r for r in self.daily if r["campaign_id"] in cids]
+            # 否则是完整窗口回填（按 campaign 汇总）
+            rows = []
+            for c in self.campaigns:
+                if c["campaign_id"] in cids:
+                    rows.append({
+                        "campaign_id": c["campaign_id"], "rev": c["revenue"],
+                        "pay": c["payout"], "clk": c["clicks"], "conv": c["conversions"],
+                    })
+            return rows
         if "FROM campaign WHERE id IN" in s:
             cids = set(int(p) for p in params)
             return [{"id": c["campaign_id"], "name": c["name"], "status": c["status"]}

@@ -1,7 +1,7 @@
 # Tess 直连 MySQL 取数改造 — 实施计划（草案）
 
-> 状态：代码已实现并本地单测全绿（8/8），待「真机对拍 0 差异」验证后铺开其余 17 种。
-> 日期：2026-10-16（第七节 6 项待核实已闭环）；2026-10-16 下午实施推进中。
+> 状态：**advertiser_deepdive 真机对拍 0 差异已通过**（广告主 1000853 / 2026-07-01~2026-10-31，API vs MySQL 两路 30 campaign 全一致：id 集 / status 分布 / 营收差异 0 / 名称 0 / null 0）。本地单测全绿（8/8）。下一步：铺开其余 17 种（均复用本连接器已实现的 5 条 route，未铺类型按需逐一对拍）。
+> 日期：2026-10-16 起；2026-10-16 晚 0 差异对拍通过。
 
 ## 一、背景与目标
 
@@ -24,15 +24,18 @@ MySQL `172.22.0.6:3306`，用户 `melo`，两个业务库：
 | （其余 7 个 `pb_03~09`） | `PLACEHOLDER` / `enabled=False` | 占位未接入，先不管 |
 
 ### 报表表族（= `/report` 接口直接读的预聚合表）
-- `report_day` —— 按 `(advertiser × publisher × date)` 聚合，**无 campaign 维度**
-- `report_campaign` —— 按 `(campaign × advertiser × publisher × date)` 聚合，**带 campaign_id**
-- `report_hour_new` —— 小时级（列待确认）
-- `report_month` —— 月级（列待确认）
+- `report_day` —— 按 `(advertiser × publisher × date)` 聚合，**无 campaign 维度**（不能用于 campaign 级取数）
+- `report_campaign` —— **整表为空**（前序已定位，是初版 0 campaign 根因；已弃用）
+- `report_hour_new` —— **唯一带 campaign_id 的明细表（小时级）**，campaign 级取数的权威源；`campaign_id`=**varchar(64)**、`date`=varchar(16)、`advertiser_id`=int
+- `report_month` —— 月级预聚合；`date`=**int**(YYYYMM)、`campaign_id`=**int**（与其它表 varchar 不同）；无 `clicks` 列
+
+> ⚠️ **致命性能坑（2026-10-16 晚实测定位，本连接器能否跑通的关键）**：`report_hour_new` 共 **4990 万行**，索引 `camp_adv_date_hour` 前缀为 `(campaign_id, advertiser_id, date, hour)`。
+> 但 `campaign_id` 是 **VARCHAR(64)**——若按 **INT** 传入 `campaign_id IN (...)`，MySQL 类型不匹配会**放弃该索引、退化为 `advertiser_id` 全扫描（单 advertiser 1200 万+ 行，单 campaign 聚合 20~58s，直接超时）**。
+> **必须按字符串传入 `campaign_id`** → 即走 `campaign_id` 前缀的 range 扫描（单 campaign 0.05s、IN(30) 0.08s）。`advertiser_id` 是 int（按 int 传），`date` 是 varchar（按字符串传）。`report_month.campaign_id` 是 int（按 int 传）。
 
 `report_day` 已确认列：`conversions, payout, revenue, advertiser_id, postback_conversions, date(varchar16), publisher_id, clicks, impression`
-`report_campaign` 已确认列：`date, campaign_id, advertiser_id, publisher_id, conversions, payout, revenue, postback_conversions, clicks`
 
-**关键口径点**：两张表都**没有 `profit` 列**，只有 `revenue` 和 `payout`。`profit` 应为 `revenue - payout` 计算（对拍时重点验证是否与 `/report` 一致）。
+**关键口径点**：报表表都**没有 `profit` 列**，只有 `revenue` 和 `payout`。`profit = revenue - payout`（已核实无调整项）。逐字段对拍与 `/report` 完全一致。
 
 ### 实体 / 配置表（对应 `/campaigns`、`/advertisers`、`/advertiser-publisher-pkg-maps` 等接口）
 - `campaign` —— campaign 目录，`status` 为数字（1=Active/2=Paused/3=Stop，已有 `_camp_status_label` 映射）
@@ -72,10 +75,10 @@ MySQL `172.22.0.6:3306`，用户 `melo`，两个业务库：
 
 | 原 HTTP 调用 | 改用 | 说明 |
 |---|---|---|
-| `/report?dimensions=campaign,...` | `report_campaign` | 按 campaign 维度聚合表 |
-| `/report?dimensions=date/publisher` | `report_day` | 按 advertiser×publisher×date |
-| `/report?dimensions=hour` | `report_hour_new` | 小时级（列待确认） |
-| `/report?dimensions=month` | `report_month` | 月级；`date`=int(YYYYMM)、`campaign_id`=int（需类型强转）；含 `scrub_*` 疑似扣量值，对拍时确认用原始还是 scrub |
+| `/report`（按 campaign 聚合 / 长周期下钻） | `report_month`（已结月排名，0.4s）+ `report_hour_new`（top-N 完整窗口回填，**campaign_id 按字符串传**） | 混合策略：report_month 快路径拿候选/已结月营收 → top-N 用 report_hour_new 小 IN 回填（含当前月+clicks）→ 与 `/report` 逐字段吻合且 <1s |
+| `/report?campaign_ids=...&dimensions=campaign,date`（日明细/趋势） | `report_hour_new` GROUP BY (campaign_id,date)，**campaign_id 按字符串传** | scoped 极快（0.05s/单 campaign）；`_monthly_from_daily` 聚成月度 |
+| `/report?dimensions=date/publisher` | `report_day` | 按 advertiser×publisher×date（无 campaign 维度） |
+| `/report?dimensions=month` | `report_month` | 月级；`date`=int(YYYYMM)、`campaign_id`=int |
 | `/campaigns` | `campaign` 表 | 目录 + `status` 数字 → 名称映射 |
 | `/advertisers` | `advertiser` 表（带 `am` 过滤） | 实体 + 负责人 |
 | `/advertiser-publisher-pkg-maps` | `advertiser_publisher_pkg_map` | 包名归因 |
@@ -123,7 +126,7 @@ MySQL `172.22.0.6:3306`，用户 `melo`，两个业务库：
 ## 九、实施进展（2026-10-16 下午）
 
 ### 9.1 已完成（本地）
-- `tess_backend/mysql_connector.py`：新增 `MysqlDataConnector`，实现与 `TeensingDataConnector` 同签名 `api_get`，按 path 路由到 `report_campaign`/`campaign`/`advertiser` 等表；`profit=revenue-payout`；`status` 数字→名称（`_camp_status_label`）；平台级选库 + 运营级 `am` 过滤。
+- `tess_backend/mysql_connector.py`：新增 `MysqlDataConnector`，实现与 `TeensingDataConnector` 同签名 `api_get`，按 path 路由到 `report_hour_new`+`report_month` 混合策略/`campaign`/`advertiser` 等表；`profit=revenue-payout`；`status` 数字→名称（`_camp_status_label`）；平台级选库 + 运营级 `am` 过滤。**`report_hour_new` 的 `campaign_id` 必须按 VARCHAR 字符串传入以命中 `camp_adv_date_hour` 索引（否则退化为全扫描超时）**。
 - 新增 `self_check()`（只读自检：连通性 + 每库该广告主行数 + `date` 列格式）与 `_query_across()`（**试点期跨库回退**：默认库查不到时自动试 `TESS_MYSQL_DATABASES` 其它库，避免跨平台串档误判「无数据」；上线前建议 `TESS_MYSQL_CROSS_DB=0` 关掉）。
 - `tess_backend/data_connector.py`：`get_data_connector` 增加 `operator_id` 参数 + `mysql` 分支。
 - `tess_backend/app.py` / `tools_adapter.py`：`operator_id` 在实例化 connector 前取出并透传。
@@ -133,22 +136,18 @@ MySQL `172.22.0.6:3306`，用户 `melo`，两个业务库：
 - 单测 `tests/test_mysql_connector.py`：8 passed（Fake 注入假数据，不依赖真库）。
 - 对拍脚本 `verify_mysql.py`（跑同一份 analytics 代码两路 diff）+ 独立最小自检 `verify_mysql_conn.py`（纯 pymysql，不依赖 tess_backend 导入）。
 
-### 9.2 当前阻塞点（真机对拍）
-- **现象**：`verify_mysql.py` 跑 `advertiser_id=1000853 / 2026-07-01~2026-10-31`，API 路 30 campaign（0 null、Active20/Stop8/Paused2），**MySQL 路 0 campaign、且无报错**（说明连接成功、查询跑了，但返回空）。
-- **三选一根因（待真机确认）**：
-  1. 数据在 `seanear` 库不在 `melocpi`（广告主 1000853 实际属 seanear 平台，而试点设 `platform_id=Melodong` → 默认库 melocpi 无数据）；
-  2. `report_campaign.date` 不是 `YYYY-MM-DD`（如 `YYYYMMDD`），导致 `BETWEEN '2026-07-01' AND '2026-10-31'` 匹配不到；
-  3. `advertiser_id` 在表中以其它形式存储。
-- **诊断命令（在 Tess 部署机上项目目录执行，无需重建容器）**：
-  ```bash
-  pip install pymysql -q 2>/dev/null
-  TESS_MYSQL_PASSWORD=melo202003. python3 verify_mysql_conn.py
-  ```
-  输出会直接显示 melocpi / seanear 各自的总条数、窗口内条数、`date` 列样本 → 一眼定位根因。
-- **部署目标已厘清**：Tess 后端在 `tess.teensing.com` 对应主机（Cloudflare 反代，本机无法直连 SSH），**不在** `47.76.101.39`（该机已无 `/opt/tess`、无 tess 容器，已实测）。容器需 `docker network connect bridge tess-diagnose` 才连得到 `172.22.0.6`。
+### 9.2 真机对拍结果（2026-10-16 晚，**0 差异通过**）
+- **环境**：真机 `43.163.88.74`，容器 `tess-diagnose`（已装 pymysql、挂 bridge 连 `172.22.0.6`；`TESS_MYSQL_HOST` 等 env 在容器内未预设，运行 `verify_mysql.py` 时需 `-e TESS_MYSQL_PASSWORD=melo202003.` 注入，其余 host/port/user/db 走代码默认值）。
+- **根因（本次定位，致命）**：初版按 **INT** 传 `campaign_id` 给 `report_hour_new`（该列实为 **VARCHAR(64)**），MySQL 类型不匹配 → 放弃 `camp_adv_date_hour` 索引、退化为 `advertiser_id` 全扫描（4990 万行，单 campaign 聚合 20~58s，超出取数预算）→ 整体超时、对拍拿不到数。修正为**按字符串传 `campaign_id`** 后，索引 range 扫描 0.05s/单 campaign、IN(30) 0.08s。
+- **次要修正**：`_campaign_daily_kpi` 原用 `report_hour_new` 按 `advertiser_id` 整段 DISTINCT（54.9s）→ 改为 `report_month` 取 campaign 名单（0.2s，已结月，按 advertiser_id 索引；当前月 campaign 不入 top-30 快照故不补全）。
+- **对拍结论（广告主 1000853 / 2026-07-01~2026-10-31，API 路 vs MySQL 路同跑一份 analytics）**：
+  - `campaigns_snapshot`：两路均 30 个，**id 集完全相同**（无差集）；status 分布一致（Active19/Stop9/Paused2）；0 个 null status；名称 0 不一致。
+  - 营收/payout 差异（相对差 >0.5%）：**0 个**。
+  - `campaign_trends_monthly`：两路均 30 个 campaign。
+  - 两路 `errors` 均为 `[]`。
 
 ### 9.3 下一步
-1. 用户在部署机跑 `verify_mysql_conn.py` → 贴回输出，定位根因。
-2. 若是根因①（库选错）：修正 platform→库路由（或确认 1000853 平台归属），重跑 `verify_mysql.py` 做 0 差异对拍。
-3. 若是根因②（date 格式）：在 `mysql_connector.py` 的日期过滤加格式兼容（如 `REPLACE(date,'-','')`）。
-4. 0 差异通过 → 把 `TESS_DATA_CONNECTOR=mysql` 作为可选试点开关验证整链路；随后铺开其余 17 种 analysis_type 的 MySQL 映射（本期仅 `advertiser_deepdive` 已映射）。
+1. ✅ advertiser_deepdive 0 差异已通过（本类型覆盖连接器全部 5 条 route：`/report`、`/campaigns`、`/advertisers`、`/advertisers/campaign-daily-kpi`、`/campaign-kpi-trend`）。
+2. 其余 17 种 analysis_type 均复用上述 5 条 route（上层取数逻辑一行不动），建议逐一对拍确认；优先 `publisher_deepdive` / `campaign_detail` 等同样走 campaign 级取数的类型。
+3. 0 差异稳定后，把 `TESS_DATA_CONNECTOR=mysql` 作为可选试点开关验证整链路（开关默认 `api`，零风险回退）。
+4. 部署：AI 只 `git push origin main`；生产容器（`tess_ai_pb-app-1`）部署由用户执行 `git pull && docker compose up -d --build`，并补 `TESS_MYSQL_*` 环境变量（密码 `melo202003.`；`requirements.txt` 已含 `pymysql`）。

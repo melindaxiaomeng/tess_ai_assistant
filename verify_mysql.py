@@ -63,7 +63,7 @@ _CONNS = {
     "MYSQL": MysqlDataConnector(platform_id="Melodong"),
 }
 
-# ---- 先跑 MySQL 自检：一眼看清连没连上 / 数据在哪个库 / date 格式 ----
+# ---- 先跑 MySQL 自检：一眼看清连没连上 / 数据在哪个库 / 表行数 ----
 print("\n=== MYSQL SELF-CHECK (advertiser_id=%d, %s~%s) ===" % (AID, DS, DE))
 try:
     sc = _CONNS["MYSQL"].self_check(AID, DS, DE)
@@ -71,8 +71,8 @@ try:
         sc["host"], sc["port"], sc["user"], sc["default_db"], sc["cross_db"]))
     for name, e in sc["dbs"].items():
         if e["reachable"]:
-            print("  [%s] db=%s  总条数=%s  窗口内=%s  date样本=%s" % (
-                name, e["db"], e["total_rows"], e["window_rows"], e["date_sample"]))
+            print("  [%s] db=%s  report_month行数=%s  report_hour_new窗口内行数=%s" % (
+                name, e["db"], e["report_month_rows"], e["report_hour_new_rows"]))
         else:
             print("  [%s] db=%s  不可达: %s" % (name, e["db"], e["error"]))
 except Exception as e:  # noqa: BLE001
