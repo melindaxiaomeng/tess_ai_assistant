@@ -381,7 +381,7 @@ def _teensing_token(request: Optional[Request]) -> str:
 def _resolve_access_token(request: Optional[Request], platform_id: Optional[str] = None) -> tuple:
     """解析本次调 saas_v3.0 数据接口用的 token 与模式。
 
-    优先级（平台 token 已废弃：saas_v3.0 实际按运营 token 鉴权，平台级取数 token 无用武之地）：
+    优先级：
       1) 运营个人 token（X-Teensing-Token：前端逐请求带当前登录运营的 access_token，
          saas_v3.0 按该运营的 RBAC/数据权限返回数据 —— 各运营各看各的）
       2) 全局 TESS_SYSTEM_TOKEN（兜底，写在后端 .env / compose，前端不接触；

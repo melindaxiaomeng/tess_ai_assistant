@@ -145,7 +145,9 @@ class PlatformRegistry:
             s.commit()
             return True
 
-    # —— LLM key 解析（取数平台 token 已废弃，saas_v3.0 按运营个人 token 鉴权）——
+    # —— LLM key / 取数 token 解析 ——
+    # 取数 token = tess_platforms.token 列，per-platform 路由用（覆盖全局 TESS_SYSTEM_TOKEN）；
+    # 运营个人 X-Teensing-Token 优先级更高，仅在无运营 token 上下文时回落到平台/全局 token。
     def resolve_llm(self, platform_id: Optional[str]) -> Optional[str]:
         """按 platform_id 解析该平台专用的 LLM（DeepSeek）API key。
 
@@ -158,6 +160,19 @@ class PlatformRegistry:
         if row is None or not row.is_active:
             return None
         return row.llm_api_key or None
+
+    def resolve_data_token(self, platform_id: Optional[str]) -> Optional[str]:
+        """按 platform_id 解析该平台专属的取数 token（HTTP 取数路由鉴权用）。
+
+        返回 None 的情况：platform_id 为空 / 平台不存在 / 平台禁用 / 未配置 token。
+        调用方据此回退到全局 TESS_SYSTEM_TOKEN（运营个人 X-Teensing-Token 优先级更高）。
+        """
+        if not platform_id:
+            return None
+        row = self.get(platform_id)
+        if row is None or not row.is_active:
+            return None
+        return row.token or None
 
     def active_platforms(self) -> list:
         """返回所有启用平台：[ {id, llm_api_key}, ... ]。

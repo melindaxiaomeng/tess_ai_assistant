@@ -282,13 +282,15 @@ class TeensingDataConnector:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         timeout: int = 60,
+        platform_token: Optional[str] = None,
     ):
         self.base_url = _ensure_scheme(base_url or os.getenv("TESS_DATA_API_BASE_URL", "")).rstrip("/")
         self.api_key = api_key if api_key is not None else os.getenv("TESS_DATA_API_KEY", "")
         self.timeout = int(os.getenv("TESS_DATA_API_TIMEOUT", str(timeout)))
-        # 全局兜底取数 token（账户级全量权限，与 saas_v3 服务端同源）：
-        # 当调用方传入的运营个人 token（RBAC 截断）拿不全涨跌榜时，用它补取。
-        self.fallback_token = os.getenv("TESS_SYSTEM_TOKEN", "") or ""
+        # 取数 token 三级回落：① 平台专属 token（tess_platforms.token，按 platform_id 路由到各自 SaaS 端点）
+        # ② 全局兜底取数 token（TESS_SYSTEM_TOKEN，账户级全量权限）
+        # ③ 运营个人 token 由调用方逐请求透传，优先级最高（见 _headers / _resolve_access_token）。
+        self.fallback_token = platform_token or os.getenv("TESS_SYSTEM_TOKEN", "") or ""
         if not self.base_url:
             raise RuntimeError(
                 "TeensingDataConnector 未配置 TESS_DATA_API_BASE_URL，无法拉取真实异常数据"
@@ -1107,7 +1109,10 @@ def get_data_connector(platform_id: Optional[str] = None, operator_id: Optional[
     """
     kind = os.getenv("TESS_DATA_CONNECTOR", "mock").lower()
     if kind == "teensing" or kind == "api":
-        return TeensingDataConnector(base_url=get_platform_base_url(platform_id))
+        return TeensingDataConnector(
+            base_url=get_platform_base_url(platform_id),
+            platform_token=_db_data_token(platform_id) if platform_id else None,
+        )
     if kind == "mysql":
         from .mysql_connector import MysqlDataConnector
         return MysqlDataConnector(platform_id=platform_id, operator_id=operator_id)
