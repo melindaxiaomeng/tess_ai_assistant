@@ -772,6 +772,7 @@ def fetch_bi_analysis_context(
                             "time_label": it.get("date"),
                             "revenue": it.get("revenue"),
                             "clicks": it.get("clicks"),
+                            "conversions": it.get("conversions"),
                             "cvr": it.get("cr"),
                             "margin_rate": it.get("margin"),
                             "payout": it.get("payout"),
@@ -1410,21 +1411,53 @@ def _pick_many(items, keys, limit: Optional[int] = None):
 
 
 def _monthly_from_daily(items):
-    """把按天的趋势序列本地聚合为按月代表序列（每月取最后一天的点）。
+    """把按天的趋势序列本地聚合为按月汇总序列（每月对营收/点击/转化做 SUM）。
 
     用于长周期（>35 天）下钻：避免逐日 100+ 点撑爆 prompt 与取数超时，
-    同时仍保留「月度变化」所需的粒度。time_label 形如 10-07 / 2026-10-07 均可解析。
+    同时仍保留「月度变化」所需的粒度。
+
+    关键修复：必须按月求和，不能用「当月最后一天」代替整月——否则会严重低估
+    （如 7 月整月 3699.55 被压成 7-31 单日 13.0）。cvr / margin_rate 由汇总值
+    重算，避免拿到单日比率。time_label 形如 2026-07-01（当月首日）标明为月度桶。
     """
     by_month = {}
     for it in (items or []):
-        tl = str(it.get("time_label", ""))
+        tl = str(it.get("time_label") or it.get("date") or "")
         m = re.search(r"(?:(\d{4})-)?(\d{2})-(\d{2})", tl)
         if not m:
             continue
         y = m.group(1) or str(datetime.now().year)
         mk = f"{y}-{m.group(2)}"  # 月份 key
-        by_month[mk] = _pick(it, ["time_label", "revenue", "clicks", "cvr", "margin_rate", "payout"])
-    return [by_month[k] for k in sorted(by_month)]
+        b = by_month.setdefault(mk, {
+            "revenue": 0.0, "payout": 0.0, "clicks": 0.0,
+            "conv": 0.0, "has_conv": False,
+        })
+        b["revenue"] += _to_float(it.get("revenue"))
+        b["payout"] += _to_float(it.get("payout"))
+        b["clicks"] += _to_float(it.get("clicks"))
+        if it.get("conversions") is not None:
+            b["conv"] += _to_float(it.get("conversions"))
+            b["has_conv"] = True
+        elif it.get("cvr") is not None and it.get("clicks") is not None:
+            # 上游未回 conversions 时，用 cvr(=conv/clicks*100) 反推后累加
+            b["conv"] += _to_float(it.get("cvr")) * _to_float(it.get("clicks")) / 100.0
+
+    out = []
+    for mk in sorted(by_month):
+        b = by_month[mk]
+        rev = b["revenue"]; pay = b["payout"]; clk = b["clicks"]; conv = b["conv"]
+        cvr = (conv / clk * 100) if clk > 0 else 0.0
+        margin = ((rev - pay) / rev * 100) if rev > 0 else 0.0
+        y, mo = mk.split("-")
+        out.append({
+            "time_label": f"{y}-{mo}-01",
+            "revenue": round(rev, 4),
+            "clicks": int(clk),
+            "cvr": round(cvr, 4),
+            "margin_rate": round(margin, 4),
+            "payout": round(pay, 4),
+        })
+    return out
 
 
 def _months_between(ds_str: str, de_str: str):
