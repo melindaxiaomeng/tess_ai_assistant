@@ -261,7 +261,14 @@ class MysqlDataConnector:
     ) -> dict:
         """公开透传：与 TeensingDataConnector.api_get 同签名，返回已「解包」的业务 dict。
 
-        已实现的路径（report/campaigns/advertiser/daily-kpi/kpi-trend）由 MySQL 直出；
+        已实现的路径由 MySQL 直出：
+          /advertisers, /advertisers/{id}, /report, /campaigns, /campaign-kpi-trend,
+          /campaign-detail, /replace-channels, /publishers, /campaign-quality,
+          /campaign-quality/publisher, /campaign-ctit-etit, /advertisers/campaign-daily-kpi,
+          /advertiser-publisher-pkg-maps, /mapping-publisher-channels, /publisher-campaign-blocks,
+          /replace-channels, /campaign-compare,
+          /users/options, /overview/ranking, /overview/ranking/fluctuation,
+          /overview/daily-kpi, /overview/ranking/anomaly-warning, /global-settings。
         未实现的路径**回退到真实 Teensing API**（试点期零风险，绝不静默返回空导致数据丢失）。
         每次调用都记一笔 served_routes，便于对拍时区分「MySQL 校验」与「API 委托」。
         """
@@ -269,6 +276,9 @@ class MysqlDataConnector:
         if path == "/advertisers/campaign-daily-kpi":
             self.served_routes.append((path, "mysql"))
             return self._campaign_daily_kpi(params)
+        if path == "/advertisers":
+            # 广告主目录（列表），区别于 /advertisers/{aid} 单档案
+            return self._try_or_fallback(path, self._advertisers_list, params, token, timeout)
         if path.startswith("/advertisers/"):
             self.served_routes.append((path, "mysql"))
             aid = path.split("/advertisers/", 1)[1]
@@ -294,6 +304,32 @@ class MysqlDataConnector:
         if path == "/campaign-ctit-etit":
             self.served_routes.append((path, "mysql"))
             return self._ctit_etit(params)
+        # ----- 平台级榜单 / 主数据（dashboard 类，用预聚合表 report_month/report_day，秒级） -----
+        if path == "/overview/ranking":
+            return self._try_or_fallback(path, self._overview_ranking, params, token, timeout)
+        if path == "/overview/ranking/fluctuation":
+            return self._try_or_fallback(path, self._overview_fluctuation, params, token, timeout)
+        if path == "/overview/daily-kpi":
+            return self._try_or_fallback(path, self._daily_kpi, params, token, timeout)
+        if path == "/global-settings":
+            return self._try_or_fallback(path, self._global_settings, params, token, timeout)
+        # ----- 配置 / 映射 / 规则（原 API 兜底路径，现直连 MySQL 配置表） -----
+        if path == "/advertiser-publisher-pkg-maps":
+            return self._try_or_fallback(path, self._adv_pub_pkg_maps, params, token, timeout)
+        if path == "/mapping-publisher-channels":
+            return self._try_or_fallback(path, self._mapping_publisher_channels, params, token, timeout)
+        if path == "/publisher-campaign-blocks":
+            return self._try_or_fallback(path, self._publisher_campaign_blocks, params, token, timeout)
+        if path == "/replace-channels":
+            return self._try_or_fallback(path, self._replace_channels, params, token, timeout)
+        if path == "/users/options":
+            return self._try_or_fallback(path, self._users_options, params, token, timeout)
+        if path == "/overview/ranking/anomaly-warning":
+            return self._try_or_fallback(path, self._anomaly_warning, params, token, timeout)
+        if path == "/campaign-detail":
+            return self._try_or_fallback(path, self._campaign_detail, params, token, timeout)
+        if path == "/campaign-compare":
+            return self._try_or_fallback(path, self._campaign_compare, params, token, timeout)
         # 未实现：回退到真实 Teensing API（绝不静默返回空，避免数据丢失）。
         self.served_routes.append((path, "api"))
         if self._api_fallback is None:
@@ -880,8 +916,8 @@ class MysqlDataConnector:
         de = params.get("date_end")
         ctit = {b[0]: 0 for b in self._ctit_buckets()}
         etit = {b[0]: 0 for b in self._ctit_buckets()}
+        # ETIT：event_postback_info（install_time → create_time），两平台都有，独立容错
         try:
-            # ETIT：直接从 event_postback_info 算（install_time → create_time），排除噪声事件
             sql_e = (
                 "SELECT install_time, create_time, event_name FROM event_postback_info "
                 "WHERE campaign_id=%s"
@@ -901,7 +937,10 @@ class MysqlDataConnector:
                 d = max(0, int((et - it).total_seconds()))
                 lab = self._bucket_label(d)
                 etit[lab] = etit.get(lab, 0) + 1
-            # CTIT：install_time − click_time（需 click 表关联）
+        except Exception as e:  # noqa: BLE001
+            logger.warning("MysqlDataConnector ETIT 失败(campaign=%s)：%s", cid, e)
+        # CTIT：install_time − click_time（需 click 表；seanear 无 click 表 → 静默留空，不崩溃）
+        try:
             sql_c = (
                 "SELECT e.install_time, c.create_time clk_time "
                 "FROM event_postback_info e JOIN click c ON e.click_uuid = c.clickid "
@@ -921,14 +960,9 @@ class MysqlDataConnector:
                 d = max(0, int((it - clk).total_seconds()))
                 lab = self._bucket_label(d)
                 ctit[lab] = ctit.get(lab, 0) + 1
-        except Exception:
-            # seanear 等无 click 表或 event_postback_info 结构不同 → 委托真实 API
-            if self._api_fallback is None:
-                from tess_backend.data_connector import TeensingDataConnector, get_platform_base_url, _db_data_token
-                self._api_fallback = TeensingDataConnector(
-                    base_url=get_platform_base_url(self.platform_id),
-                    platform_token=_db_data_token(self.platform_id))
-            return self._api_fallback.api_get("/campaign-ctit-etit", params, None, None)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "MysqlDataConnector CTIT 失败(campaign=%s，可能无 click 表)：%s", cid, e)
         return {"ctit": ctit, "etit": etit}
 
     def _bucket_label(self, secs: int) -> str:
@@ -945,3 +979,555 @@ class MysqlDataConnector:
             except (TypeError, ValueError):
                 return " AND am = %s", (self.operator_id,)
         return "", ()
+
+    # ----- 安全回退 helper（新端点通用） -----
+
+    def _try_or_fallback(self, path, fn, params, token, timeout):
+        """优先走 MySQL 实现；任何异常（表缺失/平台无数据/超时）自动回退真实 API。
+
+        保证：即便某平台缺预聚合表或查询失败，也不会崩、不会静默丢数；
+        served_routes 同时记录最终命中的是 mysql 还是 api，便于可观测。
+        """
+        try:
+            self.served_routes.append((path, "mysql"))
+            return fn(params)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "MysqlDataConnector %s MySQL 实现失败，回退 API：%s", path, e)
+            self.served_routes.append((path, "api"))
+            if self._api_fallback is None:
+                from tess_backend.data_connector import (
+                    TeensingDataConnector, get_platform_base_url, _db_data_token)
+                self._api_fallback = TeensingDataConnector(
+                    base_url=get_platform_base_url(self.platform_id),
+                    platform_token=_db_data_token(self.platform_id))
+            return self._api_fallback.api_get(path, params, token, timeout)
+
+    # ----- 批量映射辅助（ranking/fluctuation 补主数据） -----
+
+    def _advertiser_profile_map(self, aids: list) -> dict:
+        """批量取 advertiser 档案，按 id 索引（int/str 兼容）。"""
+        aids = [a for a in aids if a is not None]
+        if not aids:
+            return {}
+        try:
+            ids = tuple(int(a) for a in aids)
+        except (TypeError, ValueError):
+            ids = tuple(aids)
+        ph = ",".join(["%s"] * len(ids))
+        rows = self._query(
+            f"SELECT id, name, am, bd, status FROM advertiser WHERE id IN ({ph})", ids)
+        return {
+            r["id"]: {"name": r.get("name"), "am": r.get("am"),
+                      "bd": r.get("bd"), "status": r.get("status")}
+            for r in rows
+        }
+
+    def _campaign_adv_map(self, cids: list) -> dict:
+        """批量取 campaign_id -> advertiser_id，按 str(campaign_id) 索引。"""
+        cids = [c for c in cids if c]
+        if not cids:
+            return {}
+        try:
+            ids = tuple(int(c) for c in cids)
+        except (TypeError, ValueError):
+            ids = tuple(cids)
+        ph = ",".join(["%s"] * len(ids))
+        rows = self._query(
+            f"SELECT id, advertiser_id FROM campaign WHERE id IN ({ph})", ids)
+        return {str(r["id"]): r.get("advertiser_id") for r in rows}
+
+    # ----- 平台级榜单 / 主数据实现（dashboard 类，预聚合表，秒级） -----
+
+    def _latest_closed_month(self) -> int:
+        """report_month 不含当前进行月；取最大的已结月作为『当前榜单月』。"""
+        rows = self._query("SELECT MAX(date) m FROM report_month")
+        m = rows[0]["m"] if rows and rows[0]["m"] is not None else None
+        if m is None:
+            cur = self._current_ym()
+            y, mo = divmod(cur - 1, 100)
+            if mo == 0:
+                y -= 1
+                mo = 12
+            m = y * 100 + mo
+        return int(m)
+
+    @staticmethod
+    def _prev_month(m: int) -> int:
+        y, mo = divmod(m, 100)
+        mo -= 1
+        if mo == 0:
+            mo, y = 12, y - 1
+        return y * 100 + mo
+
+    def _overview_ranking(self, params: dict) -> list:
+        """模拟 GET /overview/ranking：按『最近已结月』营收排名的广告主榜。
+
+        用 report_month（月度预聚合，秒级）GROUP BY advertiser_id；JOIN advertiser
+        补 name/am/bd/status；revenue_change 取与上一已结月的环比。返回 list。
+
+        形状对齐 adminv3 消费侧（account_overview 取 advertiser_id/advertiser_name/
+        revenue/profit/margin/revenue_change）。
+
+        取舍说明：report_month 不含当前进行月，榜单反映最近已结月（非滚动 30 天）。
+        实时滚动榜需扫 report_hour_new 4900 万行超取数预算，故用预聚合月榜。
+        """
+        m = self._latest_closed_month()
+        pm = self._prev_month(m)
+        cur = self._query(
+            "SELECT advertiser_id, SUM(revenue) rev, SUM(payout) pay, "
+            "SUM(conversions) conv FROM report_month "
+            "WHERE date=%s GROUP BY advertiser_id", (m,))
+        prev = self._query(
+            "SELECT advertiser_id, SUM(revenue) rev FROM report_month "
+            "WHERE date=%s GROUP BY advertiser_id", (pm,))
+        prev_map = {str(r["advertiser_id"]): self._f(r["rev"]) for r in prev}
+        aids = [r["advertiser_id"] for r in cur if r["advertiser_id"] is not None]
+        meta = self._advertiser_profile_map(aids)
+        out = []
+        for r in cur:
+            aid = r["advertiser_id"]
+            rev = self._f(r["rev"])
+            pay = self._f(r["pay"])
+            conv = int(self._f(r["conv"]))
+            margin = ((rev - pay) / rev * 100) if rev > 0 else 0.0
+            prev_rev = prev_map.get(str(aid), 0.0)
+            chg = ((rev - prev_rev) / prev_rev * 100) if prev_rev > 0 else (100.0 if rev > 0 else 0.0)
+            m0 = meta.get(aid, {})
+            out.append({
+                "advertiser_id": aid,
+                "advertiser_name": m0.get("name"),
+                "revenue": round(rev, 4),
+                "payout": round(pay, 4),
+                "profit": round(rev - pay, 4),
+                "conversions": conv,
+                "margin": round(margin, 4),
+                "revenue_change": round(chg, 2),
+                "status": m0.get("status"),
+                "status_name": campaign_status_label(m0.get("status")),
+                "am": m0.get("am"),
+                "bd": m0.get("bd"),
+            })
+        out.sort(key=lambda x: x["revenue"], reverse=True)
+        return out[:100]
+
+    def _overview_fluctuation(self, params: dict) -> dict:
+        """模拟 GET /overview/ranking/fluctuation：最近两已结月 campaign 级环比涨跌榜。
+
+        返回 {rising:[...], falling:[...]}；每个 item 含 campaign_id/campaign_name/
+        advertiser_id/revenue/profit/margin/revenue_change/prev_revenue 等，供
+        campaign_ranking（按 revenue_change 排序）与 daily_summary 消费。
+
+        取舍：用 report_month 月度环比（非 7 天环比），因 report_hour_new 平台级
+        实时聚合超预算；月榜反映最近两已结月变化，已足够识别大幅涨跌。
+        """
+        m = self._latest_closed_month()
+        pm = self._prev_month(m)
+        cur = self._query(
+            "SELECT campaign_id, SUM(revenue) rev, SUM(payout) pay, "
+            "SUM(conversions) conv FROM report_month "
+            "WHERE date=%s GROUP BY campaign_id", (m,))
+        prev = self._query(
+            "SELECT campaign_id, SUM(revenue) rev FROM report_month "
+            "WHERE date=%s GROUP BY campaign_id", (pm,))
+        prev_map = {str(r["campaign_id"]): self._f(r["rev"]) for r in prev}
+        items = []
+        for r in cur:
+            cid = str(r["campaign_id"])
+            rev = self._f(r["rev"])
+            pay = self._f(r["pay"])
+            conv = int(self._f(r["conv"]))
+            margin = ((rev - pay) / rev * 100) if rev > 0 else 0.0
+            prev_rev = prev_map.get(cid, 0.0)
+            chg = ((rev - prev_rev) / prev_rev * 100) if prev_rev > 0 else (100.0 if rev > 0 else 0.0)
+            items.append({
+                "campaign_id": int(cid) if cid.isdigit() else cid,
+                "revenue": round(rev, 4),
+                "payout": round(pay, 4),
+                "profit": round(rev - pay, 4),
+                "conversions": conv,
+                "margin": round(margin, 4),
+                "revenue_change": round(chg, 2),
+                "prev_revenue": round(prev_rev, 4),
+            })
+        rising = sorted(
+            [i for i in items if i["revenue_change"] > 0],
+            key=lambda x: x["revenue_change"], reverse=True)[:50]
+        falling = sorted(
+            [i for i in items if i["revenue_change"] < 0],
+            key=lambda x: x["revenue_change"])[:50]
+        # 仅给 top 100 campaign 补 name/advertiser_id（避免对上万 id 做 IN 大查询，稳健且快）
+        top_cids = [str(i["campaign_id"]) for i in (rising + falling)]
+        names = self._campaign_meta(top_cids)
+        amap = self._campaign_adv_map(top_cids)
+        for i in rising + falling:
+            cid = str(i["campaign_id"])
+            i["campaign_name"] = names.get(cid, {}).get("name")
+            i["advertiser_id"] = amap.get(cid)
+        return {"rising": rising[:50], "falling": falling[:50]}
+
+    def _daily_kpi(self, params: dict) -> list:
+        """模拟 GET /overview/daily-kpi：平台级日 KPI 时间序列（report_day 预聚合，秒级）。
+
+        返回按 date 升序的 list：[{date, revenue, payout, profit, clicks, conversions,
+        postback_conversions, reject_count}]，消费侧取末两位做环比（_pct_delta 读
+        revenue/profit/payout/clicks/conversions）。默认窗口 30 天、结束于请求 date
+        （缺省=昨天），避免把『今天』部分日当完整日。
+        """
+        end = params.get("date") or (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        days = int(params.get("days") or 30)
+        try:
+            start = (datetime.strptime(end, "%Y-%m-%d") - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        except (TypeError, ValueError):
+            start = end
+        rows = self._query(
+            "SELECT date, SUM(revenue) rev, SUM(payout) pay, SUM(clicks) clk, "
+            "SUM(conversions) conv, SUM(postback_conversions) pb, SUM(reject_count) rj "
+            "FROM report_day WHERE date BETWEEN %s AND %s GROUP BY date ORDER BY date",
+            (start, end))
+        out = []
+        for r in rows:
+            rev = self._f(r.get("rev"))
+            pay = self._f(r.get("pay"))
+            clk = int(self._f(r.get("clk")))
+            conv = int(self._f(r.get("conv")))
+            out.append({
+                "date": r.get("date"),
+                "revenue": round(rev, 4),
+                "payout": round(pay, 4),
+                "profit": round(rev - pay, 4),
+                "clicks": clk,
+                "conversions": conv,
+                "postback_conversions": int(self._f(r.get("pb"))),
+                "reject_count": int(self._f(r.get("rj"))),
+            })
+        return out
+
+    def _advertisers_list(self, params: dict) -> dict:
+        """模拟 GET /advertisers：广告主目录（支持 am/bd/status 过滤 + 分页 + 关键字）。"""
+        page = int(params.get("page") or 1)
+        page_size = min(int(params.get("page_size") or 50), 200)
+        am = params.get("am")
+        bd = params.get("bd")
+        status = params.get("status")
+        q = params.get("q") or params.get("search")
+        where = []
+        wargs = []
+        if am not in (None, ""):
+            where.append("am=%s")
+            wargs.append(am)
+        if bd not in (None, ""):
+            where.append("bd=%s")
+            wargs.append(bd)
+        if status not in (None, ""):
+            where.append("status=%s")
+            wargs.append(status)
+        if q:
+            where.append("(name LIKE %s OR user_name LIKE %s OR id LIKE %s)")
+            like = f"%{q}%"
+            wargs += [like, like, like]
+        wsql = (" WHERE " + " AND ".join(where)) if where else ""
+        total_rows = self._query(f"SELECT COUNT(*) c FROM advertiser{wsql}", wargs)
+        total = total_rows[0]["c"] if total_rows else 0
+        offset = (page - 1) * page_size
+        rows = self._query(
+            f"SELECT id, name, user_name, bd, am, status, margin, jointime, company_name "
+            f"FROM advertiser{wsql} ORDER BY id DESC LIMIT %s OFFSET %s",
+            tuple(wargs) + (page_size, offset))
+        items = [{
+            "id": r.get("id"),
+            "name": r.get("name"),
+            "user_name": r.get("user_name"),
+            "bd": r.get("bd"),
+            "am": r.get("am"),
+            "status": r.get("status"),
+            "status_name": campaign_status_label(r.get("status")),
+            "margin": self._f(r.get("margin")),
+            "jointime": str(r.get("jointime")) if r.get("jointime") is not None else None,
+            "company_name": r.get("company_name"),
+        } for r in rows]
+        return {"total": total, "page": page, "page_size": page_size, "items": items}
+
+    def _global_settings(self, params: dict) -> dict:
+        """模拟 GET /global-settings：从 global_setting 表读 key/value；暴露 global_cap。"""
+        try:
+            rows = self._query("SELECT key_name, key_value FROM global_setting")
+        except Exception:  # noqa: BLE001 —— 表不存在等，安全返回 None
+            return {"global_cap": None}
+        kv = {r["key_name"]: r["key_value"] for r in rows}
+        cap = kv.get("global_cap") or kv.get("cap") or kv.get("global_cap_limit")
+        try:
+            cap = float(cap) if cap is not None else None
+        except (TypeError, ValueError):
+            cap = None
+        out = {"global_cap": cap}
+        out.update(kv)
+        return out
+
+    # ----- 配置 / 映射 / 规则（traffic_policy / 实体解析 / 异常告警）直连实现 -----
+    # 这些端点原走 Teensing API，本质都是网盟 MySQL 里的配置/映射表，可直接直出，
+    # 全部用 _try_or_fallback 包裹：MySQL 成功即直出，异常才回退 API（当前 API 401，
+    # 故必须 MySQL 成功；包裹仅为上线期容错，不静默丢数）。
+
+    @staticmethod
+    def _row_to_dict(r: dict) -> dict:
+        """把一行（DictCursor）转成可 JSON 序列化 dict：bytes->utf8、datetime/date->iso、Decimal->float。"""
+        out = {}
+        for k, v in r.items():
+            if isinstance(v, (bytes, bytearray)):
+                try:
+                    v = v.decode("utf-8", "ignore")
+                except Exception:  # noqa: BLE001
+                    v = str(v)
+            elif hasattr(v, "isoformat"):  # datetime / date / time
+                v = v.isoformat()
+            else:
+                try:
+                    import decimal
+                    if isinstance(v, decimal.Decimal):
+                        v = float(v)
+                except Exception:  # noqa: BLE001
+                    pass
+            out[k] = v
+        return out
+
+    @staticmethod
+    def _page_limit(params: dict, default: int = 100, cap: int = 500) -> int:
+        """从 params 取 page_size，夹在 [1, cap]。"""
+        try:
+            n = int(params.get("page_size") or default)
+        except (TypeError, ValueError):
+            n = default
+        return max(1, min(n, cap))
+
+    def _adv_pub_pkg_maps(self, params: dict) -> dict:
+        """模拟 GET /advertiser-publisher-pkg-maps：按包名归因广告主/渠道。"""
+        pkg = (params.get("packagename") or params.get("package_name") or "").strip()
+        if not pkg:
+            return {"items": [], "total": 0}
+        try:
+            rows = self._query(
+                "SELECT id, publisher_id, advertiser_id, platform, packagename, "
+                "appname, channel, comment, operator, status, update_time "
+                "FROM advertiser_publisher_pkg_map "
+                "WHERE packagename = %s OR appname = %s "
+                "ORDER BY id DESC LIMIT 500",
+                (pkg, pkg),
+            )
+        except Exception:  # noqa: BLE001
+            return {"items": [], "total": 0}
+        items = [self._row_to_dict(r) for r in rows]
+        return {"items": items, "total": len(items)}
+
+    def _mapping_publisher_channels(self, params: dict) -> dict:
+        """模拟 GET /mapping-publisher-channels：publisher<->channel 映射。"""
+        pid = params.get("publisher_id")
+        ch = params.get("channel")
+        conds, args = [], []
+        if pid:
+            pid_v = int(pid) if str(pid).isdigit() else pid
+            conds.append("publisher_id = %s")
+            args.append(pid_v)
+        if ch:
+            conds.append("channel = %s")
+            args.append(ch)
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        limit = self._page_limit(params, default=100, cap=500)
+        try:
+            rows = self._query(
+                "SELECT id, publisher_id, channel, campaign_id, replace_publisher_id, "
+                "replace_channel, `desc`, status, operator, update_time, advertiser_id "
+                "FROM mapping_publisher_channel" + where +
+                " ORDER BY id DESC LIMIT " + str(limit),
+                tuple(args),
+            )
+        except Exception:  # noqa: BLE001
+            return {"items": [], "total": 0}
+        items = [self._row_to_dict(r) for r in rows]
+        return {"items": items, "total": len(items)}
+
+    def _publisher_campaign_blocks(self, params: dict) -> dict:
+        """模拟 GET /publisher-campaign-blocks：屏蔽规则（普通 + 系统级）。"""
+        cid = params.get("campaign_id")
+        pid = params.get("publisher_id")
+        conds, args = [], []
+        if cid:
+            conds.append("campaign_id = %s")
+            args.append(int(cid) if str(cid).isdigit() else cid)
+        if pid:
+            conds.append("publisher_id = %s")
+            args.append(int(pid) if str(pid).isdigit() else pid)
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        try:
+            rows_a = self._query(
+                "SELECT id, publisher_id, campaign_id, `desc`, status, channels, "
+                "'manual' AS source FROM publisher_campaign_block" + where,
+                tuple(args),
+            )
+            rows_b = self._query(
+                "SELECT id, publisher_id, campaign_id, reason AS `desc`, status, "
+                "'' AS channels, 'system' AS source FROM system_publisher_campaign_block" + where,
+                tuple(args),
+            )
+        except Exception:  # noqa: BLE001
+            return {"items": []}
+        items = [self._row_to_dict(r) for r in (list(rows_a) + list(rows_b))]
+        return {"items": items, "total": len(items)}
+
+    def _replace_channels(self, params: dict) -> dict:
+        """模拟 GET /replace-channels：替换渠道规则。publisher_id 在表中可能是逗号分隔多值。"""
+        pid = params.get("publisher_id")
+        conds, args = [], []
+        if pid:
+            # 兼容 publisher_id 为逗号分隔串的情况
+            conds.append("(publisher_id = %s OR FIND_IN_SET(%s, publisher_id))")
+            args.append(pid)
+            args.append(pid)
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        try:
+            rows = self._query(
+                "SELECT id, advertiser_id, campaign_id, publisher_id, channel, "
+                "replace_publisher_id, replace_channel, replace_channel_count, click_count, "
+                "event_name, event_count, `desc`, operator, status, update_time "
+                "FROM replace_channel" + where + " ORDER BY id DESC LIMIT 500",
+                tuple(args),
+            )
+        except Exception:  # noqa: BLE001
+            return {"items": []}
+        items = [self._row_to_dict(r) for r in rows]
+        return {"items": items, "total": len(items)}
+
+    def _users_options(self, params: dict) -> list:
+        """模拟 GET /users/options：扁平用户目录（owner 名->id 解析用）。返回 list。
+
+        user 表无 real_name 列，以 name 兜底；analytics 同时读 name/real_name，故二者同值。
+        """
+        try:
+            rows = self._query(
+                "SELECT id, name, status, role, email FROM `user` ORDER BY id LIMIT 500")
+        except Exception:  # noqa: BLE001
+            return []
+        out = []
+        for r in rows:
+            out.append({
+                "id": r.get("id"),
+                "name": r.get("name"),
+                "real_name": r.get("name"),
+                "status": r.get("status"),
+                "role": r.get("role"),
+            })
+        return out
+
+    def _anomaly_warning(self, params: dict) -> list:
+        """模拟 GET /overview/ranking/anomaly-warning：异常告警列表。返回 list。"""
+        try:
+            logs = self._query(
+                "SELECT id, rule_name, rule_code, log_date, advertiser_id, advertiser_name, "
+                "publisher_id, publisher_name, campaign_id, campaign_name, package_name, "
+                "warning_level, real_value, desired_value, clicks, conversions, cvr, "
+                "handle_status, created_at FROM ad_traffic_warning_log "
+                "ORDER BY created_at DESC LIMIT 50")
+        except Exception:  # noqa: BLE001
+            logs = []
+        items = [self._row_to_dict(r) for r in logs]
+        # 补充 publisher_warning 阈值规则（若存在）
+        try:
+            pw = self._query(
+                "SELECT id, publisher_id, campaign_id, min_cvr, max_cvr, status, create_time "
+                "FROM publisher_warning LIMIT 100")
+            for r in pw:
+                items.append(self._row_to_dict(r))
+        except Exception:  # noqa: BLE001
+            pass
+        return items
+
+    def _campaign_detail(self, params: dict) -> dict:
+        """模拟 GET /campaign-detail：组合 campaign/advertiser 配置直出真实数据。
+
+        原 API 的 campaigns/events/advertisers 为嵌套结构；此处用实体表直出，字段无法与 API
+        100% 对齐时由下游 Gatekeeper 容错。包裹在 _try_or_fallback 中，任何异常回退 API。
+        """
+        cid = params.get("campaign_ids") or params.get("campaign_id")
+        if cid and "," in str(cid):
+            cid = str(cid).split(",")[0]
+        if not cid:
+            return {"t_campaign_id": None, "campaigns": [], "events": [], "advertisers": []}
+        try:
+            cid_i = int(cid)
+        except (TypeError, ValueError):
+            return {"t_campaign_id": cid, "campaigns": [], "events": [], "advertisers": []}
+        try:
+            camps = self._query(
+                "SELECT * FROM campaign WHERE id = %s LIMIT 1", (cid_i,))
+            adv_id = camps[0].get("advertiser_id") if camps else None
+            advs = self._query(
+                "SELECT * FROM advertiser WHERE id = %s LIMIT 1", (adv_id,)) if adv_id else []
+        except Exception:  # noqa: BLE001
+            camps, advs = [], []
+        return {
+            "t_campaign_id": cid,
+            "campaigns": [self._row_to_dict(c) for c in camps],
+            "events": [],  # 事件明细暂无独立实体表，留空（下游容错）
+            "advertisers": [self._row_to_dict(a) for a in advs],
+        }
+
+    def _campaign_compare(self, params: dict) -> dict:
+        """模拟 GET /campaign-compare：某 campaign 当前周期 vs 上一等长周期对比。
+
+        数据源 report_hour_new（网盟库里唯一带 campaign_id 的明细表）；
+        campaign_id 必须按字符串传以走索引（否则全表扫 4900 万行）。
+        profit = revenue - payout；cvr = conversions / clicks。包裹在 _try_or_fallback 中容错。
+        """
+        import datetime as _dt
+        cid_raw = params.get("campaign_ids") or params.get("campaign_id") or ""
+        if "," in str(cid_raw):
+            cid_raw = str(cid_raw).split(",")[0]
+        cid = str(cid_raw).strip()
+        if not cid:
+            return {"current_period": {}, "previous_period": {},
+                    "revenue": 0, "profit": 0, "conversions": 0, "cvr": 0}
+        ds = params.get("date_start")
+        de = params.get("date_end")
+        if not ds or not de:
+            de = _dt.datetime.now().strftime("%Y-%m-%d")
+            ds = (_dt.datetime.now() - _dt.timedelta(days=7)).strftime("%Y-%m-%d")
+
+        def _agg(ads, ade):
+            try:
+                row = self._query(
+                    "SELECT SUM(revenue) rev, SUM(payout) pay, SUM(conversions) conv, SUM(clicks) clk "
+                    "FROM report_hour_new WHERE campaign_id=%s AND date BETWEEN %s AND %s",
+                    (cid, ads, ade))
+                r = row[0] if row else {}
+            except Exception:  # noqa: BLE001
+                r = {}
+            rev = float(r.get("rev") or 0)
+            pay = float(r.get("pay") or 0)
+            conv = int(r.get("conv") or 0)
+            clk = int(r.get("clk") or 0)
+            return {
+                "date_start": ads, "date_end": ade,
+                "revenue": round(rev, 2), "payout": round(pay, 2),
+                "profit": round(rev - pay, 2), "conversions": conv, "clicks": clk,
+                "cvr": round(conv / clk, 4) if clk else 0,
+            }
+
+        try:
+            d0 = _dt.datetime.strptime(ds, "%Y-%m-%d")
+            d1 = _dt.datetime.strptime(de, "%Y-%m-%d")
+            length = (d1 - d0).days + 1
+            prev_de = (d0 - _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+            prev_ds = (d0 - _dt.timedelta(days=length)).strftime("%Y-%m-%d")
+        except Exception:  # noqa: BLE001
+            prev_ds, prev_de = ds, de
+
+        cur = _agg(ds, de)
+        prev = _agg(prev_ds, prev_de)
+        return {
+            "current_period": cur,
+            "previous_period": prev,
+            "revenue": cur["revenue"], "profit": cur["profit"],
+            "conversions": cur["conversions"], "cvr": cur["cvr"],
+            "current_period_revenue": cur["revenue"],
+            "previous_period_revenue": prev["revenue"],
+        }
