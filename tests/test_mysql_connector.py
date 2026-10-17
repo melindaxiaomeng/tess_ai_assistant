@@ -171,14 +171,15 @@ def test_campaigns_status_int():
         assert isinstance(it["status"], int)  # 数字，由调用方 _camp_status_label 映射
 
 
-def test_unknown_path_delegates_to_api():
-    # 未知 path 不再静默返回空（会丢数据），而是回退到真实 Teensing API。
-    # 单测环境无 TESS_DATA_API_BASE_URL，故用 stub 验证「委托」语义。
+def test_unknown_path_raises_no_api_fallback():
+    # MySQL 直连模式下，未知 path 绝不回退 API（避免静默返回部分/截断的 API 数据）。
+    # 而是显式抛 NotImplementedError，由上游 _safe_api_get 捕获并转为 error 字段
+    # （Gatekeeper 熔断 INCONCLUSIVE）—— 这正是「全部落到 MySQL 直连」的硬保证。
     c = FakeMysqlDataConnector()
-    sentinel = {"items": [{"delegated": True}]}
-    c._api_fallback = type("S", (), {"api_get": staticmethod(lambda *a, **k: sentinel)})()
-    assert c.api_get("/overview/ranking") == sentinel
-    assert ("/overview/ranking", "api") in c.served_routes
+    with pytest.raises(NotImplementedError):
+        c.api_get("/some/unknown/path")
+    # 不得出现任何 api 委托记录
+    assert all(src == "mysql" for (_p, src) in c.served_routes)
 
 
 # --------------------------------------------------------------------------

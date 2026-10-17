@@ -146,10 +146,9 @@ class MysqlDataConnector:
         self.cross_db = str(os.getenv("TESS_MYSQL_CROSS_DB", "0") or "0").strip() not in (
             "0", "false", "no", "off"
         )
-        # 路由审计：记录每个被调用的 path 由 MySQL 实现还是回退到真实 API（供对拍/可观测用）。
+        # 路由审计：记录每个被调用的 path 命中 MySQL（mysql 直连模式下只会是 mysql，
+        # 绝不回退 API，保证「全部落到 MySQL 直连」）。
         self.served_routes: list = []
-        # 试点期回退实例（惰性创建，避免与 data_connector 循环 import）。
-        self._api_fallback = None
 
     # ----- 传输层（替代 Teensing 的 HTTP） -----
 
@@ -299,8 +298,9 @@ class MysqlDataConnector:
           /replace-channels, /campaign-compare,
           /users/options, /overview/ranking, /overview/ranking/fluctuation,
           /overview/daily-kpi, /overview/ranking/anomaly-warning, /global-settings。
-        未实现的路径**回退到真实 Teensing API**（试点期零风险，绝不静默返回空导致数据丢失）。
-        每次调用都记一笔 served_routes，便于对拍时区分「MySQL 校验」与「API 委托」。
+        未实现的路径**显式报错**（绝不回退 API）：由上游 _safe_api_get 捕获并转为 error 字段，
+        保证「全部落到 MySQL 直连」，绝不静默返回空或部分/截断的 API 数据导致对账口径偏差。
+        每次调用都记一笔 served_routes（mode 恒为 mysql）。
         """
         params = params or {}
         if path == "/advertisers/campaign-daily-kpi":
@@ -308,7 +308,7 @@ class MysqlDataConnector:
             return self._campaign_daily_kpi(params)
         if path == "/advertisers":
             # 广告主目录（列表），区别于 /advertisers/{aid} 单档案
-            return self._try_or_fallback(path, self._advertisers_list, params, token, timeout)
+            return self._mysql_only(path, self._advertisers_list, params, token, timeout)
         if path.startswith("/advertisers/"):
             self.served_routes.append((path, "mysql"))
             aid = path.split("/advertisers/", 1)[1]
@@ -334,43 +334,44 @@ class MysqlDataConnector:
         if path == "/campaign-quality":
             self.served_routes.append((path, "mysql"))
             return self._campaign_quality(params)
+        if path == "/campaign-quality/publisher/channels":
+            self.served_routes.append((path, "mysql"))
+            return self._channel_quality(params)
         if path == "/campaign-ctit-etit":
             self.served_routes.append((path, "mysql"))
             return self._ctit_etit(params)
         # ----- 平台级榜单 / 主数据（dashboard 类，用预聚合表 report_month/report_day，秒级） -----
         if path == "/overview/ranking":
-            return self._try_or_fallback(path, self._overview_ranking, params, token, timeout)
+            return self._mysql_only(path, self._overview_ranking, params, token, timeout)
         if path == "/overview/ranking/fluctuation":
-            return self._try_or_fallback(path, self._overview_fluctuation, params, token, timeout)
+            return self._mysql_only(path, self._overview_fluctuation, params, token, timeout)
         if path == "/overview/daily-kpi":
-            return self._try_or_fallback(path, self._daily_kpi, params, token, timeout)
+            return self._mysql_only(path, self._daily_kpi, params, token, timeout)
         if path == "/global-settings":
-            return self._try_or_fallback(path, self._global_settings, params, token, timeout)
+            return self._mysql_only(path, self._global_settings, params, token, timeout)
         # ----- 配置 / 映射 / 规则（原 API 兜底路径，现直连 MySQL 配置表） -----
         if path == "/advertiser-publisher-pkg-maps":
-            return self._try_or_fallback(path, self._adv_pub_pkg_maps, params, token, timeout)
+            return self._mysql_only(path, self._adv_pub_pkg_maps, params, token, timeout)
         if path == "/mapping-publisher-channels":
-            return self._try_or_fallback(path, self._mapping_publisher_channels, params, token, timeout)
+            return self._mysql_only(path, self._mapping_publisher_channels, params, token, timeout)
         if path == "/publisher-campaign-blocks":
-            return self._try_or_fallback(path, self._publisher_campaign_blocks, params, token, timeout)
+            return self._mysql_only(path, self._publisher_campaign_blocks, params, token, timeout)
         if path == "/replace-channels":
-            return self._try_or_fallback(path, self._replace_channels, params, token, timeout)
+            return self._mysql_only(path, self._replace_channels, params, token, timeout)
         if path == "/users/options":
-            return self._try_or_fallback(path, self._users_options, params, token, timeout)
+            return self._mysql_only(path, self._users_options, params, token, timeout)
         if path == "/overview/ranking/anomaly-warning":
-            return self._try_or_fallback(path, self._anomaly_warning, params, token, timeout)
+            return self._mysql_only(path, self._anomaly_warning, params, token, timeout)
         if path == "/campaign-detail":
-            return self._try_or_fallback(path, self._campaign_detail, params, token, timeout)
+            return self._mysql_only(path, self._campaign_detail, params, token, timeout)
         if path == "/campaign-compare":
-            return self._try_or_fallback(path, self._campaign_compare, params, token, timeout)
-        # 未实现：回退到真实 Teensing API（绝不静默返回空，避免数据丢失）。
-        self.served_routes.append((path, "api"))
-        if self._api_fallback is None:
-            from tess_backend.data_connector import TeensingDataConnector, get_platform_base_url, _db_data_token
-            self._api_fallback = TeensingDataConnector(
-                base_url=get_platform_base_url(self.platform_id),
-                platform_token=_db_data_token(self.platform_id))
-        return self._api_fallback.api_get(path, params, token, timeout)
+            return self._mysql_only(path, self._campaign_compare, params, token, timeout)
+        # 未实现：MySQL 直连模式下绝不回退 API。显式报错，由上游 _safe_api_get 捕获转为
+        # error 字段（Gatekeeper 熔断 INCONCLUSIVE），避免静默返回空或部分 API 数据。
+        raise NotImplementedError(
+            f"MysqlDataConnector 未实现路径 {path!r}；全部取数须走 MySQL 直连，"
+            f"请为其在 mysql_connector.py 增加对应的 _<name> 方法并在 api_get 路由。"
+        )
 
     # ----- 数据依据（provenance）透传：供前端「查了哪张表/哪些条件」折叠面板 -----
     def build_provenance(self, params: Optional[dict] = None,
@@ -1190,6 +1191,50 @@ class MysqlDataConnector:
             })
         return {"items": items}
 
+    def _channel_quality(self, params: dict) -> dict:
+        """模拟 GET /campaign-quality/publisher/channels（渠道级质量，publisher_id + campaign_ids）。
+
+        从 report_hour_new 按 channel_id 聚合近 7 天质量时序；publisher_id 为 int、campaign_id
+        为 VARCHAR(64) 必须按字符串传（否则索引失效）。channel_id 列若不存在则查询抛错，
+        由上游 _safe_api_get 捕获降级为空（绝不回退 API，符合「全部落到 MySQL 直连」）。
+        """
+        pid = params.get("publisher_id")
+        cids = [x for x in str(params.get("campaign_ids") or "").split(",") if x]
+        if pid is None or not cids:
+            return {"items": []}
+        ds, de = self._recent_window(7)
+        ph = ",".join(["%s"] * len(cids))
+        sql = (
+            "SELECT channel_id, date, SUM(conversions) conv, SUM(postback_conversions) pb, "
+            "SUM(clicks) clk, SUM(reject_count) rj FROM report_hour_new "
+            f"WHERE publisher_id=%s AND campaign_id IN ({ph}) AND date BETWEEN %s AND %s "
+            "GROUP BY channel_id, date"
+        )
+        rows = self._query(sql, (int(pid), *cids, ds, de))
+        by_ch: dict = {}
+        for r in rows:
+            ch = r.get("channel_id")
+            by_ch.setdefault(ch, {})[r["date"]] = {
+                "conversions": self._f(r.get("conv")),
+                "postback_conversions": self._f(r.get("pb")),
+                "clicks": int(self._f(r.get("clk"))),
+                "reject_count": int(self._f(r.get("rj"))),
+            }
+        items = []
+        for ch, dates in by_ch.items():
+            per_date = {}
+            tc = tp = tk = tr = 0.0
+            for d, a in dates.items():
+                per_date[d] = self._quality_item(d, a["conversions"], a["postback_conversions"], a["clicks"], a["reject_count"], 0, 0)
+                tc += a["conversions"]; tp += a["postback_conversions"]; tk += a["clicks"]; tr += a["reject_count"]
+            total = self._quality_total(tc, tp, tk, tr, 0, 0)
+            items.append({
+                "channel_id": ch,
+                "total": total,
+                **per_date,
+            })
+        return {"items": items}
+
     @staticmethod
     def _parse_dt(value):
         """容错解析时间：网盟 install_time 实际为 'YYYY:MM:DD HH:MM:SS'（冒号分隔日期），
@@ -1295,26 +1340,15 @@ class MysqlDataConnector:
 
     # ----- 安全回退 helper（新端点通用） -----
 
-    def _try_or_fallback(self, path, fn, params, token, timeout):
-        """优先走 MySQL 实现；任何异常（表缺失/平台无数据/超时）自动回退真实 API。
+    def _mysql_only(self, path, fn, params, token=None, timeout=None):
+        """只走 MySQL 实现；任何异常直接抛出，由上游 _safe_api_get 捕获并标记 error。
 
-        保证：即便某平台缺预聚合表或查询失败，也不会崩、不会静默丢数；
-        served_routes 同时记录最终命中的是 mysql 还是 api，便于可观测。
+        绝不回退真实 API —— 保证「全部落到 MySQL 直连」：MySQL 取数失败/缺表时宁愿让上游
+        把该字段标 error（Gatekeeper 熔断 INCONCLUSIVE），也绝不静默返回部分/截断的 API 数据
+        （正是此前「数据不全」反复出现的根因）。
         """
-        try:
-            self.served_routes.append((path, "mysql"))
-            return fn(params)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "MysqlDataConnector %s MySQL 实现失败，回退 API：%s", path, e)
-            self.served_routes.append((path, "api"))
-            if self._api_fallback is None:
-                from tess_backend.data_connector import (
-                    TeensingDataConnector, get_platform_base_url, _db_data_token)
-                self._api_fallback = TeensingDataConnector(
-                    base_url=get_platform_base_url(self.platform_id),
-                    platform_token=_db_data_token(self.platform_id))
-            return self._api_fallback.api_get(path, params, token, timeout)
+        self.served_routes.append((path, "mysql"))
+        return fn(params)
 
     # ----- 批量映射辅助（ranking/fluctuation 补主数据） -----
 
@@ -1579,8 +1613,8 @@ class MysqlDataConnector:
 
     # ----- 配置 / 映射 / 规则（traffic_policy / 实体解析 / 异常告警）直连实现 -----
     # 这些端点原走 Teensing API，本质都是网盟 MySQL 里的配置/映射表，可直接直出，
-    # 全部用 _try_or_fallback 包裹：MySQL 成功即直出，异常才回退 API（当前 API 401，
-    # 故必须 MySQL 成功；包裹仅为上线期容错，不静默丢数）。
+    # 全部用 _mysql_only 包裹：只走 MySQL 直出，异常直接抛出（上游 _safe_api_get 捕获转
+    # error，Gatekeeper 熔断 INCONCLUSIVE），绝不回退 API —— 保证「全部落到 MySQL 直连」。
 
     @staticmethod
     def _row_to_dict(r: dict) -> dict:
@@ -1758,7 +1792,7 @@ class MysqlDataConnector:
         """模拟 GET /campaign-detail：组合 campaign/advertiser 配置直出真实数据。
 
         原 API 的 campaigns/events/advertisers 为嵌套结构；此处用实体表直出，字段无法与 API
-        100% 对齐时由下游 Gatekeeper 容错。包裹在 _try_or_fallback 中，任何异常回退 API。
+        100% 对齐时由下游 Gatekeeper 容错。包裹在 _mysql_only 中，任何异常回退 API。
         """
         cid = params.get("campaign_ids") or params.get("campaign_id")
         if cid and "," in str(cid):
@@ -1789,7 +1823,7 @@ class MysqlDataConnector:
 
         数据源 report_hour_new（网盟库里唯一带 campaign_id 的明细表）；
         campaign_id 必须按字符串传以走索引（否则全表扫 4900 万行）。
-        profit = revenue - payout；cvr = conversions / clicks。包裹在 _try_or_fallback 中容错。
+        profit = revenue - payout；cvr = conversions / clicks。包裹在 _mysql_only 中容错。
         """
         import datetime as _dt
         cid_raw = params.get("campaign_ids") or params.get("campaign_id") or ""
