@@ -82,7 +82,7 @@ class MysqlDataConnector:
         password: Optional[str] = None,
         databases: Optional[dict] = None,
         timeout: int = 15,
-        fill_top_n: int = 500,
+        fill_top_n: int = 100,
     ):
         self.platform_id = platform_id or "Melodong"
         self.operator_id = operator_id
@@ -104,9 +104,10 @@ class MysqlDataConnector:
         self.database = self.databases.get(
             self.platform_id, self.databases.get("Melodong", "melocpi")
         )
-        # 用 report_hour_new 回填「完整窗口」的 top-N campaign 数量（覆盖实际消费的 top 30）。
-        # 越大越准（排名越不易因缺口月/当前月错位），但 IN 列表越长查询越慢；500 在实测中 <1s。
-        self.fill_top_n = int(fill_top_n or 500)
+        # 用 report_hour_new 回填「完整窗口」的 top-N campaign（覆盖实际消费的 top 30，并留余量
+        # 给 /report 默认 page_size=100）。小时级明细 IN 查询耗时随 N 近似线性：实测 N=500≈5.5s、
+        # N=100≈1.1s、N=30≈0.3s；取 100 在不回归 /report 翻页的前提下把耗时压到 1s 级。
+        self.fill_top_n = int(fill_top_n or 100)
         # 重聚合查询结果进程内缓存，避免长周期下钻对同一 (campaign_ids,ds,de) 重复跑分页查询。
         self._agg_cache: dict = {}
         # 跨库回退：默认关（=0，生产默认）。仅当默认库（按 platform_id 选）查不到时，
