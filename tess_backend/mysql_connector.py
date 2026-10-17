@@ -398,6 +398,166 @@ class MysqlDataConnector:
             "date_or_month": date_or_month,
         }
 
+    # ----- 定时诊断（cron）支持：补齐 TeensingDataConnector 已有的 fetch_* 接口 -----
+    # 这三个方法是 /tess/cron/run 调 run_scheduled_diagnosis 时直接调用的（原先只 Mock/
+    # Teensing/Empty 连接器实现了，MysqlDataConnector 漏了 → cron 在 mysql 模式下 AttributeError）。
+    # 全部复用 mysql 直连已有的取数方法，不引入新 SQL 风险面。
+
+    def fetch_recent_anomalies(self, limit: int = 20, token=None) -> list:
+        """定时诊断第一轮：异常预警 + 涨跌榜归并（对齐 TeensingDataConnector.fetch_recent_anomalies）。
+
+        复用 mysql 直连已有的 _anomaly_warning（ad_traffic_warning_log / publisher_warning）
+        与 _overview_fluctuation（report_month 月度环比 rising/falling），按 campaign_id 归并，
+        构造可供 normalize_to_context 消费的原始事件；fluctuation 补齐 revenue/change/_direction。
+        """
+        warn = self._anomaly_warning({})
+        fluc = self._overview_fluctuation({})
+
+        # 涨跌榜按 campaign_id 建索引（与 Teensing 版一致）
+        fluc_map: dict = {}
+        if isinstance(fluc, dict):
+            for grp in ("rising", "falling"):
+                for it in fluc.get(grp) or []:
+                    if not isinstance(it, dict):
+                        continue
+                    cid = it.get("campaign_id")
+                    if cid is None:
+                        continue
+                    merged = dict(it)
+                    merged["_direction"] = grp
+                    fluc_map[str(cid)] = merged
+
+        raws: list = []
+        for it in warn or []:
+            if not isinstance(it, dict):
+                continue
+            cid = it.get("campaign_id")
+            merged = dict(it)
+            key = str(cid) if cid is not None else None
+            if key is not None and key in fluc_map:
+                # fluctuation 的环比变化/方向/营收补齐到预警项上
+                for k, v in fluc_map[key].items():
+                    merged.setdefault(k, v)
+                merged["_direction"] = fluc_map[key].get("_direction", "unknown")
+            else:
+                merged["_direction"] = merged.get("_direction", "unknown")
+            raws.append(merged)
+
+        # 若 anomaly-warning 为空，则直接用 fluctuation 列表（含完整环比信号）
+        if not raws and isinstance(fluc, dict):
+            for grp in ("rising", "falling"):
+                for it in fluc.get(grp) or []:
+                    if isinstance(it, dict):
+                        merged = dict(it)
+                        merged["_direction"] = grp
+                        raws.append(merged)
+
+        return raws[:limit]
+
+    def fetch_realtime_kpi(self, token=None) -> dict:
+        """定时诊断第二轮：实时 KPI 小时级曲线（对齐 TeensingDataConnector.fetch_realtime_kpi）。
+
+        从 report_hour_new 取「今天 / 昨天」逐小时聚合，构造与 adminv3 realtime-kpi 同构的
+        {items:[{hour, today_revenue, today_clicks, today_conversions,
+                 yesterday_revenue, yesterday_clicks, yesterday_conversions}]}，
+        供 extract_realtime_anomalies 做掉零/暴跌判定。
+        说明：平台级全 campaign 两日聚合窗口可控；查询失败返回空 items（不误报、不崩）。
+        """
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            yest = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            rows = self._query(
+                "SELECT hour, "
+                "SUM(CASE WHEN date=%s THEN revenue END) t_rev, "
+                "SUM(CASE WHEN date=%s THEN clicks END) t_clk, "
+                "SUM(CASE WHEN date=%s THEN conversions END) t_conv, "
+                "SUM(CASE WHEN date=%s THEN revenue END) y_rev, "
+                "SUM(CASE WHEN date=%s THEN clicks END) y_clk, "
+                "SUM(CASE WHEN date=%s THEN conversions END) y_conv "
+                "FROM report_hour_new WHERE date IN (%s, %s) "
+                "GROUP BY hour ORDER BY hour",
+                (today, today, today, yest, yest, yest, today, yest),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("fetch_realtime_kpi 查询失败: %s", e)
+            return {"items": []}
+        items = []
+        for r in rows:
+            # report_hour_new.hour 可能是 int 或 'HH' 字符串，统一成两位字符串
+            h = r.get("hour")
+            hstr = f"{int(h):02d}" if h is not None else "00"
+            items.append({
+                "hour": hstr,
+                "today_revenue": self._f(r.get("t_rev")),
+                "today_clicks": int(self._f(r.get("t_clk"))),
+                "today_conversions": int(self._f(r.get("t_conv"))),
+                "yesterday_revenue": self._f(r.get("y_rev")),
+                "yesterday_clicks": int(self._f(r.get("y_clk"))),
+                "yesterday_conversions": int(self._f(r.get("y_conv"))),
+            })
+        return {"items": items}
+
+    def fetch_campaign_time_series(self, campaign_id, token=None, days=7,
+                                   granularity="day", publisher_id=None) -> dict:
+        """定时诊断用：单 campaign 历史趋势（对齐 TeensingDataConnector.fetch_campaign_time_series）。
+
+        复用 _campaign_kpi_trend（report_hour_new 日级明细，_recent_window 已排除今天），
+        重塑为 {campaign_id, granularity, range, data_points_count, time_series:[...]}。
+        hour 粒度在 report_hour_new 直接按 date,hour 聚合（窗口收窄到 3 天避免大扫表）。
+        """
+        try:
+            cid = str(campaign_id)
+            if granularity == "hour":
+                ds, de = self._recent_window(min(days, 3))
+                rows = self._query(
+                    "SELECT date, hour, SUM(revenue) rev, SUM(payout) pay, "
+                    "SUM(clicks) clk, SUM(conversions) conv FROM report_hour_new "
+                    "WHERE campaign_id=%s AND date BETWEEN %s AND %s "
+                    "GROUP BY date, hour ORDER BY date, hour",
+                    (cid, ds, de),
+                )
+                series = []
+                for r in rows:
+                    h = r.get("hour")
+                    ts = f"{r.get('date')} {int(h):02d}:00" if h is not None else r.get("date")
+                    rev = self._f(r.get("rev")); pay = self._f(r.get("pay"))
+                    clk = int(self._f(r.get("clk"))); conv = int(self._f(r.get("conv")))
+                    series.append({
+                        "timestamp": ts,
+                        "revenue": round(rev, 2),
+                        "profit": round(rev - pay, 2),
+                        "cvr_percent": round(conv / clk * 100, 2) if clk > 0 else 0.0,
+                        "margin_percent": round((rev - pay) / rev * 100, 2) if rev > 0 else 0.0,
+                        "clicks": clk,
+                        "conversions": conv,
+                    })
+            else:
+                kt = self._campaign_kpi_trend({"campaign_ids": cid})
+                series = []
+                for it in kt.get("items") or []:
+                    rev = self._f(it.get("revenue")); pay = self._f(it.get("payout"))
+                    clk = int(self._f(it.get("clicks"))); conv = int(self._f(it.get("conversions")))
+                    series.append({
+                        "timestamp": it.get("time_label"),
+                        "revenue": round(rev, 2),
+                        "profit": round(rev - pay, 2),
+                        "cvr_percent": it.get("cvr", 0.0),
+                        "margin_percent": it.get("margin_rate", 0.0),
+                        "clicks": clk,
+                        "conversions": conv,
+                    })
+            ds, de = self._recent_window(days if granularity != "hour" else min(days, 3))
+            return {
+                "campaign_id": cid,
+                "granularity": granularity,
+                "range": f"{ds} to {de}",
+                "data_points_count": len(series),
+                "time_series": series,
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.warning("fetch_campaign_time_series 失败 campaign=%s: %s", campaign_id, e)
+            return {"campaign_id": str(campaign_id), "granularity": granularity, "time_series": []}
+
     # ----- 实体 / 报表实现 -----
 
     def _advertiser_profile(self, aid: str) -> dict:
