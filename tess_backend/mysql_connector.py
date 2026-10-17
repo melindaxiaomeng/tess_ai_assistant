@@ -70,6 +70,7 @@ PATH_TABLES: dict = {
     "/advertisers": ["advertiser"],
     "/advertisers/": ["advertiser", "campaign"],  # 单档案（前缀匹配）
     "/report": ["report_day", "report_hour_new", "report_month"],
+    "/report/month": ["report_month", "advertiser"],
     "/campaigns": ["campaign"],
     "/campaign-kpi-trend": ["report_hour_new"],
     "/publishers": ["publisher"],
@@ -291,7 +292,7 @@ class MysqlDataConnector:
         """公开透传：与 TeensingDataConnector.api_get 同签名，返回已「解包」的业务 dict。
 
         已实现的路径由 MySQL 直出：
-          /advertisers, /advertisers/{id}, /report, /campaigns, /campaign-kpi-trend,
+          /advertisers, /advertisers/{id}, /report, /report/month, /campaigns, /campaign-kpi-trend,
           /campaign-detail, /replace-channels, /publishers, /campaign-quality,
           /campaign-quality/publisher, /campaign-ctit-etit, /advertisers/campaign-daily-kpi,
           /advertiser-publisher-pkg-maps, /mapping-publisher-channels, /publisher-campaign-blocks,
@@ -315,6 +316,9 @@ class MysqlDataConnector:
         if path == "/report":
             self.served_routes.append((path, "mysql"))
             return self._report(params)
+        if path == "/report/month":
+            self.served_routes.append((path, "mysql"))
+            return self._report_month(params)
         if path == "/campaigns":
             self.served_routes.append((path, "mysql"))
             return self._campaigns(params)
@@ -716,6 +720,96 @@ class MysqlDataConnector:
         rows = self._agg_campaigns_by_advertiser(aid, ds, de)
         start = (page - 1) * page_size
         return {"items": rows[start: start + page_size]}
+
+    def _report_month(self, params: dict) -> dict:
+        """模拟 GET /report/month：按月 + advertiser 聚合，返回 items + total_data。
+
+        report_month 原始行数巨大（如 202609 Melodong 有 2 万+ 行），直接全量返回会撑爆
+        prompt。这里按 advertiser_id 分组（通常 <100 行），既保证月度总计精确，又控制体积。
+        月度趋势由上层 finance_check 对 items 再按 month 汇总得到；total_data 为区间精确合计。
+        """
+        sd_raw = params.get("start_date") or params.get("end_date")
+        ed_raw = params.get("end_date") or sd_raw
+        if not sd_raw:
+            sd = ed = self._current_ym()
+        else:
+            try:
+                sd, ed = int(str(sd_raw)), int(str(ed_raw))
+            except (ValueError, TypeError):
+                return {"items": [], "total_data": {}}
+
+        where = ["date BETWEEN %s AND %s"]
+        args: list = [sd, ed]
+
+        aid = params.get("advertiser_id") or params.get("advertiser_ids")
+        if aid:
+            aids = [x for x in str(aid).split(",") if x.strip().isdigit()]
+            if aids:
+                where.append(f"advertiser_id IN ({','.join(['%s'] * len(aids))})")
+                args.extend(int(x) for x in aids)
+        cid = params.get("campaign_id") or params.get("campaign_ids")
+        if cid:
+            cids = [x for x in str(cid).split(",") if x.strip().isdigit()]
+            if cids:
+                where.append(f"campaign_id IN ({','.join(['%s'] * len(cids))})")
+                args.extend(int(x) for x in cids)
+
+        base_where = " AND ".join(where)
+        try:
+            items_sql = (
+                "SELECT date AS month, rm.advertiser_id, COALESCE(adv.name, '') AS advertiser_name, "
+                "SUM(revenue) AS revenue, SUM(scrub_revenue) AS scrub_revenue, "
+                "SUM(revenue - scrub_revenue) AS calc_revenue, "
+                "SUM(payout) AS payout, SUM(scrub_payout) AS scrub_payout, "
+                "SUM(payout - scrub_payout) AS calc_payout, "
+                "SUM(conversions) AS conversions, SUM(scrub_conversions) AS scrub_conversions "
+                "FROM report_month rm LEFT JOIN advertiser adv ON adv.id = rm.advertiser_id "
+                f"WHERE {base_where} "
+                "GROUP BY date, rm.advertiser_id ORDER BY date DESC, revenue DESC"
+            )
+            rows = self._query(items_sql, tuple(args))
+            items = [
+                {
+                    "month": str(r.get("month") or ""),
+                    "date": str(r.get("month") or ""),
+                    "advertiser_id": r.get("advertiser_id"),
+                    "advertiser_name": r.get("advertiser_name") or "",
+                    "revenue": round(self._f(r.get("revenue")), 4),
+                    "scrub_revenue": round(self._f(r.get("scrub_revenue")), 4),
+                    "calc_revenue": round(self._f(r.get("calc_revenue")), 4),
+                    "payout": round(self._f(r.get("payout")), 4),
+                    "scrub_payout": round(self._f(r.get("scrub_payout")), 4),
+                    "calc_payout": round(self._f(r.get("calc_payout")), 4),
+                    "conversions": int(self._f(r.get("conversions"))),
+                    "scrub_conversions": int(self._f(r.get("scrub_conversions"))),
+                }
+                for r in rows
+            ]
+
+            total_sql = (
+                "SELECT SUM(revenue) AS revenue, SUM(scrub_revenue) AS scrub_revenue, "
+                "SUM(revenue - scrub_revenue) AS calc_revenue, "
+                "SUM(payout) AS payout, SUM(scrub_payout) AS scrub_payout, "
+                "SUM(payout - scrub_payout) AS calc_payout, "
+                "SUM(conversions) AS conversions, SUM(scrub_conversions) AS scrub_conversions "
+                f"FROM report_month WHERE {base_where}"
+            )
+            total_rows = self._query(total_sql, tuple(args))
+            tr = total_rows[0] if total_rows else {}
+            total_data = {
+                "revenue": round(self._f(tr.get("revenue")), 4),
+                "scrub_revenue": round(self._f(tr.get("scrub_revenue")), 4),
+                "calc_revenue": round(self._f(tr.get("calc_revenue")), 4),
+                "payout": round(self._f(tr.get("payout")), 4),
+                "scrub_payout": round(self._f(tr.get("scrub_payout")), 4),
+                "calc_payout": round(self._f(tr.get("calc_payout")), 4),
+                "conversions": int(self._f(tr.get("conversions"))),
+                "scrub_conversions": int(self._f(tr.get("scrub_conversions"))),
+            }
+            return {"items": items, "total_data": total_data}
+        except Exception as e:
+            logger.exception("_report_month failed: %s", e)
+            return {"items": [], "total_data": {}}
 
     def _agg_campaigns_by_advertiser(self, aid, ds, de) -> list:
         """混合策略：report_month 已结月排名 + report_hour_new 回填 top-N 完整窗口。
