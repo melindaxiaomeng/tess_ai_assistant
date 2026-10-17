@@ -63,6 +63,34 @@ def campaign_status_label(status) -> Optional[str]:
         return None
 
 
+# 路径 -> 实际查的表（语义层 / 业务词典）：运营在「数据依据」面板看到的「查了哪些表」就来自这里。
+# 与 api_get 里 served_routes 记录的 path 一一对应；未知 path 不映射（留空，不臆造表名）。
+PATH_TABLES: dict = {
+    "/advertisers/campaign-daily-kpi": ["report_month", "report_hour_new"],
+    "/advertisers": ["advertiser"],
+    "/advertisers/": ["advertiser", "campaign"],  # 单档案（前缀匹配）
+    "/report": ["report_day", "report_hour_new", "report_month"],
+    "/campaigns": ["campaign"],
+    "/campaign-kpi-trend": ["report_hour_new"],
+    "/publishers": ["publisher"],
+    "/campaign-quality/publisher": ["report_hour_new"],
+    "/campaign-quality": ["report_hour_new", "event_postback_info"],
+    "/campaign-ctit-etit": ["report_hour_new", "event_postback_info", "click"],
+    "/overview/ranking": ["report_month"],
+    "/overview/ranking/fluctuation": ["report_month"],
+    "/overview/daily-kpi": ["report_day"],
+    "/global-settings": ["global_setting"],
+    "/advertiser-publisher-pkg-maps": ["advertiser_publisher_pkg_map"],
+    "/mapping-publisher-channels": ["mapping_publisher_channel"],
+    "/publisher-campaign-blocks": ["publisher_campaign_block", "system_publisher_campaign_block"],
+    "/replace-channels": ["replace_channel"],
+    "/users/options": ["user"],
+    "/overview/ranking/anomaly-warning": ["ad_traffic_warning_log", "publisher_warning"],
+    "/campaign-detail": ["campaign", "advertiser", "report_hour_new"],
+    "/campaign-compare": ["report_hour_new", "campaign"],
+}
+
+
 class MysqlDataConnector:
     """生产用：直连网盟 MySQL，按路径模拟 Teensing HTTP 报表接口返回。
 
@@ -339,6 +367,36 @@ class MysqlDataConnector:
                 base_url=get_platform_base_url(self.platform_id),
                 platform_token=_db_data_token(self.platform_id))
         return self._api_fallback.api_get(path, params, token, timeout)
+
+    # ----- 数据依据（provenance）透传：供前端「查了哪张表/哪些条件」折叠面板 -----
+    def build_provenance(self, params: Optional[dict] = None,
+                         route_source: Optional[str] = None,
+                         date_or_month: Optional[str] = None) -> dict:
+        """汇总本次请求命中的取数路径与表，生成可透传给前端的依据块。
+
+        纯只读、纯确定性（served_routes 已逐笔记录 mysql/api 命中），LLM 不碰，
+        符合三层死锁「数据/路由由死锁层攥死」的设计，不会引入幻觉。
+        """
+        routes = [{"path": p, "source": s} for (p, s) in self.served_routes]
+        tables: list = []
+        for (p, _s) in self.served_routes:
+            # 先精确匹配，再前缀匹配（如 /advertisers/123 命中 /advertisers/）
+            for t in (PATH_TABLES.get(p) or PATH_TABLES.get(next((k for k in PATH_TABLES if p.startswith(k) and k.endswith("/")), None)) or []):
+                if t not in tables:
+                    tables.append(t)
+        entities: dict = {}
+        if params:
+            for _k in ("campaign_id", "advertiser_id", "publisher_id",
+                       "package_name", "owner_user_id"):
+                if params.get(_k) is not None:
+                    entities[_k] = params[_k]
+        return {
+            "routes": routes,
+            "tables": tables,
+            "entities": entities,
+            "route_source": route_source,
+            "date_or_month": date_or_month,
+        }
 
     # ----- 实体 / 报表实现 -----
 

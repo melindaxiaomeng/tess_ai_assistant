@@ -2676,12 +2676,22 @@ def process_question(
             answer = llm.complete(ASK_SYSTEM_PROMPT, user_prompt, json_mode=False)
         except LLMUnavailableError:
             answer = _llm_busy_msg
+    # 数据依据（provenance）：仅 MysqlDataConnector 具备，API 兜底连接器无此方法则跳过
+    provenance = None
+    _bp = getattr(connector, "build_provenance", None)
+    if callable(_bp):
+        provenance = _bp(
+            params=params,
+            route_source=route_source,
+            date_or_month=summary_extra.get("date_or_month"),
+        )
     context_summary = {
         "endpoint": "/tess/ask",
         "errors": ctx.get("errors", []),
         "operator_id": operator_id,
         "token_mode": token_mode,
         "llm_usage": llm_last_usage(llm),  # 本次 LLM 调用用量（计费/成本分析）
+        "provenance": provenance,
         **summary_extra,
     }
     return {

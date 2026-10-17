@@ -13,6 +13,7 @@ import hmac
 import os
 import re
 import time
+import uuid
 import json
 import threading
 from queue import Queue, Empty
@@ -637,6 +638,12 @@ def post_ask(payload: dict, request: Request):
             params[_k] = (payload or {}).get(_k)
     # —— 多轮会话：chat_id 存在则加载历史上下文并回退上一轮实体 ——
     chat_id = (payload or {}).get("chat_id")
+    # 聊天回答反馈锚点：有 chat_id 用会话级 stable id，否则一次性 uuid；
+    # 回写进 context_summary.event_id，前端 👎 时原样回传 /tess/feedback。
+    event_id = (
+        f"chat:{chat_id}:{uuid.uuid4().hex[:8]}" if chat_id
+        else f"ask:{uuid.uuid4().hex[:8]}"
+    )
     history_text, history_entities = (None, None)
     if chat_id:
         history_text, history_entities = load_history(chat_id)
@@ -670,7 +677,9 @@ def post_ask(payload: dict, request: Request):
 
     def _after(res):
         """取数完成后统一做：多轮落库 + 审计（流式/非流式共用）。"""
-        cs = res.get("context_summary", {})
+        cs = res.setdefault("context_summary", {})
+        # 把反馈锚点 event_id 带回前端（👎 时回传 /tess/feedback）
+        cs["event_id"] = event_id
         if chat_id:
             try:
                 _ents = extract_entities(question, params)
@@ -1394,15 +1403,22 @@ def joint_diagnose(payload: dict = None) -> dict:
 def feedback(payload: dict) -> dict:
     """抽屉底部 👍/👎 的回传入口。
 
-    payload: { event_id, vote(accurate|inaccurate), tess_status, confidence,
+    payload: { event_id, vote(accurate|inaccurate), tess_status?, confidence?,
                 corrected_root_cause?, corrected_contributor_id? }
+    - 诊断流：传完整 tess_status / confidence（用于误判率度量）。
+    - 聊天流（/tess/ask 回答）：仅传 event_id + vote 即可，tess_status 默认
+      "ANSWERED"、confidence 默认 0.0，不进入误判率统计但照常落盘。
     """
     try:
+        if not payload.get("event_id"):
+            raise HTTPException(status_code=422, detail="缺少字段：event_id")
+        if payload.get("vote") not in ("accurate", "inaccurate"):
+            raise HTTPException(status_code=422, detail="vote 必须为 accurate|inaccurate")
         rec = STORE.record_feedback(
             event_id=payload["event_id"],
             vote=payload["vote"],
-            tess_status=payload["tess_status"],
-            confidence=float(payload["confidence"]),
+            tess_status=payload.get("tess_status", "ANSWERED"),
+            confidence=float(payload.get("confidence", 0.0)),
             corrected_root_cause=payload.get("corrected_root_cause"),
             corrected_contributor_id=payload.get("corrected_contributor_id"),
         )

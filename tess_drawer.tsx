@@ -13,7 +13,7 @@
  * 依赖：React 18+。样式使用 Tailwind 类名（可按你们设计令牌替换）。
  */
 
-import React from "react";
+import React, { useState } from "react";
 
 // ---------------------------------------------------------------------------
 // 类型（与后端 TESS_OUTPUT_SCHEMA / TESS_INPUT_SCHEMA 对齐）
@@ -57,6 +57,11 @@ export interface TessDrawerProps {
   llmOutput: TessOutput;
   inputData: TessInput;
   onCallHuman?: () => void;
+  // P3：反馈锚点 + 回传地址（诊断流由后端 /tess/diagnose 返回 event_id；聊天流一般不用此抽屉）
+  eventId?: string;
+  backend?: string; // 如 http://<Tess服务器IP>:8080
+  apiKey?: string; // X-API-Key
+  platformId?: string; // X-Platform-Id
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +83,10 @@ export const TessDiagnosticDrawer: React.FC<TessDrawerProps> = ({
   llmOutput,
   inputData,
   onCallHuman,
+  eventId,
+  backend,
+  apiKey,
+  platformId,
 }) => {
   const {
     status,
@@ -108,6 +117,36 @@ export const TessDiagnosticDrawer: React.FC<TessDrawerProps> = ({
     matchedContributor?.dimension_type ?? ""
   ).toLowerCase();
   const routeBase = MODULE_ROUTE_MAP[dimTypeKey] ?? "/overview?id=";
+
+  // P3：👍/👎 反馈状态 + 纠错回传
+  const [vote, setVote] = useState<string | null>(null);
+  const [corrOpen, setCorrOpen] = useState(false);
+  const [corrText, setCorrText] = useState("");
+  const sendFb = async (v: "accurate" | "inaccurate") => {
+    if (!backend || !eventId) return;
+    setVote(v);
+    try {
+      const h: Record<string, string> = { "Content-Type": "application/json" };
+      if (apiKey) h["X-API-Key"] = apiKey;
+      if (platformId) h["X-Platform-Id"] = platformId;
+      await fetch(`${backend.replace(/\/+$/, "")}/tess/feedback`, {
+        method: "POST",
+        headers: h,
+        body: JSON.stringify({
+          event_id: eventId,
+          vote: v,
+          tess_status: status,
+          confidence,
+          corrected_root_cause: v === "inaccurate" ? corrText || undefined : undefined,
+        }),
+      });
+    } catch {
+      /* 反馈落库失败不影响诊断展示 */
+    } finally {
+      setCorrOpen(false);
+      setCorrText("");
+    }
+  };
 
   return (
     <div className="tess-drawer-content p-4 space-y-4">
@@ -210,6 +249,96 @@ export const TessDiagnosticDrawer: React.FC<TessDrawerProps> = ({
           </button>
         )}
       </div>
+
+      {/* 6. P3：👍/👎 纠错 + 可折叠「诊断依据」 */}
+      {eventId && (
+        <div className="pt-3 border-t space-y-2">
+          <div className="flex items-center gap-2 text-sm">
+            {!vote ? (
+              <>
+                <span className="text-gray-500">这个诊断准吗？</span>
+                <button
+                  className="border border-gray-300 rounded px-2 py-1 hover:bg-gray-100"
+                  onClick={() => sendFb("accurate")}
+                >
+                  👍 准
+                </button>
+                <button
+                  className="border border-gray-300 rounded px-2 py-1 hover:bg-gray-100"
+                  onClick={() => setCorrOpen(true)}
+                >
+                  👎 不准
+                </button>
+              </>
+            ) : (
+              <span className="text-gray-500">
+                已反馈：{vote === "accurate" ? "准确 👍" : "不准确 👎"}
+              </span>
+            )}
+          </div>
+
+          {corrOpen && (
+            <div className="p-2 border rounded bg-amber-50 space-y-2">
+              <textarea
+                className="w-full border border-gray-300 rounded px-2 py-1 text-xs"
+                rows={2}
+                placeholder="哪里不对？（可选，帮助技术小哥定位）"
+                value={corrText}
+                onChange={(e) => setCorrText(e.target.value)}
+              />
+              <div className="flex gap-2">
+                <button
+                  className="bg-red-600 text-white rounded px-2 py-1 text-xs hover:bg-red-700"
+                  onClick={() => sendFb("inaccurate")}
+                >
+                  提交纠错
+                </button>
+                <button
+                  className="border border-gray-300 rounded px-2 py-1 text-xs hover:bg-gray-100"
+                  onClick={() => {
+                    setCorrOpen(false);
+                    setCorrText("");
+                  }}
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          )}
+
+          <details className="group">
+            <summary className="cursor-pointer text-gray-400 hover:text-gray-600 select-none text-sm">
+              🔍 诊断依据（状态 / 置信度 / 严重度 / 事件）
+            </summary>
+            <div className="mt-1 p-2 border rounded bg-gray-50 text-gray-600 text-xs leading-relaxed space-y-1">
+              <div className="flex gap-2">
+                <span className="text-gray-400 w-16 shrink-0">状态</span>
+                <span>{status}</span>
+              </div>
+              <div className="flex gap-2">
+                <span className="text-gray-400 w-16 shrink-0">置信度</span>
+                <span>{(confidence * 100).toFixed(0)}%</span>
+              </div>
+              <div className="flex gap-2">
+                <span className="text-gray-400 w-16 shrink-0">严重度</span>
+                <span>{severity}</span>
+              </div>
+              <div className="flex gap-2">
+                <span className="text-gray-400 w-16 shrink-0">事件ID</span>
+                <span className="break-all">{eventId}</span>
+              </div>
+              {matchedContributor && (
+                <div className="flex gap-2">
+                  <span className="text-gray-400 w-16 shrink-0">核心维度</span>
+                  <span>
+                    {matchedContributor.dimension_value}（{matchedContributor.dimension_type}）
+                  </span>
+                </div>
+              )}
+            </div>
+          </details>
+        </div>
+      )}
     </div>
   );
 };

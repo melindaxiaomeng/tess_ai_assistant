@@ -21,6 +21,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [tamper, setTamper] = useState(false); // 模拟 LLM 注入伪造字段
+  const [eventId, setEventId] = useState<string | undefined>(); // 诊断反馈锚点
 
   const appendLog = (m: string) =>
     setLogs((l) => [...l, `[${new Date().toLocaleTimeString()}] ${m}`]);
@@ -78,6 +79,7 @@ export default function App() {
     } catch (e: any) {
       return appendLog("输入 JSON 解析失败：" + e.message);
     }
+    setEventId(payload?.anomaly_metadata?.event_id);
     setLoading(true);
     appendLog("POST /tess/diagnose …");
     try {
@@ -105,6 +107,7 @@ export default function App() {
   function offlineDemo() {
     setLlmOutput(MOCK_OUTPUT as TessOutput);
     setInputData(SAMPLE_INPUT as TessInput);
+    setEventId((SAMPLE_INPUT as any).anomaly_metadata?.event_id);
     appendLog("离线演示：使用内置样例渲染（无需后端）");
   }
 
@@ -244,7 +247,14 @@ export default function App() {
             <div className="px-4 py-2 border-b bg-gray-50 text-xs text-gray-500">
               抽屉预览（TessDiagnosticDrawer 组件实际渲染）
             </div>
-            <TessDiagnosticDrawer llmOutput={shownOutput} inputData={inputData} />
+            <TessDiagnosticDrawer
+              llmOutput={shownOutput}
+              inputData={inputData}
+              eventId={eventId}
+              backend={backend}
+              apiKey={apiKey}
+              platformId={platformId}
+            />
           </div>
         </div>
       </div>
