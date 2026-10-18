@@ -1178,12 +1178,19 @@ def fetch_bi_analysis_context(
         # /report 不带实体过滤恒为空，不能再走那条路。
         daily_raw, err_r = _safe_api_get(connector, "/overview/daily-kpi", token=token)
         daily_raw = daily_raw if isinstance(daily_raw, list) else []
-        try:
-            days = int(params.get("days"))
-        except (TypeError, ValueError):
-            days = 7
-        end = today.strftime("%Y-%m-%d")
-        start = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+        # 优先用问题抽取到的日期范围（如「本月」-> 当月 1 号~今天），否则默认近 7 日
+        ds = params.get("date_start")
+        de = params.get("date_end")
+        if ds and de:
+            start, end = str(ds), str(de)
+            days = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days + 1
+        else:
+            try:
+                days = int(params.get("days"))
+            except (TypeError, ValueError):
+                days = 7
+            end = today.strftime("%Y-%m-%d")
+            start = (today - timedelta(days=days)).strftime("%Y-%m-%d")
 
         daily, tot = [], {"revenue": 0.0, "profit": 0.0, "payout": 0.0, "clicks": 0, "conversions": 0}
         for it in daily_raw:
@@ -1796,6 +1803,16 @@ _ANALYSIS_KEYWORDS: list = [
     ("advertisers_missing_owner", ["没有配置am", "未配置am", "哪些广告主没有", "未分配am",
                                    "am为空", "没有负责人", "没有配置负责人", "缺am", "没有am"]),
     ("scaling_capacity", ["容量", "cap", "放量空间", "还能放", "预算上限", "放量容量", "容量评估"]),
+    # account_profit_rollup 必须排在 finance_check 之前：两者都含「毛利/利润」语义，
+    # 但 finance_check 依赖 report_month 月度预聚合表——当月（未结账）返回全 0；
+    # 「本月利润/本月毛利润」等当前月口径必须走 account_profit_rollup（/overview/daily-kpi
+    # 含当月迄今数据），否则会判「数据不足」。仅「对账/月报/毛利趋势」等仍走 finance_check。
+    ("account_profit_rollup", ["最近两周", "近两周", "近两周利润", "最近两周利润", "两周利润",
+                               "两周的", "近期利润", "利润汇总", "总利润",
+                               "整体利润", "全账户利润", "账户利润", "利润总计", "利润总览",
+                               "本月利润", "本月利润多少", "本月利润是多少", "利润多少",
+                               "本月毛利润", "本月的利润", "本月利润吗",
+                               "这个月利润", "上月利润", "上月毛利润", "毛利润"]),
     ("finance_check", ["对账", "毛利", "结算", "营收核对", "对账差异", "月报", "财务", "month", "invoice",
                        "本月营收", "本月支出", "月度营收", "月度支出", "营收与支出", "营收趋势",
                        "支出趋势", "营收支出", "收支趋势", "月度收支"]),
@@ -1811,9 +1828,6 @@ _ANALYSIS_KEYWORDS: list = [
     # 优先命中；纯"昨天营收怎么样"（不含排名词）仍走 daily_summary。
     ("campaign_ranking", ["利润环比下滑", "利润下滑", "营收下滑", "环比下滑", "下滑最快", "跌幅最大", "掉得最快", "降幅最大", "哪个campaign", "哪个活动", "哪个 campaign", "谁掉得最快", "利润下降最快", "营收下降最快"]),
     ("daily_summary", ["复盘", "每日", "昨日", "昨天", "日报", "今日表现", "daily summary"]),
-    ("account_profit_rollup", ["最近两周", "近两周", "近两周利润", "最近两周利润", "两周利润",
-                               "两周的", "近期利润", "利润汇总", "总利润",
-                               "整体利润", "全账户利润", "账户利润", "利润总计", "利润总览"]),
     ("scaling_opportunity", ["放量", "扩量", "加预算", "增长机会", "潜力", "机会", "加大投放", "scale"]),
     ("campaign_detail", ["ctit", "etit", "漏斗", "转化时间", "事件质量", "活动详情", "单活动", "campaign详情"]),
     # am_leaderboard 必须排在 advertiser_deepdive 之前：「哪个AM负责的客户」会命中 advertiser_deepdive 的「客户」词
@@ -1910,6 +1924,14 @@ def _extract_date_range(q: str):
     """
     now = datetime.now()
     year = now.year
+    # 相对词：本月 / 当月 / 这个月 -> 当月 1 号 ~ 今天（含当月迄今数据）
+    if re.search(r"本\s*月|当\s*月|这\s*个\s*月", q):
+        return f"{year}-{now.month:02d}-01", now.strftime("%Y-%m-%d")
+    # 上月 / 上个月 -> 上一自然月整月
+    if re.search(r"上\s*个?\s*月", q):
+        first = now.replace(day=1)
+        last_prev = first - timedelta(days=1)
+        return f"{last_prev.year}-{last_prev.month:02d}-01", last_prev.strftime("%Y-%m-%d")
     # 显式年份：2026年7月、2026年7月到10月
     ym = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月", q)
     year_used = int(ym.group(1)) if ym else year
@@ -2547,6 +2569,12 @@ def process_question(
             analysis_type = ent_type
             route_source = "entity"
         else:
+            # 无实体时仍把抽取到的时间范围灌入 params（如「本月利润」-> 当月 1 号~今天），
+            # 供 account_profit_rollup 等深度类型按日期归集；否则只回退浅层全局上下文。
+            if ents.get("date_start"):
+                params["date_start"] = ents["date_start"]
+            if ents.get("date_end"):
+                params["date_end"] = ents["date_end"]
             inferred = infer_analysis_type(question)
             if inferred:
                 all_inferred = infer_all_analysis_types(question)
