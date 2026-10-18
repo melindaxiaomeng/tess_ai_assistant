@@ -945,6 +945,57 @@ def fetch_bi_analysis_context(
     # 场景 9：跨 Campaign 排名 / 诊断（"哪个 Campaign 利润环比下滑最快"）
     # ---------------------------------------------------------------
     elif analysis_type == "campaign_ranking":
+        # —— 日级意图（今日/今天/昨天/当日/日环比）→ 走 report_hour_new 日环比，而非 fluctuation 月度环比 ——
+        _q = (params.get("question") or "").lower()
+        _daily_kw = ("今日", "今天", "当日", "当天", "日环比", "日跌幅", "日下滑", "日涨跌", "今日", "昨天", "昨日")
+        _is_daily = any(k in _q for k in _daily_kw)
+        if _is_daily:
+            _anchor = today.strftime("%Y-%m-%d")
+            if ("昨日" in _q) or ("昨天" in _q):
+                _anchor = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+            _daily_ctx = (connector._report_daily_campaign_change(_anchor)
+                          if hasattr(connector, "_report_daily_campaign_change")
+                          else {"items": []})
+            _ditems = _daily_ctx.get("items") or []
+            _d_curr = _daily_ctx.get("date_curr")
+            _d_prev = _daily_ctx.get("date_prev")
+
+            def _mk_daily(it):
+                return {
+                    "campaign_id": _fmt_id(it.get("campaign_id")),
+                    "campaign_name": it.get("campaign_name", ""),
+                    "revenue_change": it.get("revenue_change"),
+                    "profit_change": it.get("profit_change"),
+                    "revenue_change_pct": it.get("revenue_change_pct"),
+                    "profit_change_pct": it.get("profit_change_pct"),
+                    "revenue": it.get("revenue"),
+                    "profit": it.get("profit"),
+                    "margin": it.get("margin"),
+                }
+
+            _enriched = [_mk_daily(x) for x in _ditems]
+            _falling = sorted(_enriched, key=_change_metric)[:10]
+            _rising = sorted(_enriched, key=lambda x: -_change_metric(x))[:10]
+            _intraday = (_d_curr == today.strftime("%Y-%m-%d"))
+            _note = (
+                f"日环比涨跌榜由 report_hour_new 按 (date,campaign) 聚合得出，对比 {_d_prev} → {_d_curr} "
+                f"逐 Campaign 利润/营收日环比；排序优先利润环比(profit_change_pct)，缺失时退营收环比。"
+            )
+            if _intraday:
+                _note += f" 注意：{_d_curr} 为当日且数据仍在回写，今日为盘中值，日环比仅供盘中参考。"
+            _errs = []
+            if not _ditems:
+                _errs.append("report_hour_new 近两日均无 campaign 日级数据（可能数据延迟）")
+            return {
+                "analysis_type": "campaign_ranking",
+                "daily": True,
+                "date_curr": _d_curr,
+                "date_prev": _d_prev,
+                "metric_note": _note + " falling_top 已按环比变化升序排列，[0] 即下滑最快的 Campaign。",
+                "rising_top": _rising,
+                "falling_top": _falling,
+                "errors": _errs,
+            }
         # fluctuation 是平台唯一的「全量 campaign 涨跌榜」免过滤来源；
         # /report 不带 campaign_ids 等过滤时返回空，无法单独算全量榜。
         # 因此：先用 fluctuation 拿全量榜（id + rising 完整信息），再用 /report?campaign_ids
@@ -1697,7 +1748,10 @@ def _build_user_prompt(analysis_type: str, ctx: dict) -> str:
         "advertiser_deepdive": "以下是广告主档案与日 KPI 趋势，请分析该广告主的整体消耗与旗下活动表现。",
         "traffic_policy_check": "以下是该渠道/活动的映射、替换与屏蔽规则，请核查流量策略配置是否完整、是否存在风险。",
         "kpi_compare": "以下是该 Campaign 的指标趋势与同期对比，请分析波动原因与环比变化。",
-        "campaign_ranking": "以下是各 Campaign 的环比涨跌榜（rising/falling，字段含 campaign_id、campaign_name、revenue、revenue_change、profit_change）。profit_change 已由 /report 按昨日 vs 前日回补真实利润环比并优先用于排序；只有该 campaign 无利润数据时才退到 revenue_change。请找出利润环比下滑最快的 Campaign，给出 campaign_id、名称、profit_change、revenue_change 与可能原因。",
+        "campaign_ranking": "以下是各 Campaign 的环比涨跌榜（rising/falling，字段含 campaign_id、campaign_name、revenue、revenue_change、profit_change）。"
+        "若上下文含 daily=true：这是『日环比』——由 report_hour_new 按 (date,campaign) 聚合得出，对比 date_prev → date_curr 两天逐 Campaign 利润/营收日环比；"
+        "排序优先看 profit_change_pct（利润环比百分比），缺失时退 revenue_change_pct。请找出利润环比下滑最快的 Campaign，给出 campaign_id、名称、profit_change_pct、revenue_change_pct 与可能原因。"
+        "若不含 daily 字段：这是 fluctuation 的『月度环比』（最近两已结月），同理优先利润环比。",
         "pkg_deepdive": "以下是该包名在系统中的归属（广告主/渠道映射）与近 7 日跨 Campaign 营收/利润/Margin 表现，请分析该包的跑量情况、主要投放渠道与转化效率，并说明数据口径（来自 pkg-maps 归因 + /report 聚合，非单 campaign 视角）。",
         "owner_performance": "以下是该 AM/BD 负责人名下所有广告主近 7 日的消耗与利润表现，请汇总其业绩（总营收/利润、头部广告主、异常项），并说明数据口径（/advertisers?am|bd= 解析名下广告主 + /report 聚合）。",
         "cross_dimension": "以下是多个实体维度的交叉切片（近 7 日，各维度取交集 AND）。请围绕【交叉维度】作答：先说明本次是哪几个维度交叉、过滤后样本量，再给出联合视角下的营收/利润/Margin、头部明细（用表格），并指出交叉后暴露的结构性问题（如某广告主在某渠道集中、某负责人客户转化差）。数据口径：package 经 pkg-maps 归因到广告主、owner 经 /advertisers?am|bd= 归因到名下广告主，再与显式 advertiser_id 取交集后联合打 /report。",
@@ -2544,6 +2598,7 @@ def process_question(
                 elif kind == "publisher":
                     ents["publisher_id"] = str(bare)
         params = params or {}  # 确保后续 {**params, ...} 字典展开安全（process_question 默认 params=None）
+        params["question"] = question  # 透传原始问题给下游取数器（如 campaign_ranking 判断「今日/昨天」走日环比）
         # —— 多轮指代消解：本轮完全未显式抽取到任何实体时，回退沿用上一轮解析出的实体 ——
         # 仅「填充」不「覆盖」：若本轮已带实体则以其为准，避免误改写用户显式意图或误触发 cross_dimension。
         if history_entities:

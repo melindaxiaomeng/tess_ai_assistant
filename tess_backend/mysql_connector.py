@@ -906,6 +906,65 @@ class MysqlDataConnector:
         start = (page - 1) * page_size
         return {"items": all_rows[start: start + page_size]}
 
+    def _report_daily_campaign_change(self, anchor: str) -> dict:
+        """日环比涨跌榜：report_hour_new 按 (date, campaign) 聚合，对比最近两天（anchor 当天 vs 前一天）
+        的逐 Campaign 利润/营收，计算日环比(profit_change / revenue_change)。
+        供「今日/昨天 哪个 Campaign 利润环比下滑最快」这类『日级』问法——与 fluctuation 的月度环比区分。
+
+        anchor 形如 'YYYY-MM-DD'（通常 today 或 yesterday）。
+        返回 {items:[{campaign_id, campaign_name, revenue, profit, revenue_change, profit_change,
+                      revenue_change_pct, profit_change_pct, margin}], date_curr, date_prev}。
+        """
+        try:
+            a = datetime.strptime(str(anchor), "%Y-%m-%d")
+            d0 = (a - timedelta(days=3)).strftime("%Y-%m-%d")  # 取近 4 天，挑最近两个『有数据』的日期对比
+            rows = self._query_across(
+                "SELECT campaign_id, date, SUM(revenue) rev, SUM(payout) pay "
+                "FROM report_hour_new WHERE date >= %s GROUP BY campaign_id, date",
+                (d0,),
+            )
+            by_c: dict = {}
+            dates_present: set = set()
+            for r in rows:
+                cid = str(r.get("campaign_id"))
+                d = str(r.get("date"))
+                dates_present.add(d)
+                rev = self._f(r.get("rev"))
+                pay = self._f(r.get("pay"))
+                by_c.setdefault(cid, {})[d] = (rev, pay)
+            if len(dates_present) < 2:
+                return {"items": [], "date_curr": anchor, "date_prev": None}
+            sd = sorted(dates_present)
+            d_curr, d_prev = sd[-1], sd[-2]
+            out = []
+            for cid, m in by_c.items():
+                if d_curr not in m or d_prev not in m:
+                    continue  # 两日都要有数才算『环比』
+                rev_c, pay_c = m[d_curr]
+                rev_p, pay_p = m[d_prev]
+                profit_c = rev_c - pay_c
+                profit_p = rev_p - pay_p
+                rc = rev_c - rev_p
+                pc = profit_c - profit_p
+                item = {
+                    "campaign_id": int(cid) if cid.isdigit() else cid,
+                    "revenue": round(rev_c, 2),
+                    "profit": round(profit_c, 2),
+                    "revenue_change": round(rc, 2),
+                    "profit_change": round(pc, 2),
+                }
+                item["revenue_change_pct"] = round(rc / rev_p * 100, 2) if rev_p else (100.0 if rev_c else 0.0)
+                item["profit_change_pct"] = round(pc / profit_p * 100, 2) if profit_p else (100.0 if profit_c else 0.0)
+                item["margin"] = round(profit_c / rev_c * 100, 2) if rev_c > 0 else 0.0
+                out.append(item)
+            names = self._campaign_meta([str(i["campaign_id"]) for i in out])
+            for i in out:
+                i["campaign_name"] = (names.get(str(i["campaign_id"])) or {}).get("name") or ""
+            return {"items": out, "date_curr": d_curr, "date_prev": d_prev}
+        except Exception as e:
+            logger.exception("_report_daily_campaign_change failed: %s", e)
+            return {"items": [], "date_curr": anchor, "date_prev": None}
+
     def _campaigns(self, params: dict) -> dict:
         """模拟 GET /campaigns：按 id 精确回目录（用于补缺失 campaign 的 status / config）。
 
