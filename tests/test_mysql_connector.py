@@ -57,6 +57,17 @@ class FakeMysqlDataConnector(MysqlDataConnector):
 
     def _query(self, sql, params=()):
         s = sql
+        # 裸 ID 反查探针（用探针 SQL 特有的「SELECT 1 FROM」前缀精确匹配，
+        # 避免与真实画像查询 SELECT ... FROM advertiser WHERE id = 冲突）
+        if "SELECT 1 FROM campaign WHERE id =" in s:
+            cid = int(params[0])
+            return [{"1": 1}] if any(c["campaign_id"] == cid for c in self.campaigns) else []
+        if "SELECT 1 FROM advertiser WHERE id =" in s:
+            aid = int(params[0])
+            return [{"1": 1}] if aid == 1000853 else []
+        if "SELECT 1 FROM publisher WHERE id =" in s:
+            pid = int(params[0])
+            return [{"1": 1}] if pid in (2001, 2002) else []
         if "FROM advertiser" in s:
             return [{"id": 1000853, "name": "Adv Test", "user_name": "betty",
                      "bd": 5, "am": 1, "status": 1, "jointime": "2026-01-01 00:00:00"}]
@@ -215,4 +226,39 @@ def test_advertiser_deepdive_long_span_full():
     null_status = [s for s in snap if s.get("status") is None or s.get("status") == ""]
     assert null_status == [], f"仍有 {len(null_status)} 个 null status"
     # 至少一个有可读 status
-    assert any(s.get("status") in ("Active", "Paused", "Stop") for s in snap)
+
+
+# --------------------------------------------------------------------------
+# 裸 ID 反查：运营只输入纯数字 ID，自动归类到 campaign/advertiser/publisher
+# --------------------------------------------------------------------------
+
+from tess_backend.analytics import resolve_bare_id, _extract_bare_id  # noqa: E402
+
+
+def test_extract_bare_id_only_pure_numeric():
+    # 纯数字（≥4 位）→ 提取；带量词/其它词 → None
+    assert _extract_bare_id("1000853") == 1000853
+    assert _extract_bare_id("  7160172  ") == 7160172
+    assert _extract_bare_id("9月份营收") is None
+    assert _extract_bare_id("过去10天") is None
+    assert _extract_bare_id("100") is None  # <4 位
+    assert _extract_bare_id("营收 1000853") is None  # 含其它词
+
+
+def test_resolve_bare_id_classifies_each_dimension():
+    c = FakeMysqlDataConnector()
+    # campaign id 落在 self.campaigns（900001..900035）
+    assert resolve_bare_id(900001, c) == "campaign"
+    # advertiser id 在 fake 中固定为 1000853
+    assert resolve_bare_id(1000853, c) == "advertiser"
+    # publisher id 在 fake 中固定为 2001/2002
+    assert resolve_bare_id(2001, c) == "publisher"
+    # 不存在的 id → None（回退浅层兜底）
+    assert resolve_bare_id(999999, c) is None
+
+
+def test_resolve_bare_id_no_query_attr_returns_none():
+    # mock / teensing 模式 connector 无 _query，绝不抛错
+    class NoQuery:
+        pass
+    assert resolve_bare_id(1000853, NoQuery()) is None

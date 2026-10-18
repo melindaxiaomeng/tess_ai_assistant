@@ -2148,6 +2148,47 @@ def _find_in_list(connector, path, name, token, id_field="id", name_field="name"
     return None
 
 
+def _extract_bare_id(question: str):
+    """从问题中抽取「裸 ID」：运营只输入一串纯数字（无 adv/pub/camp/广告主/渠道 等前缀）。
+
+    返回 int（纯数字、≥4 位、问题整体就是这串数字）；否则返回 None。
+    用 ≥4 位 + 整体纯数字，避免误吞「过去10天」「9月份」之类带量词的问法。
+    """
+    if not question:
+        return None
+    m = re.fullmatch(r"\s*(\d{4,})\s*", question.strip())
+    return int(m.group(1)) if m else None
+
+
+def resolve_bare_id(raw_id, connector, token: Optional[str] = None) -> Optional[str]:
+    """反查一个纯数字 ID 属于哪一维实体：campaign / advertiser / publisher。
+
+    用于运营只输入裸 ID（无维度前缀）的场景。三张主表 id 均为 int 且 ID 空间不重叠，
+    命中即唯一，无需运营确认。任一维度查询异常被隔离（单表报错不影响其它维度探测），
+    全部失败/无命中则返回 None（交由上层回退浅层全局兜底）。
+
+    仅 mysql 模式（connector 带 _query）生效；mock / teensing 模式直接返回 None。
+    """
+    if raw_id is None or not hasattr(connector, "_query"):
+        return None
+    probes = [
+        ("campaign", "SELECT 1 FROM campaign WHERE id = %s LIMIT 1"),
+        ("advertiser", "SELECT 1 FROM advertiser WHERE id = %s LIMIT 1"),
+        ("publisher", "SELECT 1 FROM publisher WHERE id = %s LIMIT 1"),
+    ]
+    try:
+        rid = int(raw_id)
+    except (TypeError, ValueError):
+        return None
+    for kind, sql in probes:
+        try:
+            if connector._query(sql, (rid,)):
+                return kind
+        except Exception:  # noqa: BLE001  单维异常隔离，不阻断其它维度
+            continue
+    return None
+
+
 def _coerce_owner_id(v):
     """把 advertiser 记录里的 am/bd 字段归一化为整型 user id（或 None）。
 
@@ -2440,6 +2481,20 @@ def process_question(
         # ② 五维实体抽取（优先级高于关键词表）：Campaign/Advertiser/Publisher/Package/Owner
         ents = extract_entities(question, params)
         ents = resolve_entities(ents, connector, token)  # 名称/代号 -> 可下钻 id
+        # ②.5 裸 ID 反查：运营只输入纯数字 ID（无 adv/pub/camp/广告主/渠道 等前缀）时，
+        # 反查它属于 advertiser / publisher / campaign 哪一维并自动归类（ID 空间不重叠，命中唯一，
+        # 无需运营确认）。ID 不存在或全部探测失败则保持 None，继续走下方浅层兜底。
+        if not any(ents.get(k) for k in ("campaign_id", "advertiser_id", "publisher_id",
+                                         "package_name", "owner_user_id")):
+            bare = _extract_bare_id(question)
+            if bare is not None:
+                kind = resolve_bare_id(bare, connector, token)
+                if kind == "campaign":
+                    ents["campaign_id"] = str(bare)
+                elif kind == "advertiser":
+                    ents["advertiser_id"] = str(bare)
+                elif kind == "publisher":
+                    ents["publisher_id"] = str(bare)
         params = params or {}  # 确保后续 {**params, ...} 字典展开安全（process_question 默认 params=None）
         # —— 多轮指代消解：本轮完全未显式抽取到任何实体时，回退沿用上一轮解析出的实体 ——
         # 仅「填充」不「覆盖」：若本轮已带实体则以其为准，避免误改写用户显式意图或误触发 cross_dimension。
