@@ -896,6 +896,7 @@ class MysqlDataConnector:
                     "date": r.get("date"),
                     "revenue": round(rev, 4),
                     "payout": round(pay, 4),
+                    "profit": round(rev - pay, 4),
                     "clicks": int(clk),
                     "conversions": int(conv),
                     "cr": round(cr, 4),
