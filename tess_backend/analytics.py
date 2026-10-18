@@ -976,13 +976,24 @@ def fetch_bi_analysis_context(
         def _enrich(item):
             cid = _fmt_id(item.get("campaign_id"))
             p = profit_map.get(cid, {})
+            # 利润环比优先用 /report 按日回补的真实值；回补不到时直接用 fluctuation 月度榜同口径的 profit_change。
+            # revenue/profit 绝对值同理，避免停投 campaign 在 report_hour_new 无近两日数据导致全空。
+            profit_change = p.get("profit_change")
+            if profit_change is None:
+                profit_change = item.get("profit_change")
+            revenue = p.get("revenue")
+            if revenue is None:
+                revenue = item.get("revenue")
+            profit = p.get("profit")
+            if profit is None:
+                profit = item.get("profit")
             return {
                 "campaign_id": cid,
                 "campaign_name": p.get("campaign_name") or item.get("campaign_name", ""),
                 "revenue_change": item.get("revenue_change", p.get("revenue_change")),
-                "profit_change": p.get("profit_change"),
-                "revenue": p.get("revenue"),
-                "profit": p.get("profit"),
+                "profit_change": profit_change,
+                "revenue": revenue,
+                "profit": profit,
             }
 
         rising = [_enrich(x) for x in rising_raw]

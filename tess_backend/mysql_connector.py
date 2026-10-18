@@ -1476,26 +1476,32 @@ class MysqlDataConnector:
             "SUM(conversions) conv FROM report_month "
             "WHERE date=%s GROUP BY campaign_id", (m,))
         prev = self._query(
-            "SELECT campaign_id, SUM(revenue) rev FROM report_month "
+            "SELECT campaign_id, SUM(revenue) rev, SUM(payout) pay FROM report_month "
             "WHERE date=%s GROUP BY campaign_id", (pm,))
-        prev_map = {str(r["campaign_id"]): self._f(r["rev"]) for r in prev}
+        prev_map = {str(r["campaign_id"]): {"rev": self._f(r["rev"]), "pay": self._f(r["pay"])} for r in prev}
         items = []
         for r in cur:
             cid = str(r["campaign_id"])
             rev = self._f(r["rev"])
             pay = self._f(r["pay"])
+            profit = rev - pay
             conv = int(self._f(r["conv"]))
-            margin = ((rev - pay) / rev * 100) if rev > 0 else 0.0
-            prev_rev = prev_map.get(cid, 0.0)
+            margin = (profit / rev * 100) if rev > 0 else 0.0
+            prev = prev_map.get(cid, {})
+            prev_rev = prev.get("rev", 0.0)
+            prev_pay = prev.get("pay", 0.0)
+            prev_profit = prev_rev - prev_pay
             chg = ((rev - prev_rev) / prev_rev * 100) if prev_rev > 0 else (100.0 if rev > 0 else 0.0)
+            profit_chg = ((profit - prev_profit) / prev_profit * 100) if prev_profit > 0 else (100.0 if profit > 0 else 0.0)
             items.append({
                 "campaign_id": int(cid) if cid.isdigit() else cid,
                 "revenue": round(rev, 4),
                 "payout": round(pay, 4),
-                "profit": round(rev - pay, 4),
+                "profit": round(profit, 4),
                 "conversions": conv,
                 "margin": round(margin, 4),
                 "revenue_change": round(chg, 2),
+                "profit_change": round(profit_chg, 2),
                 "prev_revenue": round(prev_rev, 4),
             })
         rising = sorted(
