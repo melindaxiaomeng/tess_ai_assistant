@@ -1805,17 +1805,20 @@ _ANALYSIS_KEYWORDS: list = [
     ("scaling_capacity", ["容量", "cap", "放量空间", "还能放", "预算上限", "放量容量", "容量评估"]),
     # account_profit_rollup 必须排在 finance_check 之前：两者都含「毛利/利润」语义，
     # 但 finance_check 依赖 report_month 月度预聚合表——当月（未结账）返回全 0；
-    # 「本月利润/本月毛利润」等当前月口径必须走 account_profit_rollup（/overview/daily-kpi
-    # 含当月迄今数据），否则会判「数据不足」。仅「对账/月报/毛利趋势」等仍走 finance_check。
-    ("account_profit_rollup", ["最近两周", "近两周", "近两周利润", "最近两周利润", "两周利润",
+    # 「本月利润/本月毛利润/裸毛利」等当前月/滚动口径必须走 account_profit_rollup
+    # （/overview/daily-kpi 含近 7 日+当月迄今数据），否则会判「数据不足」。
+    # 仅带「趋势/对账/月度」强信号的毛利问法（毛利趋势/毛利对账）仍走 finance_check 月度报表，
+    # 由 _resolve_profit_route 在命中 account_profit_rollup 后改判回 finance_check。
+    ("account_profit_rollup", ["毛利", "毛利多少", "毛利情况", "毛利是多少", "毛利咋样", "本月毛利", "这个月毛利", "最近两周", "近两周", "近两周利润", "最近两周利润", "两周利润",
                                "两周的", "近期利润", "利润汇总", "总利润",
                                "整体利润", "全账户利润", "账户利润", "利润总计", "利润总览",
                                "本月利润", "本月利润多少", "本月利润是多少", "利润多少",
                                "本月毛利润", "本月的利润", "本月利润吗",
                                "这个月利润", "上月利润", "上月毛利润", "毛利润"]),
-    ("finance_check", ["对账", "毛利", "结算", "营收核对", "对账差异", "月报", "财务", "month", "invoice",
+    ("finance_check", ["对账", "结算", "营收核对", "对账差异", "月报", "财务", "month", "invoice",
                        "本月营收", "本月支出", "月度营收", "月度支出", "营收与支出", "营收趋势",
-                       "支出趋势", "营收支出", "收支趋势", "月度收支"]),
+                       "支出趋势", "营收支出", "收支趋势", "月度收支",
+                       "毛利趋势", "毛利走势", "毛利月度", "毛利对账", "毛利环比", "毛利变化"]),
     ("publisher_deepdive", ["渠道详情", "渠道明细", "渠道下钻", "这个渠道", "某个渠道",
                             "渠道表现", "渠道趋势", "publisher", "媒体质量", "扣量", "作弊", "渠道质量"]),
     ("account_overview", ["账户全景", "整体大盘", "总览", "概览", "全景", "account overview",
@@ -1870,6 +1873,17 @@ _ANALYSIS_DOMAIN: dict = {
 }
 _GENERIC_DRILL = {"advertiser_deepdive", "publisher_deepdive", "campaign_detail", "pkg_deepdive"}
 
+# 裸「毛利」已上移 account_profit_rollup；但带以下强信号的毛利问法语义是「逐月走势/对账」，
+# 应回到 finance_check 月度报表（report_month 才有逐月聚合与对账口径），而非账户近 7 日滚动。
+_FINANCE_TREND_SIGNALS = ("趋势", "走势", "月度", "月报", "对账", "结算", "环比", "逐月", "每月", "历史", "变化")
+
+
+def _resolve_profit_route(atype: str, q: str) -> str:
+    """account_profit_rollup 命中（含裸「毛利」）但问题带趋势/对账强信号时，改判 finance_check。"""
+    if atype == "account_profit_rollup" and any(s in q for s in _FINANCE_TREND_SIGNALS):
+        return "finance_check"
+    return atype
+
 
 def infer_analysis_type(question: str) -> Optional[str]:
     """用轻量关键词把自然语言问题映射到深度 analysis_type。
@@ -1886,7 +1900,7 @@ def infer_analysis_type(question: str) -> Optional[str]:
         for kw in kws:
             k = kw.lower()
             if k in q or k.replace(" ", "") in qn:
-                return atype
+                return _resolve_profit_route(atype, q)
     return None
 
 
@@ -1905,6 +1919,7 @@ def infer_all_analysis_types(question: str) -> list:
         for kw in kws:
             k = kw.lower()
             if (k in q or k.replace(" ", "") in qn) and atype not in seen:
+                atype = _resolve_profit_route(atype, q)
                 seen.add(atype)
                 dom = _ANALYSIS_DOMAIN.get(atype)
                 # 通用实体下钻：同域已命中更具体类型时抑制
